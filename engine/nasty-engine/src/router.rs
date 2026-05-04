@@ -158,6 +158,7 @@ fn is_read_only(method: &str) -> bool {
                 | "backup.profile.get"
                 | "backup.status"
                 | "backup.snapshots"
+                | "auth.oidc.config_status"
         )
 }
 
@@ -385,6 +386,62 @@ async fn route(req: &Request, state: &AppState, session: &Session) -> Response {
             },
             Err(r) => r,
         },
+
+        // ── OIDC SSO ──────────────────────────────────────────
+        "auth.oidc.config_status" => {
+            let oidc = state.settings.get().await.oidc;
+            ok(req, nasty_system::settings::redact_oidc_secret(oidc))
+        }
+        "auth.oidc.update_config" => {
+            if session.role != Role::Admin {
+                return err(req, "admin only".to_string());
+            }
+            match parse_params::<nasty_system::settings::OidcSettings>(req) {
+                Ok(new_settings) => {
+                    let enabled = new_settings.enabled;
+                    match state.settings.set_oidc(new_settings).await {
+                        Ok(saved) => {
+                            // Rebuild the live OIDC client to reflect the new config
+                            // (or tear it down when disabling).
+                            let merged = state.settings.get().await.oidc;
+                            let rebuild =
+                                state.oidc.rebuild(&merged).await.map_err(|e| e.to_string());
+                            crate::auth::audit(
+                                "oidc_config_changed",
+                                &session.username,
+                                session.client_ip.as_deref().unwrap_or(""),
+                                &format!("enabled={enabled}"),
+                            );
+                            match rebuild {
+                                Ok(()) => ok(req, saved),
+                                Err(e) => err(
+                                    req,
+                                    format!("config saved but client rebuild failed: {e}"),
+                                ),
+                            }
+                        }
+                        Err(e) => err(req, e),
+                    }
+                }
+                Err(e) => invalid(req, e),
+            }
+        }
+        "auth.oidc.test" => {
+            if session.role != Role::Admin {
+                return err(req, "admin only".to_string());
+            }
+            let sample = req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("claims"))
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            let oidc = state.settings.get().await.oidc;
+            match crate::auth_oidc::dry_run_role(&sample, &oidc) {
+                Ok(role) => ok(req, serde_json::json!({ "role": role })),
+                Err(e) => err(req, e),
+            }
+        }
 
         // ── Audit ──────────────────────────────────────────────
         "audit.list" => {

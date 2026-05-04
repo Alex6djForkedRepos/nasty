@@ -18,6 +18,7 @@ use tracing_subscriber::{prelude::*, reload};
 mod app_deploy;
 mod log_stream;
 mod auth;
+mod auth_oidc;
 mod router;
 mod telemetry;
 mod terminal;
@@ -36,6 +37,7 @@ pub type EventBus = tokio::sync::broadcast::Sender<String>;
 
 pub struct AppState {
     pub auth: AuthService,
+    pub oidc: auth_oidc::OidcHolder,
     pub events: EventBus,
     pub log_reload: LogReloadHandle,
     pub system: nasty_system::SystemService,
@@ -108,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         auth: AuthService::new().await,
+        oidc: auth_oidc::OidcHolder::default(),
         events: event_tx,
         log_reload: reload_handle,
         system: nasty_system::SystemService::new(None, Some(built.to_string())),
@@ -203,6 +206,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Build the OIDC client if SSO is configured. Failures are logged, not
+    // fatal — a misconfigured IdP shouldn't block the engine from starting,
+    // and admins can fix the config via the WebUI.
+    {
+        let oidc_settings = state.settings.get().await.oidc;
+        if oidc_settings.enabled {
+            if let Err(e) = state.oidc.rebuild(&oidc_settings).await {
+                tracing::warn!("OIDC client init failed at startup: {e}");
+            } else {
+                info!("OIDC client initialized (issuer={:?})", oidc_settings.issuer_url);
+            }
+        }
+    }
+
     // Start daily anonymous telemetry (if not opted out)
     telemetry::spawn_daily(state.clone());
 
@@ -220,6 +237,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws/vm/{vm_id}/vnc", get(vm_console::vnc_handler))
         .route("/ws/vm/{vm_id}/serial", get(vm_console::serial_handler))
         .route("/api/login", post(login_handler))
+        .route("/api/auth/oidc/available", get(oidc_available_handler))
+        .route("/api/auth/oidc/start", get(oidc_start_handler))
+        .route("/api/auth/oidc/callback", get(oidc_callback_handler))
         .route(
             "/api/upload/vm-image",
             post(upload_vm_image_handler).layer(DefaultBodyLimit::max(10_737_418_240)),
@@ -1229,6 +1249,114 @@ async fn login_handler(
             )
                 .into_response()
         }
+    }
+}
+
+// ── OIDC SSO ─────────────────────────────────────────────────────
+
+/// Percent-encode a value for placement in a URL fragment.
+fn url_encode(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+
+/// Tells the WebUI whether to render the "Sign in with SSO" button.
+/// No auth required — the response only exposes booleans / public config.
+async fn oidc_available_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let oidc = state.settings.get().await.oidc;
+    let configured = state.oidc.current().await.is_some();
+    Json(serde_json::json!({
+        "enabled": oidc.enabled && configured,
+    }))
+}
+
+/// Start an OIDC authorization-code flow. 302s the browser to the IdP.
+/// Returns 404 when SSO is disabled so the endpoint doesn't leak its existence.
+async fn oidc_start_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(client) = state.oidc.current().await else {
+        return (StatusCode::NOT_FOUND, "OIDC not enabled").into_response();
+    };
+    let url = client.authorize_url().await;
+    axum::response::Redirect::to(url.as_str()).into_response()
+}
+
+#[derive(Deserialize)]
+struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// IdP callback. Validates state + code, exchanges for tokens, mints a NASty
+/// session, and 302s the browser to `/#nasty_token=…&oidc=1`. Errors land at
+/// `/#oidc_error=<reason>` so the SPA can show a meaningful message.
+async fn oidc_callback_handler(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<OidcCallbackQuery>,
+) -> impl IntoResponse {
+    let client_ip = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let bounce = |fragment: String| -> axum::response::Response {
+        axum::response::Redirect::to(&format!("/#{fragment}")).into_response()
+    };
+
+    if let Some(err) = q.error {
+        let detail = q.error_description.unwrap_or_default();
+        crate::auth::audit("oidc_login_failed", "anonymous", &client_ip, &format!("{err}: {detail}"));
+        return bounce(format!(
+            "oidc_error={}",
+            url_encode(&format!("{err}: {detail}"))
+        ));
+    }
+
+    let (Some(code), Some(state_param)) = (q.code, q.state) else {
+        crate::auth::audit("oidc_login_failed", "anonymous", &client_ip, "missing code or state");
+        return bounce("oidc_error=missing+code+or+state".into());
+    };
+
+    let Some(client) = state.oidc.current().await else {
+        return (StatusCode::NOT_FOUND, "OIDC not enabled").into_response();
+    };
+
+    let identity = match client.exchange_code(&state_param, &code).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!("OIDC token exchange failed: {e}");
+            crate::auth::audit("oidc_login_failed", "anonymous", &client_ip, &e.to_string());
+            return bounce(format!(
+                "oidc_error={}",
+                url_encode(&e.to_string())
+            ));
+        }
+    };
+
+    let oidc_settings = state.settings.get().await.oidc;
+    let derived_role_str = auth_oidc::role_for_groups(&identity.groups, &oidc_settings);
+    let derived_role = derived_role_str
+        .as_deref()
+        .and_then(crate::auth::parse_role_str);
+
+    match state
+        .auth
+        .login_or_provision_oidc(
+            &identity,
+            derived_role,
+            oidc_settings.auto_provision,
+            &client_ip,
+        )
+        .await
+    {
+        Ok(token) => bounce(format!("nasty_token={}&oidc=1", url_encode(&token))),
+        Err(e) => bounce(format!(
+            "oidc_error={}",
+            url_encode(&e.to_string())
+        )),
     }
 }
 

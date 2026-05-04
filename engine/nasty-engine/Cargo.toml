@@ -33,3 +33,5 @@ sha2 = "0.10.9"
 bollard = "0.20"
 serde_yaml_ng = "0.10"
 tokio-util = { workspace = true, features = ["io"] }
+openidconnect = { version = "3", default-features = false, features = ["reqwest", "rustls-tls", "accept-rfc3339-timestamps", "accept-string-booleans"] }
+url = "2"

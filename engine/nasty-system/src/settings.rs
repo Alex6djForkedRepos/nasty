@@ -121,6 +121,94 @@ pub struct Settings {
     /// Whether anonymous telemetry is enabled (drive count, storage capacity).
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
+    /// OpenID Connect single-sign-on configuration. Disabled by default.
+    #[serde(default)]
+    pub oidc: OidcSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OidcSettings {
+    /// Master switch — when false, OIDC endpoints return 404 and no IdP traffic occurs.
+    #[serde(default)]
+    pub enabled: bool,
+    /// IdP issuer URL (used for OIDC discovery, e.g. "https://auth.example.com").
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    /// OAuth client_id registered with the IdP.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// OAuth client_secret. Returned as a placeholder over RPC; only the engine sees the real value.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Absolute redirect URI registered with the IdP (e.g. "https://nasty.local/api/auth/oidc/callback").
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// OAuth scopes to request. Defaults to ["openid","profile","email","groups"].
+    #[serde(default = "default_oidc_scopes")]
+    pub scopes: Vec<String>,
+    /// Name of the ID-token claim that carries the user's groups.
+    #[serde(default = "default_oidc_groups_claim")]
+    pub groups_claim: String,
+    /// Group → role mappings. Evaluated in order; first match wins.
+    #[serde(default)]
+    pub role_mappings: Vec<OidcRoleMapping>,
+    /// Role applied when no group mapping matches. None = deny login.
+    #[serde(default)]
+    pub default_role: Option<String>,
+    /// When true, unknown OIDC subjects are auto-provisioned as local users on first login.
+    #[serde(default = "default_true")]
+    pub auto_provision: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OidcRoleMapping {
+    /// Group name (matched verbatim against entries in the configured groups claim).
+    pub group: String,
+    /// NASty role to assign: "admin", "operator", or "readonly".
+    pub role: String,
+}
+
+impl Default for OidcSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer_url: None,
+            client_id: None,
+            client_secret: None,
+            redirect_uri: None,
+            scopes: default_oidc_scopes(),
+            groups_claim: default_oidc_groups_claim(),
+            role_mappings: Vec::new(),
+            default_role: None,
+            auto_provision: true,
+        }
+    }
+}
+
+/// Sentinel returned in place of the OIDC client_secret over the API. When a
+/// caller sends this back unchanged, the engine keeps the stored secret.
+pub const OIDC_SECRET_PLACEHOLDER: &str = "<unchanged>";
+
+/// Replace the client_secret on a copy of OidcSettings with `<set>` / `<unset>`,
+/// suitable for returning to API callers without leaking the real value.
+pub fn redact_oidc_secret(mut s: OidcSettings) -> OidcSettings {
+    s.client_secret = match s.client_secret.as_deref() {
+        Some(v) if !v.is_empty() => Some("<set>".into()),
+        _ => Some("<unset>".into()),
+    };
+    s
+}
+
+fn default_oidc_scopes() -> Vec<String> {
+    vec!["openid".into(), "profile".into(), "email".into(), "groups".into()]
+}
+
+fn default_oidc_groups_claim() -> String {
+    "groups".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_challenge_type() -> String {
@@ -155,6 +243,7 @@ impl Default for Settings {
             tls_dns_resolver: None,
             tls_dns_propagation_wait: None,
             telemetry_enabled: default_telemetry_enabled(),
+            oidc: OidcSettings::default(),
         }
     }
 }
@@ -215,6 +304,21 @@ impl SettingsService {
 
     pub async fn get(&self) -> Settings {
         self.state.read().await.clone()
+    }
+
+    /// Replace the OIDC configuration. If `incoming.client_secret` is the literal
+    /// placeholder `"<unchanged>"`, the previously-stored secret is preserved.
+    pub async fn set_oidc(&self, mut incoming: OidcSettings) -> Result<OidcSettings, String> {
+        let mut settings = self.state.write().await;
+        if incoming.client_secret.as_deref() == Some(OIDC_SECRET_PLACEHOLDER) {
+            incoming.client_secret = settings.oidc.client_secret.clone();
+        }
+        if incoming.scopes.is_empty() {
+            incoming.scopes = default_oidc_scopes();
+        }
+        settings.oidc = incoming.clone();
+        save(&settings).await.map_err(|e| e.to_string())?;
+        Ok(redact_oidc_secret(incoming))
     }
 
     pub async fn update(&self, update: SettingsUpdate) -> Result<Settings, String> {

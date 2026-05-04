@@ -14,12 +14,37 @@ const AUDIT_LOG_PATH: &str = "/var/lib/nasty/audit.log";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub username: String,
-    /// Argon2 password hash
-    pub password_hash: String,
+    /// Argon2 password hash. None for users provisioned via OIDC who have never set
+    /// a local password; such users can only authenticate through the configured IdP.
+    #[serde(default, deserialize_with = "deserialize_password_hash")]
+    pub password_hash: Option<String>,
     pub role: Role,
     /// When true, the user must change their password before accessing anything else.
     #[serde(default)]
     pub must_change_password: bool,
+    /// OIDC subject identifier (`sub` claim). Set on first OIDC login.
+    #[serde(default)]
+    pub oidc_subject: Option<String>,
+    /// OIDC issuer URL. Pinned alongside the subject so a sub from a different IdP
+    /// never collides with an existing user.
+    #[serde(default)]
+    pub oidc_issuer: Option<String>,
+}
+
+/// Accept legacy auth.json files where `password_hash` is a plain string (not Option).
+fn deserialize_password_hash<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::IntoDeserializer;
+    let v = serde_json::Value::deserialize(d)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) if s.is_empty() => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s)),
+        other => Option::<String>::deserialize(other.into_deserializer())
+            .map_err(|e: serde_json::Error| serde::de::Error::custom(e.to_string())),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
@@ -120,9 +145,11 @@ impl AuthService {
             let hash = hash_password("admin").expect("failed to hash default password");
             st.users.push(User {
                 username: "admin".to_string(),
-                password_hash: hash,
+                password_hash: Some(hash),
                 role: Role::Admin,
                 must_change_password: true,
+                oidc_subject: None,
+                oidc_issuer: None,
             });
             st.initialized = true;
             save_state(&st).await.ok();
@@ -170,7 +197,15 @@ impl AuthService {
             }
         };
 
-        match verify_password(password, &user.password_hash) {
+        let hash = match user.password_hash.as_deref() {
+            Some(h) => h,
+            None => {
+                audit("login_failed", username, client_ip, "no local password (OIDC-only user)");
+                self.record_failed_attempt(username, now).await;
+                return Err(AuthError::InvalidCredentials);
+            }
+        };
+        match verify_password(password, hash) {
             Ok(()) => {}
             Err(e) => {
                 audit("login_failed", username, client_ip, "wrong password");
@@ -202,6 +237,108 @@ impl AuthService {
 
         audit("login_success", username, client_ip, "");
         info!("User '{}' logged in", username);
+        Ok(token)
+    }
+
+    /// Mint a session for a verified OIDC identity. Looks up the user by
+    /// (oidc_subject, oidc_issuer); auto-provisions a new user if enabled and
+    /// no match exists. Re-derives role from the supplied groups every login,
+    /// so IdP group changes propagate without admin action.
+    ///
+    /// `derived_role` is computed by the caller (router/HTTP handler) using
+    /// `auth_oidc::role_for_groups` against the current `OidcSettings`.
+    /// Passing it in keeps this function free of `nasty_system` types.
+    pub async fn login_or_provision_oidc(
+        &self,
+        identity: &crate::auth_oidc::OidcIdentity,
+        derived_role: Option<Role>,
+        auto_provision: bool,
+        client_ip: &str,
+    ) -> Result<String, AuthError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let role = match derived_role {
+            Some(r) => r,
+            None => {
+                audit(
+                    "oidc_login_denied_no_role",
+                    identity.preferred_username.as_deref().unwrap_or(&identity.subject),
+                    client_ip,
+                    &format!("issuer={} sub={}", identity.issuer, identity.subject),
+                );
+                return Err(AuthError::Forbidden);
+            }
+        };
+
+        let mut state = self.state.write().await;
+
+        let mut existing_idx = state.users.iter().position(|u| {
+            u.oidc_subject.as_deref() == Some(&identity.subject)
+                && u.oidc_issuer.as_deref() == Some(&identity.issuer)
+        });
+
+        if existing_idx.is_none() {
+            if !auto_provision {
+                audit(
+                    "oidc_login_failed",
+                    identity.preferred_username.as_deref().unwrap_or(&identity.subject),
+                    client_ip,
+                    "user not provisioned and auto_provision disabled",
+                );
+                return Err(AuthError::UserNotFound);
+            }
+            let username = pick_username(&state.users, identity);
+            state.users.push(User {
+                username: username.clone(),
+                password_hash: None,
+                role: role.clone(),
+                must_change_password: false,
+                oidc_subject: Some(identity.subject.clone()),
+                oidc_issuer: Some(identity.issuer.clone()),
+            });
+            existing_idx = Some(state.users.len() - 1);
+            audit(
+                "oidc_user_provisioned",
+                &username,
+                client_ip,
+                &format!("issuer={} sub={} role={:?}", identity.issuer, identity.subject, role),
+            );
+        }
+
+        let idx = existing_idx.expect("user index resolved above");
+        let user = &mut state.users[idx];
+        if user.role != role {
+            audit(
+                "oidc_role_updated_on_login",
+                &user.username,
+                client_ip,
+                &format!("from={:?} to={:?}", user.role, role),
+            );
+            user.role = role.clone();
+        }
+
+        let username = user.username.clone();
+        let token = generate_token();
+        let session = Session {
+            token: token.clone(),
+            username: username.clone(),
+            role: role.clone(),
+            filesystem: None,
+            owner: None,
+            created_at: now,
+            must_change_password: false,
+            client_ip: Some(client_ip.to_string()),
+        };
+
+        state.sessions.retain(|s| now - s.created_at <= SESSION_TTL_SECS);
+        state.sessions.push(session);
+        save_state(&state).await?;
+
+        audit("oidc_login_success", &username, client_ip, "");
+        info!("OIDC login succeeded for user '{}'", username);
         Ok(token)
     }
 
@@ -407,7 +544,7 @@ impl AuthService {
             .find(|u| u.username == username)
             .ok_or(AuthError::UserNotFound)?;
 
-        user.password_hash = hash_password(new_password)?;
+        user.password_hash = Some(hash_password(new_password)?);
         user.must_change_password = false;
 
         // Also clear the flag on any active sessions for this user
@@ -446,9 +583,11 @@ impl AuthService {
         audit("user_created", &session.username, session.client_ip.as_deref().unwrap_or(""), &format!("target={username}, role={role:?}"));
         state.users.push(User {
             username: username.to_string(),
-            password_hash: hash_password(password)?,
+            password_hash: Some(hash_password(password)?),
             role,
             must_change_password: false,
+            oidc_subject: None,
+            oidc_issuer: None,
         });
         save_state(&state).await?;
 
@@ -621,6 +760,44 @@ fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Pick a unique username for a freshly-provisioned OIDC user. Prefers
+/// `preferred_username`, falls back to email local-part, then to subject.
+/// Appends a numeric suffix if the chosen name already exists.
+fn pick_username(existing: &[User], identity: &crate::auth_oidc::OidcIdentity) -> String {
+    let base = identity
+        .preferred_username
+        .clone()
+        .or_else(|| {
+            identity
+                .email
+                .as_deref()
+                .and_then(|e| e.split('@').next().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| identity.subject.clone());
+    let base = base.trim().to_string();
+    let base = if base.is_empty() { identity.subject.clone() } else { base };
+    if !existing.iter().any(|u| u.username == base) {
+        return base;
+    }
+    for n in 2.. {
+        let candidate = format!("{base}-{n}");
+        if !existing.iter().any(|u| u.username == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Parse a role string from configuration. Accepts `admin`, `operator`, `readonly`.
+pub fn parse_role_str(s: &str) -> Option<Role> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "admin" => Some(Role::Admin),
+        "operator" => Some(Role::Operator),
+        "readonly" | "read_only" | "read-only" => Some(Role::ReadOnly),
+        _ => None,
+    }
 }
 
 fn generate_token() -> String {

@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { getClient, resetClient } from '$lib/client';
-	import { getToken, clearToken, login as doLogin } from '$lib/auth';
+	import { getToken, setToken, clearToken, login as doLogin } from '$lib/auth';
 	import { error as showError, isBusy } from '$lib/toast.svelte';
 	import Toasts from '$lib/components/Toasts.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -75,6 +75,43 @@
 	let loginUser = $state('admin');
 	let loginPass = $state('');
 	let loginError = $state('');
+	let ssoEnabled = $state(false);
+
+	// Consume an SSO redirect's URL fragment: `#nasty_token=…&oidc=1` carries
+	// a freshly-minted session token from /api/auth/oidc/callback;
+	// `#oidc_error=…` carries a human-readable failure message.
+	function consumeSsoFragment(): boolean {
+		if (typeof window === 'undefined' || !window.location.hash) return false;
+		const params = new URLSearchParams(window.location.hash.slice(1));
+		const tok = params.get('nasty_token');
+		const err = params.get('oidc_error');
+		if (tok) {
+			setToken(tok);
+			history.replaceState(null, '', window.location.pathname + window.location.search);
+			return true;
+		}
+		if (err) {
+			loginError = err;
+			history.replaceState(null, '', window.location.pathname + window.location.search);
+		}
+		return false;
+	}
+
+	async function refreshSsoAvailability() {
+		try {
+			const res = await fetch('/api/auth/oidc/available');
+			if (res.ok) {
+				const body = await res.json();
+				ssoEnabled = !!body.enabled;
+			} else {
+				ssoEnabled = false;
+			}
+		} catch { ssoEnabled = false; }
+	}
+
+	function startSso() {
+		window.location.assign('/api/auth/oidc/start');
+	}
 
 	// Engine version tracking — used to detect updates during reconnect
 	let initialCommit: string | null = null;
@@ -222,8 +259,13 @@
 	});
 
 	async function tryConnect() {
+		consumeSsoFragment();
 		const token = getToken();
-		if (!token) { showLogin = true; return; }
+		if (!token) {
+			refreshSsoAvailability();
+			showLogin = true;
+			return;
+		}
 		try {
 			const client = getClient();
 			authInfo = await client.connect(token);
@@ -242,6 +284,7 @@
 		} catch (e) {
 			clearToken();
 			resetClient();
+			refreshSsoAvailability();
 			showLogin = true;
 			if (e instanceof Error && e.message !== 'WebSocket connection failed') {
 				showError('Session expired, please sign in again');
@@ -458,6 +501,14 @@
 				</div>
 				<Button type="submit" class="w-full">Sign In</Button>
 			</form>
+			{#if ssoEnabled}
+				<div class="my-4 flex items-center gap-3 text-xs text-muted-foreground">
+					<div class="h-px flex-1 bg-border"></div>
+					<span>or</span>
+					<div class="h-px flex-1 bg-border"></div>
+				</div>
+				<Button type="button" variant="outline" class="w-full" onclick={startSso}>Sign in with SSO</Button>
+			{/if}
 		</div>
 	</div>
 {:else if showPasswordChange}
