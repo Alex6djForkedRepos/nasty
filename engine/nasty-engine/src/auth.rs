@@ -438,13 +438,15 @@ impl AuthService {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // Check login sessions first
-        if let Some(session) = state.sessions.iter().find(|s| s.token == token) {
+        // Check login sessions first. Constant-time compare on the token —
+        // the practical timing attack against a 256-bit URL-safe-base64 token
+        // is infeasible, but defense-in-depth is cheap.
+        if let Some(session) = state.sessions.iter().find(|s| ct_eq_str(&s.token, token)) {
             // Check TTL
             if now - session.created_at > SESSION_TTL_SECS {
                 drop(state);
                 let mut state = self.state.write().await;
-                state.sessions.retain(|s| s.token != token);
+                state.sessions.retain(|s| !ct_eq_str(&s.token, token));
                 save_state(&state).await.ok();
                 return Err(AuthError::TokenExpired);
             }
@@ -465,7 +467,7 @@ impl AuthService {
         // don't need Argon2's brute-force resistance, and Argon2 is too slow for O(n) scan)
         let incoming_hash = hash_token(token);
         let t = state.api_tokens.iter()
-            .find(|t| t.token == incoming_hash)
+            .find(|t| ct_eq_str(&t.token, &incoming_hash))
             .ok_or(AuthError::InvalidToken)?;
 
         if let Some(exp) = t.expires_at {
@@ -876,6 +878,20 @@ fn verify_password(password: &str, hash: &str) -> Result<(), AuthError> {
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| AuthError::InvalidCredentials)
+}
+
+/// Constant-time string equality. Avoids the timing side-channel of `==`
+/// even though our tokens are 256-bit random — keeps the auth path uniform
+/// when tokens of different shapes (session vs hashed API tokens) are
+/// compared.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
 }
 
 /// SHA-256 hash for API tokens. Tokens are 32 random bytes — high entropy,

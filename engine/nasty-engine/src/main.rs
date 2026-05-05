@@ -261,7 +261,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 2137));
+    // 127.0.0.1 only — nginx proxies https://nas:443/ → http://127.0.0.1:2137/.
+    // Direct LAN access to the engine port would bypass TLS, the security
+    // headers, and the nginx-only X-Real-IP plumbing the session-IP-binding
+    // depends on.
+    let addr = SocketAddr::from(([127, 0, 0, 1], 2137));
     info!("NASty Engine v{version} (built: {built})");
     info!("Listening on {addr}");
 

@@ -994,7 +994,10 @@ in {
       settings = {
         global = {
           "server string" = "NASty NAS";
-          "map to guest" = "Bad User";
+          # Default-deny on guest. Per-share `guest ok = yes` is still allowed,
+          # but a misconfigured share (missing `valid users`, typo in ACL) no
+          # longer silently downgrades to anonymous read.
+          "map to guest" = "Never";
           "guest account" = "nobody";
           "server min protocol" = "SMB2";
           # macOS Finder requires SMB signing as optional for guest access.

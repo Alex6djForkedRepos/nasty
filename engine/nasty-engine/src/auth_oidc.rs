@@ -109,6 +109,7 @@ impl OidcClient {
             .filter(|s| !s.is_empty())
             .ok_or(OidcError::NotConfigured("redirect_uri"))?;
 
+        validate_issuer_url(issuer)?;
         let issuer_url =
             IssuerUrl::new(issuer.to_string()).map_err(|e| OidcError::Config(e.to_string()))?;
         let metadata = CoreProviderMetadata::discover_async(issuer_url, async_http_client)
@@ -292,4 +293,107 @@ pub fn dry_run_role(
         None => Vec::new(),
     };
     Ok(role_for_groups(&groups, settings))
+}
+
+/// Reject obviously dangerous issuer URLs before we hand them to the OIDC
+/// discovery client (which would otherwise happily fetch from
+/// `http://169.254.169.254/latest/...` and return AWS instance metadata).
+///
+/// Hostnames are not resolved here — DNS rebinding is hard to defend
+/// against in code, and the OIDC discovery flow is admin-configured anyway.
+/// What we *can* catch is the obvious mistakes: `http://` (downgrade),
+/// loopback, link-local, the unspecified address, and known metadata
+/// hostnames. Private-network RFC1918 hosts are allowed because a
+/// self-hosted Keycloak on the same LAN is a legitimate setup.
+pub fn validate_issuer_url(s: &str) -> Result<(), OidcError> {
+    let u = url::Url::parse(s)
+        .map_err(|e| OidcError::Config(format!("issuer URL: {e}")))?;
+
+    if u.scheme() != "https" {
+        return Err(OidcError::Config(format!(
+            "issuer URL must use https (got '{}')", u.scheme()
+        )));
+    }
+
+    let host_str = u.host_str()
+        .ok_or_else(|| OidcError::Config("issuer URL missing host".to_string()))?;
+
+    // Match well-known metadata hostnames regardless of how DNS resolves them.
+    let lower = host_str.to_ascii_lowercase();
+    let metadata_hosts = [
+        "metadata.google.internal",
+        "metadata.goog",
+    ];
+    if metadata_hosts.iter().any(|h| lower == *h) {
+        return Err(OidcError::Config(format!(
+            "issuer URL host '{host_str}' is a cloud metadata service"
+        )));
+    }
+
+    // Literal-IP checks. A hostname that secretly resolves to 169.254.169.254
+    // would still pass, but a typo'd `https://169.254.169.254/...` won't.
+    match u.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast() {
+                return Err(OidcError::Config(format!(
+                    "issuer URL host {v4} is a loopback/link-local/broadcast/unspecified address"
+                )));
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return Err(OidcError::Config(format!(
+                    "issuer URL host {v6} is a loopback/unspecified address"
+                )));
+            }
+            // is_unicast_link_local isn't stable yet; check the prefix manually.
+            // fe80::/10 — top 10 bits are 1111111010
+            if v6.segments()[0] & 0xffc0 == 0xfe80 {
+                return Err(OidcError::Config(format!(
+                    "issuer URL host {v6} is a link-local address"
+                )));
+            }
+        }
+        Some(url::Host::Domain(_)) | None => {} // hostname or absent — already checked above
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_issuer_url;
+
+    #[test]
+    fn accepts_normal_https() {
+        assert!(validate_issuer_url("https://accounts.google.com").is_ok());
+        assert!(validate_issuer_url("https://keycloak.example.com/realms/main").is_ok());
+        // Private RFC1918 — legitimate for self-hosted IdPs on a LAN.
+        assert!(validate_issuer_url("https://192.168.1.50:8443/realms/main").is_ok());
+        assert!(validate_issuer_url("https://10.0.0.10/realms/main").is_ok());
+    }
+
+    #[test]
+    fn rejects_http() {
+        assert!(validate_issuer_url("http://idp.example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_loopback() {
+        assert!(validate_issuer_url("https://127.0.0.1/").is_err());
+        assert!(validate_issuer_url("https://[::1]/").is_err());
+    }
+
+    #[test]
+    fn rejects_link_local_and_metadata() {
+        assert!(validate_issuer_url("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(validate_issuer_url("https://metadata.google.internal/").is_err());
+        assert!(validate_issuer_url("https://[fe80::1]/").is_err());
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(validate_issuer_url("not a url").is_err());
+        assert!(validate_issuer_url("https://").is_err());
+    }
 }

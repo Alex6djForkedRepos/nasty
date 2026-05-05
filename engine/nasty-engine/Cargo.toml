@@ -30,6 +30,7 @@ futures-util.workspace = true
 schemars.workspace = true
 reqwest.workspace = true
 sha2 = "0.10.9"
+subtle = "2"
 bollard = "0.20"
 serde_yaml_ng = "0.10"
 tokio-util = { workspace = true, features = ["io"] }
