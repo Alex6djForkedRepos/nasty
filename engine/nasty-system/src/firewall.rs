@@ -366,19 +366,9 @@ async fn apply_nftables(state: &FirewallState) -> Result<(), String> {
         }
     }
 
-    let output = Command::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn nft: {e}"))?
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("nft: {e}"))?;
-
-    // Need to pipe stdin — let me use a temp file approach instead
+    // Apply the ruleset by writing it to a temp file and pointing nft at it.
+    // An earlier version tried `nft -f -` with piped stdin but never wrote to
+    // the pipe, so nft hung waiting for EOF until the spawn went out of scope.
     let tmp = "/tmp/nasty-firewall.nft";
     tokio::fs::write(tmp, &rules).await
         .map_err(|e| format!("write {tmp}: {e}"))?;
