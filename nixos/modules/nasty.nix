@@ -928,11 +928,37 @@ in {
         RestartSec = 5;
         StateDirectory = "nasty";
 
-        # No filesystem sandboxing (ProtectSystem, ProtectHome, etc.) — any of
-        # these create a private mount namespace, making filesystem mounts invisible
-        # to NFS/SMB/iSCSI services.  The engine is a privileged system manager;
-        # security is enforced at the API authentication layer.
-        NoNewPrivileges = false;  # needs root for mount/format operations
+        # The engine is a privileged system manager and cannot run under a
+        # private mount namespace — that would hide its mounts from
+        # NFS/SMB/iSCSI. So ProtectSystem, ProtectHome, PrivateTmp,
+        # ProtectKernelTunables, and friends stay off.
+        #
+        # What we *can* tighten is per-process state (prctl flags), syscall
+        # filters (seccomp), and address families. None of these need a
+        # private namespace, so they don't break mount visibility.
+
+        # Prevent privilege gain via setuid binaries spawned by the engine.
+        # The engine itself runs as root, so this doesn't drop privileges —
+        # it just stops a compromised engine from launching, say, a setuid
+        # ping or a misconfigured suid debug helper.
+        NoNewPrivileges = true;
+        # Lock the personality(2) bits — block selinux-style ABI flips.
+        LockPersonality = true;
+        # Reject chmod that would set the setuid/setgid bits on any file
+        # the engine creates. The engine writes configs, not setuid bins.
+        RestrictSUIDSGID = true;
+        # Block adjtimex/clock_settime — the engine never sets the clock.
+        ProtectClock = true;
+        # Block escalation to SCHED_FIFO/SCHED_RR.
+        RestrictRealtime = true;
+        # Use a private kernel session keyring so the engine cannot read
+        # secrets stashed in another unit's keyring (and vice-versa).
+        KeyringMode = "private";
+        # Allow only the address families the engine actually uses:
+        #   AF_UNIX   — docker/QMP/libvirt sockets
+        #   AF_INET/6 — outbound HTTPS (lego, telemetry, registries)
+        #   AF_NETLINK — nft, ip, mount/umount kernel chatter
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
       };
     };
 

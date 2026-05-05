@@ -186,6 +186,15 @@ async fn deploy_compose(socket: &mut WebSocket, state: &AppState, req: &DeployRe
         }
     };
 
+    // Reject dangerous compose directives before anything touches disk or
+    // docker. Without this, an authenticated admin (or anyone who steals an
+    // admin token) can mount '/' into a container and walk out with every
+    // secret on the host.
+    if let Err(e) = validate_compose(&compose_content, &req.name) {
+        let _ = socket.send(Message::Text(DeployMessage::error(&format!("compose rejected: {e}")).into())).await;
+        return;
+    }
+
     let compose_dir = format!("/var/lib/nasty/apps/{}", req.name);
     let compose_path = format!("{}/docker-compose.yml", compose_dir);
 
@@ -419,6 +428,202 @@ async fn stream_command(
     Ok(())
 }
 
+/// Capabilities that effectively grant host root if added to a container.
+/// CAP_SYS_ADMIN is "the new root" — kernel module loading, mount, etc.
+/// CAP_SYS_PTRACE lets you peek into other processes (including the engine).
+/// CAP_SYS_MODULE/_RAWIO/_BOOT/_TIME are direct kernel takeover.
+/// CAP_NET_ADMIN reconfigures the host network from inside a container.
+/// CAP_DAC_READ_SEARCH/CAP_DAC_OVERRIDE bypass host filesystem permissions.
+/// CAP_MAC_ADMIN/_OVERRIDE bypass MAC (SELinux/AppArmor).
+const FORBIDDEN_CAPS: &[&str] = &[
+    "ALL", "SYS_ADMIN", "SYS_PTRACE", "SYS_MODULE", "SYS_RAWIO", "SYS_BOOT",
+    "SYS_TIME", "NET_ADMIN", "DAC_READ_SEARCH", "DAC_OVERRIDE",
+    "MAC_ADMIN", "MAC_OVERRIDE", "AUDIT_CONTROL", "AUDIT_WRITE",
+];
+
+/// security_opt values that disable the default container sandbox layers.
+const FORBIDDEN_SECURITY_OPTS: &[&str] = &[
+    "seccomp=unconfined", "seccomp:unconfined",
+    "apparmor=unconfined", "apparmor:unconfined",
+    "label=disable", "label:disable",
+    "label=type:spc_t", "label:type:spc_t",
+    "no-new-privileges=false", "no-new-privileges:false",
+    "systempaths=unconfined", "systempaths:unconfined",
+];
+
+/// Validate a docker-compose YAML before it's written to disk and handed to
+/// `docker compose up`. Returns Err with a human-readable message on the
+/// first dangerous directive found.
+///
+/// We reject patterns that grant a container host-equivalent privilege:
+/// privileged mode, host namespace sharing, dangerous capabilities, opt-out
+/// of seccomp/apparmor, host-device passthrough, and bind mounts pointing
+/// outside the app's own directory or `/fs/` share roots.
+fn validate_compose(yaml: &str, app_name: &str) -> Result<(), String> {
+    let parsed: serde_json::Value = serde_yaml_ng::from_str(yaml)
+        .map_err(|e| format!("compose YAML failed to parse: {e}"))?;
+
+    let services = parsed
+        .get("services")
+        .and_then(|s| s.as_object())
+        .ok_or_else(|| "compose file has no `services:` map".to_string())?;
+
+    let allowed_app_dir = format!("/var/lib/nasty/apps/{app_name}");
+
+    for (svc_name, svc) in services {
+        let scope = |field: &str| format!("services.{svc_name}.{field}");
+
+        if svc.get("privileged").and_then(|v| v.as_bool()) == Some(true) {
+            return Err(format!("{} sets privileged: true (host-root equivalent)", scope("privileged")));
+        }
+
+        for (field, allowed_self_only) in [
+            ("pid", true),
+            ("ipc", true),
+            ("uts", true),
+            ("userns_mode", true),
+            ("cgroup", true),
+            ("network_mode", false),
+        ] {
+            if let Some(v) = svc.get(field).and_then(|v| v.as_str()) {
+                let v_lower = v.to_ascii_lowercase();
+                if v_lower == "host" || v_lower.starts_with("host:") {
+                    return Err(format!("{} = '{}' shares the host namespace", scope(field), v));
+                }
+                if !allowed_self_only && v_lower == "none" {
+                    // network_mode: none is fine, just no networking.
+                    continue;
+                }
+            }
+        }
+        // Compose v2 also accepts top-level `network_mode: host` plus `pid: host`
+        // already covered above. `ipc: shareable` lets other containers attach
+        // and is risky — block it.
+        if let Some(v) = svc.get("ipc").and_then(|v| v.as_str()) {
+            if v.eq_ignore_ascii_case("shareable") {
+                return Err(format!("{} = 'shareable' lets other containers attach to this IPC namespace", scope("ipc")));
+            }
+        }
+
+        if let Some(caps) = svc.get("cap_add").and_then(|v| v.as_array()) {
+            for c in caps {
+                if let Some(s) = c.as_str() {
+                    let bare = s.strip_prefix("CAP_").unwrap_or(s).to_ascii_uppercase();
+                    if FORBIDDEN_CAPS.contains(&bare.as_str()) {
+                        return Err(format!("{} includes '{}' — grants host-equivalent privilege", scope("cap_add"), s));
+                    }
+                }
+            }
+        }
+
+        if let Some(opts) = svc.get("security_opt").and_then(|v| v.as_array()) {
+            for o in opts {
+                if let Some(s) = o.as_str() {
+                    let normalized = s.replace(' ', "").to_ascii_lowercase();
+                    if FORBIDDEN_SECURITY_OPTS.iter().any(|f| normalized == *f) {
+                        return Err(format!("{} includes '{}' — disables container sandbox", scope("security_opt"), s));
+                    }
+                }
+            }
+        }
+
+        // `devices:` passes host /dev nodes into the container. We don't have a
+        // safe-by-default allowlist (different apps need different devices), so
+        // require the operator to fork the engine if they really need this.
+        if let Some(devices) = svc.get("devices").and_then(|v| v.as_array()) {
+            if !devices.is_empty() {
+                return Err(format!("{} maps host devices into the container; not allowed", scope("devices")));
+            }
+        }
+
+        // `device_cgroup_rules:` punches holes in the device cgroup.
+        if svc.get("device_cgroup_rules").is_some() {
+            return Err(format!("{} bypasses the device cgroup; not allowed", scope("device_cgroup_rules")));
+        }
+
+        if let Some(volumes) = svc.get("volumes").and_then(|v| v.as_array()) {
+            for vol in volumes {
+                let source = match vol {
+                    serde_json::Value::String(s) => {
+                        // "src:dst[:opts]" — split on the first colon.
+                        s.split(':').next().unwrap_or("").to_string()
+                    }
+                    serde_json::Value::Object(map) => {
+                        let kind = map.get("type").and_then(|v| v.as_str()).unwrap_or("volume");
+                        if kind != "bind" {
+                            // Named volumes, tmpfs, npipe — host filesystem isn't directly exposed.
+                            continue;
+                        }
+                        map.get("source")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    }
+                    _ => continue,
+                };
+
+                if source.is_empty() {
+                    continue;
+                }
+
+                // Named volume short-form ("data:/var/lib/foo") — no host path.
+                if !source.starts_with('/') && !source.starts_with('.') && !source.starts_with('~') {
+                    continue;
+                }
+
+                if source.contains("..") {
+                    return Err(format!("{} bind-mounts '{}' which escapes via '..'", scope("volumes"), source));
+                }
+
+                let allowed = source.starts_with(&format!("{allowed_app_dir}/"))
+                    || source == allowed_app_dir
+                    || source.starts_with("/fs/")
+                    || source == "/fs";
+                if !allowed {
+                    return Err(format!(
+                        "{} bind-mounts '{}' — only paths under '{}/' or '/fs/' are allowed",
+                        scope("volumes"),
+                        source,
+                        allowed_app_dir
+                    ));
+                }
+            }
+        }
+    }
+
+    // Top-level named volumes can be configured as bind mounts via `driver_opts`.
+    // Treat those the same as inline binds.
+    if let Some(top_volumes) = parsed.get("volumes").and_then(|v| v.as_object()) {
+        for (vol_name, vol) in top_volumes {
+            let opts = match vol.get("driver_opts").and_then(|v| v.as_object()) {
+                Some(o) => o,
+                None => continue,
+            };
+            let is_bind = opts.get("type").and_then(|v| v.as_str()) == Some("none")
+                || opts.get("o").and_then(|v| v.as_str()).map(|s| s.contains("bind")).unwrap_or(false);
+            if !is_bind {
+                continue;
+            }
+            let device = opts.get("device").and_then(|v| v.as_str()).unwrap_or("");
+            if device.contains("..") {
+                return Err(format!("volumes.{vol_name}.driver_opts.device '{device}' escapes via '..'"));
+            }
+            let allowed_app_dir = format!("/var/lib/nasty/apps/{app_name}");
+            let allowed = device.starts_with(&format!("{allowed_app_dir}/"))
+                || device == allowed_app_dir
+                || device.starts_with("/fs/")
+                || device == "/fs";
+            if !allowed {
+                return Err(format!(
+                    "volumes.{vol_name} bind-mounts '{device}' — only paths under '{allowed_app_dir}/' or '/fs/' are allowed"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Extract image references from a docker-compose YAML string.
 /// Looks for `image:` fields under `services:` — skips services that use `build:` instead.
 fn extract_compose_images(yaml: &str) -> Vec<String> {
@@ -509,4 +714,106 @@ async fn pull_image_with_progress(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_compose;
+
+    fn ok(yaml: &str) {
+        assert!(validate_compose(yaml, "myapp").is_ok(), "expected ok: {yaml}");
+    }
+
+    fn err(yaml: &str, needle: &str) {
+        let e = validate_compose(yaml, "myapp").expect_err(&format!("expected err: {yaml}"));
+        assert!(e.contains(needle), "error '{e}' did not contain '{needle}'");
+    }
+
+    #[test]
+    fn accepts_minimal_compose() {
+        ok("services:\n  web:\n    image: nginx\n");
+    }
+
+    #[test]
+    fn rejects_privileged() {
+        err("services:\n  bad:\n    image: alpine\n    privileged: true\n", "privileged");
+    }
+
+    #[test]
+    fn rejects_host_namespaces() {
+        err("services:\n  bad:\n    image: alpine\n    pid: host\n", "host");
+        err("services:\n  bad:\n    image: alpine\n    network_mode: host\n", "host");
+        err("services:\n  bad:\n    image: alpine\n    ipc: host\n", "host");
+        err("services:\n  bad:\n    image: alpine\n    userns_mode: host\n", "host");
+    }
+
+    #[test]
+    fn rejects_dangerous_caps() {
+        err("services:\n  bad:\n    image: alpine\n    cap_add: [SYS_ADMIN]\n", "SYS_ADMIN");
+        err("services:\n  bad:\n    image: alpine\n    cap_add: [\"CAP_SYS_PTRACE\"]\n", "PTRACE");
+        err("services:\n  bad:\n    image: alpine\n    cap_add: [ALL]\n", "ALL");
+    }
+
+    #[test]
+    fn allows_safe_caps() {
+        ok("services:\n  ok:\n    image: alpine\n    cap_add: [NET_BIND_SERVICE]\n");
+    }
+
+    #[test]
+    fn rejects_security_opt_unconfined() {
+        err("services:\n  bad:\n    image: alpine\n    security_opt: [\"seccomp=unconfined\"]\n", "seccomp");
+        err("services:\n  bad:\n    image: alpine\n    security_opt: [\"apparmor=unconfined\"]\n", "apparmor");
+        err("services:\n  bad:\n    image: alpine\n    security_opt: [\"no-new-privileges=false\"]\n", "no-new-privileges");
+    }
+
+    #[test]
+    fn rejects_devices() {
+        err("services:\n  bad:\n    image: alpine\n    devices: [\"/dev/sda:/dev/sda\"]\n", "devices");
+    }
+
+    #[test]
+    fn rejects_root_bind_mount() {
+        err("services:\n  bad:\n    image: alpine\n    volumes: [\"/:/host\"]\n", "/");
+        err("services:\n  bad:\n    image: alpine\n    volumes: [\"/etc:/etc\"]\n", "/etc");
+        err("services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty:/secrets\"]\n", "/var/lib/nasty");
+    }
+
+    #[test]
+    fn rejects_dotdot_escape() {
+        err(
+            "services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty/apps/myapp/../auth.json:/x\"]\n",
+            "..",
+        );
+    }
+
+    #[test]
+    fn allows_app_dir_and_share_root_binds() {
+        ok("services:\n  ok:\n    image: alpine\n    volumes:\n      - \"/var/lib/nasty/apps/myapp/data:/data\"\n      - \"/fs/photos:/photos:ro\"\n      - \"named-vol:/x\"\n");
+    }
+
+    #[test]
+    fn rejects_long_form_bind_outside_allowed() {
+        err(
+            "services:\n  bad:\n    image: alpine\n    volumes:\n      - type: bind\n        source: /home/user\n        target: /x\n",
+            "/home/user",
+        );
+    }
+
+    #[test]
+    fn rejects_top_volume_bind_to_root() {
+        err(
+            "services:\n  s:\n    image: alpine\n    volumes: [evil:/x]\nvolumes:\n  evil:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n",
+            "/",
+        );
+    }
+
+    #[test]
+    fn rejects_unparseable_yaml() {
+        err("services: [unbalanced\n", "parse");
+    }
+
+    #[test]
+    fn rejects_no_services_block() {
+        err("version: '3'\n", "services");
+    }
 }
