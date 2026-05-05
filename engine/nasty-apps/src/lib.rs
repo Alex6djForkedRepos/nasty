@@ -39,6 +39,8 @@ const LABEL_MANAGED: &str = "nasty.managed";
 const LABEL_APP_NAME: &str = "nasty.app.name";
 /// Label storing the app kind: "simple" or "compose".
 const LABEL_APP_KIND: &str = "nasty.app.kind";
+/// Label set to "true" when the app was deployed with allow_unsafe.
+const LABEL_APP_UNSAFE: &str = "nasty.app.unsafe";
 
 // ── Errors ──────────────────────────────────────────────────────
 
@@ -60,6 +62,8 @@ pub enum AppsError {
     CommandFailed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("forbidden bind mount: {0}")]
+    ForbiddenBind(String),
 }
 
 impl AppsError {
@@ -73,8 +77,63 @@ impl AppsError {
             Self::DockerFailed(_) => -33006,
             Self::CommandFailed(_) => -33007,
             Self::Io(_) => -33008,
+            Self::ForbiddenBind(_) => -33009,
         }
     }
+}
+
+/// Validate the `host_path` of every volume in a simple-app install/update.
+/// Mirrors the compose-side validator: bind mounts to `/`, anything containing
+/// `..`, and any path under `/var/lib/nasty/` (except the app's own dir) are
+/// rejected outright. In strict mode (allow_unsafe == false), bind mounts
+/// must additionally fall under the app's data dir or `/fs/`.
+pub fn validate_simple_volumes(
+    app_name: &str,
+    storage_base: &str,
+    volumes: &[AppVolume],
+    allow_unsafe: bool,
+) -> Result<(), AppsError> {
+    let app_data_dir = format!("{}/{}", storage_base.trim_end_matches('/'), app_name);
+    for v in volumes {
+        // Empty host_path is fine — the install path auto-generates one
+        // under the storage base.
+        if v.host_path.is_empty() {
+            continue;
+        }
+        let src = &v.host_path;
+
+        if src.contains("..") {
+            return Err(AppsError::ForbiddenBind(format!("'{src}' escapes via '..'")));
+        }
+        if src == "/" {
+            return Err(AppsError::ForbiddenBind(
+                "host root '/' is never allowed as a bind mount".to_string()
+            ));
+        }
+        let in_app_dir = src == &app_data_dir
+            || src.starts_with(&format!("{app_data_dir}/"));
+        // Engine state dir is off-limits even with allow_unsafe — that's where
+        // auth.json, settings.json, audit.log, OIDC client secrets live.
+        let in_engine_state = src == "/var/lib/nasty"
+            || src.starts_with("/var/lib/nasty/");
+        if in_engine_state && !in_app_dir {
+            return Err(AppsError::ForbiddenBind(format!(
+                "'{src}' targets engine state — not allowed even with allow_unsafe"
+            )));
+        }
+
+        if !allow_unsafe {
+            let allowed = in_app_dir
+                || src == "/fs"
+                || src.starts_with("/fs/");
+            if !allowed {
+                return Err(AppsError::ForbiddenBind(format!(
+                    "'{src}' is outside '{app_data_dir}/' and '/fs/'. Set allow_unsafe to override."
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl From<bollard::errors::Error> for AppsError {
@@ -144,6 +203,11 @@ pub struct App {
     /// Host ports mapped by this app.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<MappedPort>,
+    /// True if the app was deployed with allow_unsafe — i.e. it has elevated
+    /// privileges (caps, host devices, host namespaces, or bind mounts
+    /// outside the standard sandbox). Surfaced as a badge in the WebUI.
+    #[serde(default)]
+    pub unsafe_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -177,6 +241,9 @@ pub struct AppConfig {
     pub volumes: Vec<AppVolume>,
     pub cpu_limit: Option<String>,
     pub memory_limit: Option<String>,
+    /// Whether the app was deployed with allow_unsafe (read from container label).
+    #[serde(default)]
+    pub allow_unsafe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -203,6 +270,11 @@ pub struct InstallAppRequest {
     pub cpu_limit: Option<String>,
     /// Memory limit (e.g. "256m", "1g").
     pub memory_limit: Option<String>,
+    /// Opt out of the strict bind-mount allowlist. Admin-only / audited /
+    /// surfaced as a badge in the UI. Engine state and the host root are
+    /// still rejected even with this set.
+    #[serde(default)]
+    pub allow_unsafe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -512,6 +584,14 @@ impl AppsService {
             return Err(AppsError::AppAlreadyExists(req.name));
         }
 
+        // Validate bind mounts before we pull anything. Engine state and the
+        // host root are blocked unconditionally; the broader allowlist only
+        // applies in safe mode.
+        let storage_base = Self::load_config()
+            .storage_path
+            .unwrap_or_else(|| "/var/lib/nasty/apps-data".to_string());
+        validate_simple_volumes(&req.name, &storage_base, &req.volumes, req.allow_unsafe)?;
+
         // Pull the image first
         self.pull_image(&req.image).await?;
 
@@ -570,6 +650,9 @@ impl AppsService {
         labels.insert(LABEL_MANAGED.to_string(), "true".to_string());
         labels.insert(LABEL_APP_NAME.to_string(), req.name.clone());
         labels.insert(LABEL_APP_KIND.to_string(), "simple".to_string());
+        if req.allow_unsafe {
+            labels.insert(LABEL_APP_UNSAFE.to_string(), "true".to_string());
+        }
 
         let host_config = HostConfig {
             port_bindings: if port_bindings.is_empty() {
@@ -619,6 +702,7 @@ impl AppsService {
             "name": req.name,
             "image": req.image,
             "kind": "simple",
+            "allow_unsafe": req.allow_unsafe,
         });
         let manifest_path = format!("{}/{}.json", COMPOSE_DIR, req.name);
         let _ = tokio::fs::create_dir_all(COMPOSE_DIR).await;
@@ -764,6 +848,12 @@ impl AppsService {
                     } else {
                         format!("{} images", images.len())
                     };
+                    let unsafe_mode = tokio::fs::read_to_string(path.join(".nasty-meta.json"))
+                        .await
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .and_then(|v| v.get("allow_unsafe").and_then(|b| b.as_bool()))
+                        .unwrap_or(false);
                     apps.push(App {
                         name,
                         image,
@@ -772,6 +862,7 @@ impl AppsService {
                         kind: "compose".to_string(),
                         containers: Vec::new(),
                         ports: Vec::new(),
+                        unsafe_mode,
                     });
                 }
             } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -780,6 +871,7 @@ impl AppsService {
                     if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
                         let app_name = manifest.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                         let image = manifest.get("image").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        let unsafe_mode = manifest.get("allow_unsafe").and_then(|b| b.as_bool()).unwrap_or(false);
                         if !app_name.is_empty() {
                             apps.push(App {
                                 name: app_name,
@@ -789,6 +881,7 @@ impl AppsService {
                                 kind: "simple".to_string(),
                                 containers: Vec::new(),
                                 ports: Vec::new(),
+                                unsafe_mode,
                             });
                         }
                     }
@@ -832,6 +925,10 @@ impl AppsService {
                 .and_then(|l| l.get(LABEL_APP_KIND))
                 .cloned()
                 .unwrap_or_else(|| "simple".to_string());
+            let unsafe_mode = labels
+                .and_then(|l| l.get(LABEL_APP_UNSAFE))
+                .map(|v| v == "true")
+                .unwrap_or(false);
 
             apps.push(App {
                 name: app_name,
@@ -841,6 +938,7 @@ impl AppsService {
                 kind,
                 containers: vec![],
                 ports: extract_ports(c),
+                unsafe_mode,
             });
         }
 
@@ -916,6 +1014,13 @@ impl AppsService {
                     "exited".to_string()
                 };
 
+                let unsafe_mode = tokio::fs::read_to_string(entry.path().join(".nasty-meta.json"))
+                    .await
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("allow_unsafe").and_then(|b| b.as_bool()))
+                    .unwrap_or(false);
+
                 seen_names.insert(name.clone());
                 apps.push(App {
                     name,
@@ -925,6 +1030,7 @@ impl AppsService {
                     kind: "compose".to_string(),
                     containers,
                     ports: all_ports,
+                    unsafe_mode,
                 });
             }
         }
@@ -1053,6 +1159,13 @@ impl AppsService {
             }
         });
 
+        let allow_unsafe = config
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(LABEL_APP_UNSAFE))
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         Ok(AppConfig {
             name: name.to_string(),
             image,
@@ -1061,6 +1174,7 @@ impl AppsService {
             volumes,
             cpu_limit,
             memory_limit,
+            allow_unsafe,
         })
     }
 
@@ -1741,6 +1855,7 @@ impl AppsService {
                 volumes: config.volumes,
                 cpu_limit: config.cpu_limit,
                 memory_limit: config.memory_limit,
+                allow_unsafe: config.allow_unsafe,
             };
             return self.install(req).await;
         }
@@ -2258,4 +2373,85 @@ async fn inspect_image_ports(image: &str) -> Result<Vec<AppPort>, String> {
 
     ports.sort_by_key(|p| p.container_port);
     Ok(ports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_simple_volumes, AppVolume};
+
+    fn vol(host_path: &str) -> AppVolume {
+        AppVolume {
+            name: "v".to_string(),
+            mount_path: "/data".to_string(),
+            host_path: host_path.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_host_path_is_fine() {
+        // Auto-generated path under storage base; install creates it.
+        validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[vol("")], false).unwrap();
+    }
+
+    #[test]
+    fn strict_allows_app_data_dir_and_fs() {
+        validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[
+            vol("/var/lib/nasty/apps-data/myapp/cfg"),
+            vol("/fs/photos"),
+        ], false).unwrap();
+    }
+
+    #[test]
+    fn strict_rejects_outside_allowlist() {
+        let e = validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[vol("/home/user/data")], false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("/home/user/data"), "{e}");
+    }
+
+    #[test]
+    fn strict_rejects_etc() {
+        validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[vol("/etc")], false).unwrap_err();
+    }
+
+    #[test]
+    fn unsafe_allows_arbitrary_paths() {
+        validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[
+            vol("/etc"),
+            vol("/home/user/data"),
+            vol("/dev/shm"),
+        ], true).unwrap();
+    }
+
+    #[test]
+    fn unsafe_still_rejects_root() {
+        let e = validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[vol("/")], true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'/'"), "{e}");
+    }
+
+    #[test]
+    fn unsafe_still_rejects_dotdot() {
+        let e = validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[vol("/var/lib/nasty/apps-data/myapp/../auth.json")], true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(".."), "{e}");
+    }
+
+    #[test]
+    fn unsafe_still_rejects_engine_state() {
+        let e = validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[vol("/var/lib/nasty/auth.json")], true)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("engine state"), "{e}");
+    }
+
+    #[test]
+    fn unsafe_still_allows_app_data_under_engine_state() {
+        // app-data dir is /var/lib/nasty/apps-data/<name> and is the deliberate exception.
+        validate_simple_volumes("myapp", "/var/lib/nasty/apps-data", &[
+            vol("/var/lib/nasty/apps-data/myapp/foo"),
+        ], true).unwrap();
+    }
 }

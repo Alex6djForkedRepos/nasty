@@ -46,6 +46,12 @@ struct DeployRequest {
     compose_file: Option<String>,
     /// For simple: JSON-encoded InstallAppRequest params (ports, env, volumes, etc.)
     install_params: Option<serde_json::Value>,
+    /// Compose only: opt out of the strict sandbox so containers can request
+    /// caps like NET_ADMIN, host devices like /dev/dri, or host namespaces.
+    /// Admin-only, audited, and surfaced as a badge in the UI. Engine-state
+    /// bind mounts and the host root are still rejected even with this set.
+    #[serde(default)]
+    allow_unsafe: bool,
 }
 
 #[derive(Serialize)]
@@ -164,6 +170,23 @@ async fn deploy_simple(socket: &mut WebSocket, state: &AppState, req: &DeployReq
     };
     params.name = req.name.clone();
     params.image = image;
+    // Top-level flag wins over anything embedded in install_params, so the
+    // privileged-deploy decision is plainly visible in the deploy request.
+    params.allow_unsafe = req.allow_unsafe;
+
+    if req.allow_unsafe {
+        crate::auth::audit(
+            "simple_unsafe_deploy",
+            "<websocket>",
+            "<websocket>",
+            &format!("app={}", req.name),
+        );
+        let _ = socket
+            .send(Message::Text(DeployMessage::log(
+                "WARNING: deploying with allow_unsafe — bind mounts outside the sandbox are permitted",
+            ).into()))
+            .await;
+    }
 
     match state.apps.install(params).await {
         Ok(app) => {
@@ -189,10 +212,25 @@ async fn deploy_compose(socket: &mut WebSocket, state: &AppState, req: &DeployRe
     // Reject dangerous compose directives before anything touches disk or
     // docker. Without this, an authenticated admin (or anyone who steals an
     // admin token) can mount '/' into a container and walk out with every
-    // secret on the host.
-    if let Err(e) = validate_compose(&compose_content, &req.name) {
+    // secret on the host. allow_unsafe relaxes most checks but never permits
+    // bind-mounting the engine's state dir or the host root.
+    if let Err(e) = validate_compose(&compose_content, &req.name, req.allow_unsafe) {
         let _ = socket.send(Message::Text(DeployMessage::error(&format!("compose rejected: {e}")).into())).await;
         return;
+    }
+
+    if req.allow_unsafe {
+        crate::auth::audit(
+            "compose_unsafe_deploy",
+            "<websocket>",
+            "<websocket>",
+            &format!("app={}", req.name),
+        );
+        let _ = socket
+            .send(Message::Text(DeployMessage::log(
+                "WARNING: deploying with allow_unsafe — container has elevated privileges",
+            ).into()))
+            .await;
     }
 
     let compose_dir = format!("/var/lib/nasty/apps/{}", req.name);
@@ -208,6 +246,12 @@ async fn deploy_compose(socket: &mut WebSocket, state: &AppState, req: &DeployRe
     }
     if let Err(e) = tokio::fs::write(&compose_path, &compose_content).await {
         let _ = socket.send(Message::Text(DeployMessage::error(&format!("failed to write compose file: {e}")).into())).await;
+        return;
+    }
+    // Persist the unsafe flag next to the compose file so list/get can surface
+    // it. Marker is the presence of `allow_unsafe: true` in the JSON file.
+    if let Err(e) = write_app_meta(&compose_dir, req.allow_unsafe).await {
+        let _ = socket.send(Message::Text(DeployMessage::error(&format!("failed to write app meta: {e}")).into())).await;
         return;
     }
 
@@ -428,6 +472,29 @@ async fn stream_command(
     Ok(())
 }
 
+/// Sibling file alongside docker-compose.yml (or simple-app json manifest)
+/// recording per-app deploy flags that aren't part of the user-supplied
+/// content itself. Today there's only one flag — allow_unsafe.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AppMeta {
+    #[serde(default)]
+    allow_unsafe: bool,
+}
+
+async fn write_app_meta(app_dir: &str, allow_unsafe: bool) -> Result<(), String> {
+    let path = format!("{app_dir}/.nasty-meta.json");
+    if !allow_unsafe {
+        // Don't keep stale "true" markers around when an admin redeploys
+        // safely — the file's absence is the safe default.
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(());
+    }
+    let meta = AppMeta { allow_unsafe };
+    let json = serde_json::to_string(&meta).map_err(|e| e.to_string())?;
+    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Capabilities that effectively grant host root if added to a container.
 /// CAP_SYS_ADMIN is "the new root" — kernel module loading, mount, etc.
 /// CAP_SYS_PTRACE lets you peek into other processes (including the engine).
@@ -451,15 +518,47 @@ const FORBIDDEN_SECURITY_OPTS: &[&str] = &[
     "systempaths=unconfined", "systempaths:unconfined",
 ];
 
+/// Reasons a bind-mount source must be rejected outright, regardless of
+/// allow_unsafe. Returns `Some(reason)` when one applies.
+///
+/// The order matters: `..` and the host root are checked first because they
+/// shouldn't be reachable even via the app-dir carve-out. The engine-state
+/// prefix is reported separately so the caller can decide whether the app's
+/// own subtree under `/var/lib/nasty/apps/<name>/` is fine.
+enum BindReject {
+    /// Always rejected — caller cannot override.
+    Hard(&'static str),
+    /// Inside engine state — caller may carve out the app's own subtree.
+    EngineState,
+}
+
+fn always_forbidden_bind(source: &str) -> Option<BindReject> {
+    if source.contains("..") {
+        return Some(BindReject::Hard("'..' traversal is never allowed in bind sources"));
+    }
+    if source == "/" {
+        return Some(BindReject::Hard("'/' (host root) is never allowed as a bind source"));
+    }
+    if source == "/var/lib/nasty" || source.starts_with("/var/lib/nasty/") {
+        return Some(BindReject::EngineState);
+    }
+    None
+}
+
 /// Validate a docker-compose YAML before it's written to disk and handed to
 /// `docker compose up`. Returns Err with a human-readable message on the
 /// first dangerous directive found.
 ///
-/// We reject patterns that grant a container host-equivalent privilege:
-/// privileged mode, host namespace sharing, dangerous capabilities, opt-out
-/// of seccomp/apparmor, host-device passthrough, and bind mounts pointing
-/// outside the app's own directory or `/fs/` share roots.
-fn validate_compose(yaml: &str, app_name: &str) -> Result<(), String> {
+/// `allow_unsafe = false` (the default) is the strict mode: rejects any
+/// directive that grants host-equivalent privilege.
+///
+/// `allow_unsafe = true` is opt-in (admin-only, audited, surfaced in the UI):
+/// the strict checks are relaxed so workloads that legitimately need elevated
+/// access work — Tailscale (NET_ADMIN + /dev/net/tun), Plex/Jellyfin GPU
+/// transcoding (/dev/dri), Frigate (USB cameras), etc. A small core of checks
+/// stays on either way: nothing may bind-mount the engine's state dir, the
+/// root filesystem, or use `..` to escape.
+fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<(), String> {
     let parsed: serde_json::Value = serde_yaml_ng::from_str(yaml)
         .map_err(|e| format!("compose YAML failed to parse: {e}"))?;
 
@@ -473,72 +572,59 @@ fn validate_compose(yaml: &str, app_name: &str) -> Result<(), String> {
     for (svc_name, svc) in services {
         let scope = |field: &str| format!("services.{svc_name}.{field}");
 
-        if svc.get("privileged").and_then(|v| v.as_bool()) == Some(true) {
-            return Err(format!("{} sets privileged: true (host-root equivalent)", scope("privileged")));
-        }
-
-        for (field, allowed_self_only) in [
-            ("pid", true),
-            ("ipc", true),
-            ("uts", true),
-            ("userns_mode", true),
-            ("cgroup", true),
-            ("network_mode", false),
-        ] {
-            if let Some(v) = svc.get(field).and_then(|v| v.as_str()) {
-                let v_lower = v.to_ascii_lowercase();
-                if v_lower == "host" || v_lower.starts_with("host:") {
-                    return Err(format!("{} = '{}' shares the host namespace", scope(field), v));
-                }
-                if !allowed_self_only && v_lower == "none" {
-                    // network_mode: none is fine, just no networking.
-                    continue;
-                }
+        if !allow_unsafe {
+            if svc.get("privileged").and_then(|v| v.as_bool()) == Some(true) {
+                return Err(format!("{} sets privileged: true (host-root equivalent). Set allow_unsafe to override.", scope("privileged")));
             }
-        }
-        // Compose v2 also accepts top-level `network_mode: host` plus `pid: host`
-        // already covered above. `ipc: shareable` lets other containers attach
-        // and is risky — block it.
-        if let Some(v) = svc.get("ipc").and_then(|v| v.as_str()) {
-            if v.eq_ignore_ascii_case("shareable") {
-                return Err(format!("{} = 'shareable' lets other containers attach to this IPC namespace", scope("ipc")));
-            }
-        }
 
-        if let Some(caps) = svc.get("cap_add").and_then(|v| v.as_array()) {
-            for c in caps {
-                if let Some(s) = c.as_str() {
-                    let bare = s.strip_prefix("CAP_").unwrap_or(s).to_ascii_uppercase();
-                    if FORBIDDEN_CAPS.contains(&bare.as_str()) {
-                        return Err(format!("{} includes '{}' — grants host-equivalent privilege", scope("cap_add"), s));
+            for field in ["pid", "ipc", "uts", "userns_mode", "cgroup", "network_mode"] {
+                if let Some(v) = svc.get(field).and_then(|v| v.as_str()) {
+                    let v_lower = v.to_ascii_lowercase();
+                    if v_lower == "host" || v_lower.starts_with("host:") {
+                        return Err(format!(
+                            "{} = '{}' shares the host namespace. Set allow_unsafe to override.",
+                            scope(field), v
+                        ));
                     }
                 }
             }
-        }
+            if let Some(v) = svc.get("ipc").and_then(|v| v.as_str()) {
+                if v.eq_ignore_ascii_case("shareable") {
+                    return Err(format!("{} = 'shareable' lets other containers attach. Set allow_unsafe to override.", scope("ipc")));
+                }
+            }
 
-        if let Some(opts) = svc.get("security_opt").and_then(|v| v.as_array()) {
-            for o in opts {
-                if let Some(s) = o.as_str() {
-                    let normalized = s.replace(' ', "").to_ascii_lowercase();
-                    if FORBIDDEN_SECURITY_OPTS.iter().any(|f| normalized == *f) {
-                        return Err(format!("{} includes '{}' — disables container sandbox", scope("security_opt"), s));
+            if let Some(caps) = svc.get("cap_add").and_then(|v| v.as_array()) {
+                for c in caps {
+                    if let Some(s) = c.as_str() {
+                        let bare = s.strip_prefix("CAP_").unwrap_or(s).to_ascii_uppercase();
+                        if FORBIDDEN_CAPS.contains(&bare.as_str()) {
+                            return Err(format!("{} includes '{}' — grants host-equivalent privilege. Set allow_unsafe to override.", scope("cap_add"), s));
+                        }
                     }
                 }
             }
-        }
 
-        // `devices:` passes host /dev nodes into the container. We don't have a
-        // safe-by-default allowlist (different apps need different devices), so
-        // require the operator to fork the engine if they really need this.
-        if let Some(devices) = svc.get("devices").and_then(|v| v.as_array()) {
-            if !devices.is_empty() {
-                return Err(format!("{} maps host devices into the container; not allowed", scope("devices")));
+            if let Some(opts) = svc.get("security_opt").and_then(|v| v.as_array()) {
+                for o in opts {
+                    if let Some(s) = o.as_str() {
+                        let normalized = s.replace(' ', "").to_ascii_lowercase();
+                        if FORBIDDEN_SECURITY_OPTS.iter().any(|f| normalized == *f) {
+                            return Err(format!("{} includes '{}' — disables container sandbox. Set allow_unsafe to override.", scope("security_opt"), s));
+                        }
+                    }
+                }
             }
-        }
 
-        // `device_cgroup_rules:` punches holes in the device cgroup.
-        if svc.get("device_cgroup_rules").is_some() {
-            return Err(format!("{} bypasses the device cgroup; not allowed", scope("device_cgroup_rules")));
+            if let Some(devices) = svc.get("devices").and_then(|v| v.as_array()) {
+                if !devices.is_empty() {
+                    return Err(format!("{} maps host devices. Set allow_unsafe to override.", scope("devices")));
+                }
+            }
+
+            if svc.get("device_cgroup_rules").is_some() {
+                return Err(format!("{} bypasses the device cgroup. Set allow_unsafe to override.", scope("device_cgroup_rules")));
+            }
         }
 
         if let Some(volumes) = svc.get("volumes").and_then(|v| v.as_array()) {
@@ -571,21 +657,40 @@ fn validate_compose(yaml: &str, app_name: &str) -> Result<(), String> {
                     continue;
                 }
 
-                if source.contains("..") {
-                    return Err(format!("{} bind-mounts '{}' which escapes via '..'", scope("volumes"), source));
+                let in_app_dir = source.starts_with(&format!("{allowed_app_dir}/"))
+                    || source == allowed_app_dir;
+
+                match always_forbidden_bind(&source) {
+                    Some(BindReject::Hard(why)) => {
+                        return Err(format!(
+                            "{} bind-mounts '{}' — {} (off-limits even with allow_unsafe)",
+                            scope("volumes"),
+                            source,
+                            why
+                        ));
+                    }
+                    Some(BindReject::EngineState) if !in_app_dir => {
+                        return Err(format!(
+                            "{} bind-mounts '{}' — engine state under /var/lib/nasty is off-limits even with allow_unsafe",
+                            scope("volumes"),
+                            source
+                        ));
+                    }
+                    _ => {}
                 }
 
-                let allowed = source.starts_with(&format!("{allowed_app_dir}/"))
-                    || source == allowed_app_dir
-                    || source.starts_with("/fs/")
-                    || source == "/fs";
-                if !allowed {
-                    return Err(format!(
-                        "{} bind-mounts '{}' — only paths under '{}/' or '/fs/' are allowed",
-                        scope("volumes"),
-                        source,
-                        allowed_app_dir
-                    ));
+                if !allow_unsafe {
+                    let allowed = in_app_dir
+                        || source.starts_with("/fs/")
+                        || source == "/fs";
+                    if !allowed {
+                        return Err(format!(
+                            "{} bind-mounts '{}' — only paths under '{}/' or '/fs/' are allowed. Set allow_unsafe to override.",
+                            scope("volumes"),
+                            source,
+                            allowed_app_dir
+                        ));
+                    }
                 }
             }
         }
@@ -605,18 +710,36 @@ fn validate_compose(yaml: &str, app_name: &str) -> Result<(), String> {
                 continue;
             }
             let device = opts.get("device").and_then(|v| v.as_str()).unwrap_or("");
-            if device.contains("..") {
-                return Err(format!("volumes.{vol_name}.driver_opts.device '{device}' escapes via '..'"));
+            if device.is_empty() {
+                continue;
             }
-            let allowed_app_dir = format!("/var/lib/nasty/apps/{app_name}");
-            let allowed = device.starts_with(&format!("{allowed_app_dir}/"))
-                || device == allowed_app_dir
-                || device.starts_with("/fs/")
-                || device == "/fs";
-            if !allowed {
-                return Err(format!(
-                    "volumes.{vol_name} bind-mounts '{device}' — only paths under '{allowed_app_dir}/' or '/fs/' are allowed"
-                ));
+
+            let in_app_dir = device.starts_with(&format!("{allowed_app_dir}/"))
+                || device == allowed_app_dir;
+
+            match always_forbidden_bind(device) {
+                Some(BindReject::Hard(why)) => {
+                    return Err(format!(
+                        "volumes.{vol_name} bind-mounts '{device}' — {why} (off-limits even with allow_unsafe)"
+                    ));
+                }
+                Some(BindReject::EngineState) if !in_app_dir => {
+                    return Err(format!(
+                        "volumes.{vol_name} bind-mounts '{device}' — engine state under /var/lib/nasty is off-limits even with allow_unsafe"
+                    ));
+                }
+                _ => {}
+            }
+
+            if !allow_unsafe {
+                let allowed = in_app_dir
+                    || device.starts_with("/fs/")
+                    || device == "/fs";
+                if !allowed {
+                    return Err(format!(
+                        "volumes.{vol_name} bind-mounts '{device}' — only paths under '{allowed_app_dir}/' or '/fs/' are allowed. Set allow_unsafe to override."
+                    ));
+                }
             }
         }
     }
@@ -720,100 +843,163 @@ async fn pull_image_with_progress(
 mod tests {
     use super::validate_compose;
 
-    fn ok(yaml: &str) {
-        assert!(validate_compose(yaml, "myapp").is_ok(), "expected ok: {yaml}");
+    fn ok_strict(yaml: &str) {
+        assert!(validate_compose(yaml, "myapp", false).is_ok(), "expected strict ok: {yaml}");
     }
 
-    fn err(yaml: &str, needle: &str) {
-        let e = validate_compose(yaml, "myapp").expect_err(&format!("expected err: {yaml}"));
+    fn err_strict(yaml: &str, needle: &str) {
+        let e = validate_compose(yaml, "myapp", false).expect_err(&format!("expected strict err: {yaml}"));
         assert!(e.contains(needle), "error '{e}' did not contain '{needle}'");
     }
 
+    fn ok_unsafe(yaml: &str) {
+        assert!(validate_compose(yaml, "myapp", true).is_ok(), "expected unsafe ok: {yaml}");
+    }
+
+    fn err_unsafe(yaml: &str, needle: &str) {
+        let e = validate_compose(yaml, "myapp", true).expect_err(&format!("expected unsafe err: {yaml}"));
+        assert!(e.contains(needle), "error '{e}' did not contain '{needle}'");
+    }
+
+    // ── Strict mode (default) ───────────────────────────────────
+
     #[test]
-    fn accepts_minimal_compose() {
-        ok("services:\n  web:\n    image: nginx\n");
+    fn strict_accepts_minimal_compose() {
+        ok_strict("services:\n  web:\n    image: nginx\n");
     }
 
     #[test]
-    fn rejects_privileged() {
-        err("services:\n  bad:\n    image: alpine\n    privileged: true\n", "privileged");
+    fn strict_rejects_privileged() {
+        err_strict("services:\n  bad:\n    image: alpine\n    privileged: true\n", "privileged");
     }
 
     #[test]
-    fn rejects_host_namespaces() {
-        err("services:\n  bad:\n    image: alpine\n    pid: host\n", "host");
-        err("services:\n  bad:\n    image: alpine\n    network_mode: host\n", "host");
-        err("services:\n  bad:\n    image: alpine\n    ipc: host\n", "host");
-        err("services:\n  bad:\n    image: alpine\n    userns_mode: host\n", "host");
+    fn strict_rejects_host_namespaces() {
+        err_strict("services:\n  bad:\n    image: alpine\n    pid: host\n", "host");
+        err_strict("services:\n  bad:\n    image: alpine\n    network_mode: host\n", "host");
+        err_strict("services:\n  bad:\n    image: alpine\n    ipc: host\n", "host");
+        err_strict("services:\n  bad:\n    image: alpine\n    userns_mode: host\n", "host");
     }
 
     #[test]
-    fn rejects_dangerous_caps() {
-        err("services:\n  bad:\n    image: alpine\n    cap_add: [SYS_ADMIN]\n", "SYS_ADMIN");
-        err("services:\n  bad:\n    image: alpine\n    cap_add: [\"CAP_SYS_PTRACE\"]\n", "PTRACE");
-        err("services:\n  bad:\n    image: alpine\n    cap_add: [ALL]\n", "ALL");
+    fn strict_rejects_dangerous_caps() {
+        err_strict("services:\n  bad:\n    image: alpine\n    cap_add: [SYS_ADMIN]\n", "SYS_ADMIN");
+        err_strict("services:\n  bad:\n    image: alpine\n    cap_add: [\"CAP_SYS_PTRACE\"]\n", "PTRACE");
+        err_strict("services:\n  bad:\n    image: alpine\n    cap_add: [ALL]\n", "ALL");
     }
 
     #[test]
-    fn allows_safe_caps() {
-        ok("services:\n  ok:\n    image: alpine\n    cap_add: [NET_BIND_SERVICE]\n");
+    fn strict_allows_safe_caps() {
+        ok_strict("services:\n  ok:\n    image: alpine\n    cap_add: [NET_BIND_SERVICE]\n");
     }
 
     #[test]
-    fn rejects_security_opt_unconfined() {
-        err("services:\n  bad:\n    image: alpine\n    security_opt: [\"seccomp=unconfined\"]\n", "seccomp");
-        err("services:\n  bad:\n    image: alpine\n    security_opt: [\"apparmor=unconfined\"]\n", "apparmor");
-        err("services:\n  bad:\n    image: alpine\n    security_opt: [\"no-new-privileges=false\"]\n", "no-new-privileges");
+    fn strict_rejects_security_opt_unconfined() {
+        err_strict("services:\n  bad:\n    image: alpine\n    security_opt: [\"seccomp=unconfined\"]\n", "seccomp");
+        err_strict("services:\n  bad:\n    image: alpine\n    security_opt: [\"apparmor=unconfined\"]\n", "apparmor");
+        err_strict("services:\n  bad:\n    image: alpine\n    security_opt: [\"no-new-privileges=false\"]\n", "no-new-privileges");
     }
 
     #[test]
-    fn rejects_devices() {
-        err("services:\n  bad:\n    image: alpine\n    devices: [\"/dev/sda:/dev/sda\"]\n", "devices");
+    fn strict_rejects_devices() {
+        err_strict("services:\n  bad:\n    image: alpine\n    devices: [\"/dev/sda:/dev/sda\"]\n", "devices");
     }
 
     #[test]
-    fn rejects_root_bind_mount() {
-        err("services:\n  bad:\n    image: alpine\n    volumes: [\"/:/host\"]\n", "/");
-        err("services:\n  bad:\n    image: alpine\n    volumes: [\"/etc:/etc\"]\n", "/etc");
-        err("services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty:/secrets\"]\n", "/var/lib/nasty");
+    fn strict_rejects_etc_bind() {
+        err_strict("services:\n  bad:\n    image: alpine\n    volumes: [\"/etc:/etc\"]\n", "/etc");
     }
 
     #[test]
-    fn rejects_dotdot_escape() {
-        err(
-            "services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty/apps/myapp/../auth.json:/x\"]\n",
-            "..",
-        );
+    fn strict_allows_app_dir_and_share_root_binds() {
+        ok_strict("services:\n  ok:\n    image: alpine\n    volumes:\n      - \"/var/lib/nasty/apps/myapp/data:/data\"\n      - \"/fs/photos:/photos:ro\"\n      - \"named-vol:/x\"\n");
     }
 
     #[test]
-    fn allows_app_dir_and_share_root_binds() {
-        ok("services:\n  ok:\n    image: alpine\n    volumes:\n      - \"/var/lib/nasty/apps/myapp/data:/data\"\n      - \"/fs/photos:/photos:ro\"\n      - \"named-vol:/x\"\n");
-    }
-
-    #[test]
-    fn rejects_long_form_bind_outside_allowed() {
-        err(
+    fn strict_rejects_long_form_bind_outside_allowed() {
+        err_strict(
             "services:\n  bad:\n    image: alpine\n    volumes:\n      - type: bind\n        source: /home/user\n        target: /x\n",
             "/home/user",
         );
     }
 
     #[test]
-    fn rejects_top_volume_bind_to_root() {
-        err(
-            "services:\n  s:\n    image: alpine\n    volumes: [evil:/x]\nvolumes:\n  evil:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n",
-            "/",
+    fn strict_rejects_no_services_block() {
+        err_strict("version: '3'\n", "services");
+    }
+
+    // ── Unsafe mode (admin opt-in) ──────────────────────────────
+
+    #[test]
+    fn unsafe_accepts_privileged() {
+        ok_unsafe("services:\n  vpn:\n    image: tailscale\n    privileged: true\n");
+    }
+
+    #[test]
+    fn unsafe_accepts_dangerous_caps() {
+        ok_unsafe("services:\n  vpn:\n    image: tailscale\n    cap_add: [NET_ADMIN]\n");
+    }
+
+    #[test]
+    fn unsafe_accepts_host_namespace() {
+        ok_unsafe("services:\n  agent:\n    image: monitor\n    network_mode: host\n");
+    }
+
+    #[test]
+    fn unsafe_accepts_devices() {
+        ok_unsafe("services:\n  plex:\n    image: plex\n    devices: [\"/dev/dri:/dev/dri\"]\n");
+    }
+
+    #[test]
+    fn unsafe_accepts_arbitrary_bind() {
+        ok_unsafe("services:\n  agent:\n    image: monitor\n    volumes: [\"/etc:/host-etc:ro\"]\n");
+        ok_unsafe("services:\n  s:\n    image: x\n    volumes: [\"/home/user/data:/data\"]\n");
+    }
+
+    // ── Invariants — rejected even in unsafe mode ───────────────
+
+    #[test]
+    fn unsafe_still_rejects_root_bind() {
+        err_unsafe("services:\n  bad:\n    image: alpine\n    volumes: [\"/:/host\"]\n", "off-limits");
+    }
+
+    #[test]
+    fn unsafe_still_rejects_engine_state_bind() {
+        err_unsafe(
+            "services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty:/secrets\"]\n",
+            "off-limits",
+        );
+        err_unsafe(
+            "services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty/auth.json:/x\"]\n",
+            "off-limits",
         );
     }
 
     #[test]
-    fn rejects_unparseable_yaml() {
-        err("services: [unbalanced\n", "parse");
+    fn unsafe_still_allows_app_dir_under_engine_state() {
+        // /var/lib/nasty/apps/<name>/ is a deliberate exception — the app
+        // owns its own subtree of engine state.
+        ok_unsafe("services:\n  ok:\n    image: alpine\n    volumes: [\"/var/lib/nasty/apps/myapp/data:/data\"]\n");
     }
 
     #[test]
-    fn rejects_no_services_block() {
-        err("version: '3'\n", "services");
+    fn unsafe_still_rejects_dotdot_escape() {
+        err_unsafe(
+            "services:\n  bad:\n    image: alpine\n    volumes: [\"/var/lib/nasty/apps/myapp/../auth.json:/x\"]\n",
+            "off-limits",
+        );
+    }
+
+    #[test]
+    fn unsafe_still_rejects_top_volume_to_root() {
+        err_unsafe(
+            "services:\n  s:\n    image: alpine\n    volumes: [evil:/x]\nvolumes:\n  evil:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n",
+            "off-limits",
+        );
+    }
+
+    #[test]
+    fn unsafe_still_rejects_unparseable_yaml() {
+        err_unsafe("services: [unbalanced\n", "parse");
     }
 }
