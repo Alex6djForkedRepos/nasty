@@ -181,7 +181,8 @@ impl AlertService {
         Ok(())
     }
 
-    /// Evaluate all enabled rules against current system state
+    /// Evaluate all enabled rules against current system state.
+    /// Reads the configured root partition free space via `statvfs("/")`.
     pub async fn evaluate(
         &self,
         stats: &super::SystemStats,
@@ -191,39 +192,39 @@ impl AlertService {
         kernel_errors: &KernelErrorAlert,
     ) -> Vec<ActiveAlert> {
         let state = self.state.read().await;
-        let mut alerts = Vec::new();
+        evaluate_rules(
+            &state.rules,
+            stats,
+            filesystems,
+            disk_health,
+            bcachefs_health,
+            kernel_errors,
+            root_free_gb(),
+        )
+    }
+}
 
-        for rule in state.rules.iter().filter(|r| r.enabled) {
-            match rule.metric {
-                AlertMetric::FsUsagePercent => {
-                    for fs in filesystems {
-                        if fs.total_bytes == 0 {
-                            continue;
-                        }
-                        let pct = (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0;
-                        if check_condition(pct, &rule.condition, rule.threshold) {
-                            alerts.push(ActiveAlert {
-                                rule_id: rule.id.clone(),
-                                rule_name: rule.name.clone(),
-                                severity: rule.severity.clone(),
-                                metric: rule.metric.clone(),
-                                message: format!(
-                                    "Filesystem \"{}\" usage at {:.1}% (threshold: {:.0}%)",
-                                    fs.name, pct, rule.threshold
-                                ),
-                                current_value: pct,
-                                threshold: rule.threshold,
-                                source: fs.name.clone(),
-                            });
-                        }
+/// Pure rule dispatch — no I/O, no async, no shared state.
+/// `root_free_gb_value` is injected so tests don't depend on `statvfs("/")`.
+fn evaluate_rules(
+    rules: &[AlertRule],
+    stats: &super::SystemStats,
+    filesystems: &[FsUsage],
+    disk_health: &[DiskHealthSummary],
+    bcachefs_health: &[BcachefsHealth],
+    kernel_errors: &KernelErrorAlert,
+    root_free_gb_value: Option<f64>,
+) -> Vec<ActiveAlert> {
+    let mut alerts = Vec::new();
+
+    for rule in rules.iter().filter(|r| r.enabled) {
+        match rule.metric {
+            AlertMetric::FsUsagePercent => {
+                for fs in filesystems {
+                    if fs.total_bytes == 0 {
+                        continue;
                     }
-                }
-                AlertMetric::CpuLoadPercent => {
-                    let pct = if stats.cpu.count > 0 {
-                        (stats.cpu.load_1 / stats.cpu.count as f64) * 100.0
-                    } else {
-                        0.0
-                    };
+                    let pct = (fs.used_bytes as f64 / fs.total_bytes as f64) * 100.0;
                     if check_condition(pct, &rule.condition, rule.threshold) {
                         alerts.push(ActiveAlert {
                             rule_id: rule.id.clone(),
@@ -231,123 +232,145 @@ impl AlertService {
                             severity: rule.severity.clone(),
                             metric: rule.metric.clone(),
                             message: format!(
-                                "CPU load at {:.1}% (threshold: {:.0}%)",
+                                "Filesystem \"{}\" usage at {:.1}% (threshold: {:.0}%)",
+                                fs.name, pct, rule.threshold
+                            ),
+                            current_value: pct,
+                            threshold: rule.threshold,
+                            source: fs.name.clone(),
+                        });
+                    }
+                }
+            }
+            AlertMetric::CpuLoadPercent => {
+                let pct = if stats.cpu.count > 0 {
+                    (stats.cpu.load_1 / stats.cpu.count as f64) * 100.0
+                } else {
+                    0.0
+                };
+                if check_condition(pct, &rule.condition, rule.threshold) {
+                    alerts.push(ActiveAlert {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        severity: rule.severity.clone(),
+                        metric: rule.metric.clone(),
+                        message: format!(
+                            "CPU load at {:.1}% (threshold: {:.0}%)",
+                            pct, rule.threshold
+                        ),
+                        current_value: pct,
+                        threshold: rule.threshold,
+                        source: "cpu".into(),
+                    });
+                }
+            }
+            AlertMetric::MemoryUsagePercent => {
+                if stats.memory.total_bytes > 0 {
+                    let pct =
+                        (stats.memory.used_bytes as f64 / stats.memory.total_bytes as f64) * 100.0;
+                    if check_condition(pct, &rule.condition, rule.threshold) {
+                        alerts.push(ActiveAlert {
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            severity: rule.severity.clone(),
+                            metric: rule.metric.clone(),
+                            message: format!(
+                                "Memory usage at {:.1}% (threshold: {:.0}%)",
                                 pct, rule.threshold
                             ),
                             current_value: pct,
                             threshold: rule.threshold,
-                            source: "cpu".into(),
+                            source: "memory".into(),
                         });
                     }
                 }
-                AlertMetric::MemoryUsagePercent => {
-                    if stats.memory.total_bytes > 0 {
-                        let pct = (stats.memory.used_bytes as f64
-                            / stats.memory.total_bytes as f64)
-                            * 100.0;
-                        if check_condition(pct, &rule.condition, rule.threshold) {
+            }
+            AlertMetric::SwapUsagePercent => {
+                if stats.memory.swap_total_bytes > 0 {
+                    let pct = (stats.memory.swap_used_bytes as f64
+                        / stats.memory.swap_total_bytes as f64)
+                        * 100.0;
+                    if check_condition(pct, &rule.condition, rule.threshold) {
+                        alerts.push(ActiveAlert {
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            severity: rule.severity.clone(),
+                            metric: rule.metric.clone(),
+                            message: format!(
+                                "Swap usage at {:.1}% (threshold: {:.0}%)",
+                                pct, rule.threshold
+                            ),
+                            current_value: pct,
+                            threshold: rule.threshold,
+                            source: "swap".into(),
+                        });
+                    }
+                }
+            }
+            AlertMetric::DiskTemperature => {
+                for disk in disk_health {
+                    if let Some(temp) = disk.temperature_c {
+                        let val = temp as f64;
+                        if check_condition(val, &rule.condition, rule.threshold) {
                             alerts.push(ActiveAlert {
                                 rule_id: rule.id.clone(),
                                 rule_name: rule.name.clone(),
                                 severity: rule.severity.clone(),
                                 metric: rule.metric.clone(),
                                 message: format!(
-                                    "Memory usage at {:.1}% (threshold: {:.0}%)",
-                                    pct, rule.threshold
+                                    "Disk {} temperature at {}°C (threshold: {:.0}°C)",
+                                    disk.device, temp, rule.threshold
                                 ),
-                                current_value: pct,
-                                threshold: rule.threshold,
-                                source: "memory".into(),
-                            });
-                        }
-                    }
-                }
-                AlertMetric::SwapUsagePercent => {
-                    if stats.memory.swap_total_bytes > 0 {
-                        let pct = (stats.memory.swap_used_bytes as f64
-                            / stats.memory.swap_total_bytes as f64)
-                            * 100.0;
-                        if check_condition(pct, &rule.condition, rule.threshold) {
-                            alerts.push(ActiveAlert {
-                                rule_id: rule.id.clone(),
-                                rule_name: rule.name.clone(),
-                                severity: rule.severity.clone(),
-                                metric: rule.metric.clone(),
-                                message: format!(
-                                    "Swap usage at {:.1}% (threshold: {:.0}%)",
-                                    pct, rule.threshold
-                                ),
-                                current_value: pct,
-                                threshold: rule.threshold,
-                                source: "swap".into(),
-                            });
-                        }
-                    }
-                }
-                AlertMetric::DiskTemperature => {
-                    for disk in disk_health {
-                        if let Some(temp) = disk.temperature_c {
-                            let val = temp as f64;
-                            if check_condition(val, &rule.condition, rule.threshold) {
-                                alerts.push(ActiveAlert {
-                                    rule_id: rule.id.clone(),
-                                    rule_name: rule.name.clone(),
-                                    severity: rule.severity.clone(),
-                                    metric: rule.metric.clone(),
-                                    message: format!(
-                                        "Disk {} temperature at {}°C (threshold: {:.0}°C)",
-                                        disk.device, temp, rule.threshold
-                                    ),
-                                    current_value: val,
-                                    threshold: rule.threshold,
-                                    source: disk.device.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-                AlertMetric::SmartHealth => {
-                    // threshold=1 means "alert when health_passed == false"
-                    for disk in disk_health {
-                        if !disk.health_passed {
-                            alerts.push(ActiveAlert {
-                                rule_id: rule.id.clone(),
-                                rule_name: rule.name.clone(),
-                                severity: rule.severity.clone(),
-                                metric: rule.metric.clone(),
-                                message: format!("Disk {} SMART health check FAILED", disk.device),
-                                current_value: 0.0,
+                                current_value: val,
                                 threshold: rule.threshold,
                                 source: disk.device.clone(),
                             });
                         }
                     }
                 }
-                // ── bcachefs health checks (always-on, threshold ignored) ──
-                AlertMetric::BcachefsDegraded => {
-                    for fs in bcachefs_health {
-                        if fs.degraded {
-                            alerts.push(ActiveAlert {
-                                rule_id: rule.id.clone(),
-                                rule_name: rule.name.clone(),
-                                severity: rule.severity.clone(),
-                                metric: rule.metric.clone(),
-                                message: format!(
-                                    "Filesystem \"{}\" is running in DEGRADED mode (missing device)",
-                                    fs.fs_name
-                                ),
-                                current_value: 1.0,
-                                threshold: 0.0,
-                                source: fs.fs_name.clone(),
-                            });
-                        }
+            }
+            AlertMetric::SmartHealth => {
+                // threshold=1 means "alert when health_passed == false"
+                for disk in disk_health {
+                    if !disk.health_passed {
+                        alerts.push(ActiveAlert {
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            severity: rule.severity.clone(),
+                            metric: rule.metric.clone(),
+                            message: format!("Disk {} SMART health check FAILED", disk.device),
+                            current_value: 0.0,
+                            threshold: rule.threshold,
+                            source: disk.device.clone(),
+                        });
                     }
                 }
-                AlertMetric::BcachefsDeviceState => {
-                    for fs in bcachefs_health {
-                        for dev in &fs.devices {
-                            if dev.state != "rw" && dev.state != "spare" {
-                                alerts.push(ActiveAlert {
+            }
+            // ── bcachefs health checks (always-on, threshold ignored) ──
+            AlertMetric::BcachefsDegraded => {
+                for fs in bcachefs_health {
+                    if fs.degraded {
+                        alerts.push(ActiveAlert {
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            severity: rule.severity.clone(),
+                            metric: rule.metric.clone(),
+                            message: format!(
+                                "Filesystem \"{}\" is running in DEGRADED mode (missing device)",
+                                fs.fs_name
+                            ),
+                            current_value: 1.0,
+                            threshold: 0.0,
+                            source: fs.fs_name.clone(),
+                        });
+                    }
+                }
+            }
+            AlertMetric::BcachefsDeviceState => {
+                for fs in bcachefs_health {
+                    for dev in &fs.devices {
+                        if dev.state != "rw" && dev.state != "spare" {
+                            alerts.push(ActiveAlert {
                                     rule_id: rule.id.clone(),
                                     rule_name: rule.name.clone(),
                                     severity: rule.severity.clone(),
@@ -360,73 +383,73 @@ impl AlertService {
                                     threshold: 0.0,
                                     source: dev.path.clone(),
                                 });
-                            }
                         }
                     }
                 }
-                AlertMetric::BcachefsDeviceError => {
-                    for fs in bcachefs_health {
-                        for dev in &fs.devices {
-                            if dev.has_errors {
-                                alerts.push(ActiveAlert {
-                                    rule_id: rule.id.clone(),
-                                    rule_name: rule.name.clone(),
-                                    severity: rule.severity.clone(),
-                                    metric: rule.metric.clone(),
-                                    message: format!(
-                                        "Device {} in filesystem \"{}\" has IO errors",
-                                        dev.path, fs.fs_name
-                                    ),
-                                    current_value: 1.0,
-                                    threshold: 0.0,
-                                    source: dev.path.clone(),
-                                });
-                            }
-                        }
-                    }
-                }
-                AlertMetric::BcachefsIOErrors => {
-                    for fs in bcachefs_health {
-                        if fs.io_error_count > 0 {
+            }
+            AlertMetric::BcachefsDeviceError => {
+                for fs in bcachefs_health {
+                    for dev in &fs.devices {
+                        if dev.has_errors {
                             alerts.push(ActiveAlert {
                                 rule_id: rule.id.clone(),
                                 rule_name: rule.name.clone(),
                                 severity: rule.severity.clone(),
                                 metric: rule.metric.clone(),
                                 message: format!(
-                                    "Filesystem \"{}\" has {} IO errors",
-                                    fs.fs_name, fs.io_error_count
-                                ),
-                                current_value: fs.io_error_count as f64,
-                                threshold: 0.0,
-                                source: fs.fs_name.clone(),
-                            });
-                        }
-                    }
-                }
-                AlertMetric::BcachefsScrubErrors => {
-                    for fs in bcachefs_health {
-                        if fs.scrub_errors {
-                            alerts.push(ActiveAlert {
-                                rule_id: rule.id.clone(),
-                                rule_name: rule.name.clone(),
-                                severity: rule.severity.clone(),
-                                metric: rule.metric.clone(),
-                                message: format!(
-                                    "Filesystem \"{}\" scrub found data corruption",
-                                    fs.fs_name
+                                    "Device {} in filesystem \"{}\" has IO errors",
+                                    dev.path, fs.fs_name
                                 ),
                                 current_value: 1.0,
                                 threshold: 0.0,
-                                source: fs.fs_name.clone(),
+                                source: dev.path.clone(),
                             });
                         }
                     }
                 }
-                AlertMetric::BcachefsReconcileStalled => {
-                    for fs in bcachefs_health {
-                        if fs.reconcile_stalled {
-                            alerts.push(ActiveAlert {
+            }
+            AlertMetric::BcachefsIOErrors => {
+                for fs in bcachefs_health {
+                    if fs.io_error_count > 0 {
+                        alerts.push(ActiveAlert {
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            severity: rule.severity.clone(),
+                            metric: rule.metric.clone(),
+                            message: format!(
+                                "Filesystem \"{}\" has {} IO errors",
+                                fs.fs_name, fs.io_error_count
+                            ),
+                            current_value: fs.io_error_count as f64,
+                            threshold: 0.0,
+                            source: fs.fs_name.clone(),
+                        });
+                    }
+                }
+            }
+            AlertMetric::BcachefsScrubErrors => {
+                for fs in bcachefs_health {
+                    if fs.scrub_errors {
+                        alerts.push(ActiveAlert {
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            severity: rule.severity.clone(),
+                            metric: rule.metric.clone(),
+                            message: format!(
+                                "Filesystem \"{}\" scrub found data corruption",
+                                fs.fs_name
+                            ),
+                            current_value: 1.0,
+                            threshold: 0.0,
+                            source: fs.fs_name.clone(),
+                        });
+                    }
+                }
+            }
+            AlertMetric::BcachefsReconcileStalled => {
+                for fs in bcachefs_health {
+                    if fs.reconcile_stalled {
+                        alerts.push(ActiveAlert {
                                 rule_id: rule.id.clone(),
                                 rule_name: rule.name.clone(),
                                 severity: rule.severity.clone(),
@@ -439,56 +462,55 @@ impl AlertService {
                                 threshold: 0.0,
                                 source: fs.fs_name.clone(),
                             });
-                        }
-                    }
-                }
-                AlertMetric::KernelErrors => {
-                    let val = kernel_errors.total_count as f64;
-                    if check_condition(val, &rule.condition, rule.threshold) {
-                        let cat_list = if kernel_errors.categories.is_empty() {
-                            "none".to_string()
-                        } else {
-                            kernel_errors.categories.join(", ")
-                        };
-                        alerts.push(ActiveAlert {
-                            rule_id: rule.id.clone(),
-                            rule_name: rule.name.clone(),
-                            severity: rule.severity.clone(),
-                            metric: rule.metric.clone(),
-                            message: format!(
-                                "{} kernel error(s) detected (categories: {})",
-                                kernel_errors.total_count, cat_list
-                            ),
-                            current_value: val,
-                            threshold: rule.threshold,
-                            source: "kernel".into(),
-                        });
-                    }
-                }
-                AlertMetric::RootDiskFreeGb => {
-                    if let Some(free_gb) = root_free_gb()
-                        && check_condition(free_gb, &rule.condition, rule.threshold)
-                    {
-                        alerts.push(ActiveAlert {
-                            rule_id: rule.id.clone(),
-                            rule_name: rule.name.clone(),
-                            severity: rule.severity.clone(),
-                            metric: rule.metric.clone(),
-                            message: format!(
-                                "Root partition has {:.1} GB free (threshold: {:.0} GB)",
-                                free_gb, rule.threshold
-                            ),
-                            current_value: free_gb,
-                            threshold: rule.threshold,
-                            source: "/".into(),
-                        });
                     }
                 }
             }
+            AlertMetric::KernelErrors => {
+                let val = kernel_errors.total_count as f64;
+                if check_condition(val, &rule.condition, rule.threshold) {
+                    let cat_list = if kernel_errors.categories.is_empty() {
+                        "none".to_string()
+                    } else {
+                        kernel_errors.categories.join(", ")
+                    };
+                    alerts.push(ActiveAlert {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        severity: rule.severity.clone(),
+                        metric: rule.metric.clone(),
+                        message: format!(
+                            "{} kernel error(s) detected (categories: {})",
+                            kernel_errors.total_count, cat_list
+                        ),
+                        current_value: val,
+                        threshold: rule.threshold,
+                        source: "kernel".into(),
+                    });
+                }
+            }
+            AlertMetric::RootDiskFreeGb => {
+                if let Some(free_gb) = root_free_gb_value
+                    && check_condition(free_gb, &rule.condition, rule.threshold)
+                {
+                    alerts.push(ActiveAlert {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        severity: rule.severity.clone(),
+                        metric: rule.metric.clone(),
+                        message: format!(
+                            "Root partition has {:.1} GB free (threshold: {:.0} GB)",
+                            free_gb, rule.threshold
+                        ),
+                        current_value: free_gb,
+                        threshold: rule.threshold,
+                        source: "/".into(),
+                    });
+                }
+            }
         }
-
-        alerts
     }
+
+    alerts
 }
 
 /// Minimal filesystem info for alert evaluation
@@ -776,4 +798,415 @@ async fn save_state(state: &AlertState) -> Result<(), std::io::Error> {
     let json = serde_json::to_string_pretty(state).unwrap();
     tokio::fs::write(STATE_PATH, json).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SystemStats;
+    use nasty_common::metrics_types::{CpuStats, MemoryStats};
+
+    fn rule(metric: AlertMetric, condition: AlertCondition, threshold: f64) -> AlertRule {
+        AlertRule {
+            id: "r".to_string(),
+            name: "rule".to_string(),
+            enabled: true,
+            metric,
+            condition,
+            threshold,
+            severity: AlertSeverity::Warning,
+        }
+    }
+
+    fn zero_stats() -> SystemStats {
+        SystemStats {
+            cpu: CpuStats {
+                count: 0,
+                load_1: 0.0,
+                load_5: 0.0,
+                load_15: 0.0,
+                temp_c: None,
+                freq_mhz: None,
+                governor: None,
+            },
+            memory: MemoryStats {
+                total_bytes: 0,
+                used_bytes: 0,
+                available_bytes: 0,
+                swap_total_bytes: 0,
+                swap_used_bytes: 0,
+            },
+            network: vec![],
+            disk_io: vec![],
+        }
+    }
+
+    fn run(rules: &[AlertRule], stats: &SystemStats) -> Vec<ActiveAlert> {
+        evaluate_rules(
+            rules,
+            stats,
+            &[],
+            &[],
+            &[],
+            &KernelErrorAlert::default(),
+            None,
+        )
+    }
+
+    // ── check_condition ────────────────────────────────────────────
+
+    #[test]
+    fn check_condition_above() {
+        assert!(check_condition(91.0, &AlertCondition::Above, 90.0));
+        assert!(!check_condition(90.0, &AlertCondition::Above, 90.0));
+        assert!(!check_condition(89.9, &AlertCondition::Above, 90.0));
+    }
+
+    #[test]
+    fn check_condition_below() {
+        assert!(check_condition(2.9, &AlertCondition::Below, 3.0));
+        assert!(!check_condition(3.0, &AlertCondition::Below, 3.0));
+        assert!(!check_condition(3.1, &AlertCondition::Below, 3.0));
+    }
+
+    #[test]
+    fn check_condition_equals_uses_float_tolerance() {
+        assert!(check_condition(1.0, &AlertCondition::Equals, 1.0));
+        assert!(check_condition(1.0005, &AlertCondition::Equals, 1.0));
+        assert!(!check_condition(1.01, &AlertCondition::Equals, 1.0));
+    }
+
+    // ── evaluate_rules: dispatch / disable ─────────────────────────
+
+    #[test]
+    fn evaluate_rules_skips_disabled_rules() {
+        let mut r = rule(AlertMetric::FsUsagePercent, AlertCondition::Above, 80.0);
+        r.enabled = false;
+        let fs = vec![FsUsage {
+            name: "tank".into(),
+            used_bytes: 95,
+            total_bytes: 100,
+        }];
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &fs,
+            &[],
+            &[],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert!(alerts.is_empty());
+    }
+
+    // ── evaluate_rules: per-metric ─────────────────────────────────
+
+    #[test]
+    fn evaluate_rules_fs_usage_fires_above_threshold_and_skips_zero_total() {
+        let r = rule(AlertMetric::FsUsagePercent, AlertCondition::Above, 80.0);
+        let fs = vec![
+            FsUsage {
+                name: "tank".into(),
+                used_bytes: 90,
+                total_bytes: 100,
+            },
+            FsUsage {
+                name: "empty".into(),
+                used_bytes: 0,
+                total_bytes: 0, // skipped
+            },
+        ];
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &fs,
+            &[],
+            &[],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "tank");
+        assert!((alerts[0].current_value - 90.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn evaluate_rules_cpu_load_normalises_by_core_count() {
+        // load_1=4 on 8 cores → 50% — below threshold 90 → no fire.
+        let r = rule(AlertMetric::CpuLoadPercent, AlertCondition::Above, 90.0);
+        let rules = std::slice::from_ref(&r);
+        let mut s = zero_stats();
+        s.cpu.count = 8;
+        s.cpu.load_1 = 4.0;
+        assert!(run(rules, &s).is_empty());
+        // load_1=8 on 8 cores → 100% — fires.
+        s.cpu.load_1 = 8.0;
+        let alerts = run(rules, &s);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "cpu");
+    }
+
+    #[test]
+    fn evaluate_rules_memory_fires_above_threshold() {
+        let r = rule(AlertMetric::MemoryUsagePercent, AlertCondition::Above, 90.0);
+        let mut s = zero_stats();
+        s.memory.total_bytes = 100;
+        s.memory.used_bytes = 95;
+        let alerts = run(&[r], &s);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "memory");
+    }
+
+    #[test]
+    fn evaluate_rules_swap_skipped_when_swap_total_zero() {
+        let r = rule(AlertMetric::SwapUsagePercent, AlertCondition::Above, 0.0);
+        let s = zero_stats();
+        assert!(run(&[r], &s).is_empty());
+    }
+
+    #[test]
+    fn evaluate_rules_disk_temperature_fires_per_disk_with_value() {
+        let r = rule(AlertMetric::DiskTemperature, AlertCondition::Above, 50.0);
+        let disks = vec![
+            DiskHealthSummary {
+                device: "sda".into(),
+                temperature_c: Some(60),
+                health_passed: true,
+            },
+            DiskHealthSummary {
+                device: "sdb".into(),
+                temperature_c: None, // skipped
+                health_passed: true,
+            },
+            DiskHealthSummary {
+                device: "sdc".into(),
+                temperature_c: Some(45), // below threshold
+                health_passed: true,
+            },
+        ];
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &[],
+            &disks,
+            &[],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "sda");
+    }
+
+    #[test]
+    fn evaluate_rules_smart_health_fires_only_on_failure() {
+        let r = rule(AlertMetric::SmartHealth, AlertCondition::Equals, 1.0);
+        let disks = vec![
+            DiskHealthSummary {
+                device: "sda".into(),
+                temperature_c: None,
+                health_passed: true,
+            },
+            DiskHealthSummary {
+                device: "sdb".into(),
+                temperature_c: None,
+                health_passed: false,
+            },
+        ];
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &[],
+            &disks,
+            &[],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "sdb");
+    }
+
+    fn bcachefs_health(devices: Vec<BcachefsDeviceHealth>) -> BcachefsHealth {
+        BcachefsHealth {
+            fs_name: "tank".into(),
+            degraded: false,
+            devices,
+            io_error_count: 0,
+            scrub_errors: false,
+            reconcile_stalled: false,
+        }
+    }
+
+    fn dev(path: &str, state: &str, has_errors: bool) -> BcachefsDeviceHealth {
+        BcachefsDeviceHealth {
+            path: path.into(),
+            state: state.into(),
+            has_errors,
+        }
+    }
+
+    #[test]
+    fn evaluate_rules_bcachefs_degraded() {
+        let r = rule(AlertMetric::BcachefsDegraded, AlertCondition::Equals, 1.0);
+        let mut h = bcachefs_health(vec![]);
+        h.degraded = true;
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &[],
+            &[],
+            &[h],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "tank");
+    }
+
+    #[test]
+    fn evaluate_rules_bcachefs_device_state_treats_spare_as_ok() {
+        let r = rule(
+            AlertMetric::BcachefsDeviceState,
+            AlertCondition::Equals,
+            1.0,
+        );
+        let h = bcachefs_health(vec![
+            dev("/dev/sda", "rw", false),
+            dev("/dev/sdb", "spare", false), // not an alert
+            dev("/dev/sdc", "ro", false),    // alert
+        ]);
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &[],
+            &[],
+            &[h],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "/dev/sdc");
+    }
+
+    #[test]
+    fn evaluate_rules_bcachefs_device_error_fires_when_has_errors() {
+        let r = rule(
+            AlertMetric::BcachefsDeviceError,
+            AlertCondition::Equals,
+            1.0,
+        );
+        let h = bcachefs_health(vec![dev("/dev/sda", "rw", true)]);
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &[],
+            &[],
+            &[h],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "/dev/sda");
+    }
+
+    #[test]
+    fn evaluate_rules_bcachefs_io_errors_above_zero() {
+        let r = rule(AlertMetric::BcachefsIOErrors, AlertCondition::Above, 0.0);
+        let mut h = bcachefs_health(vec![]);
+        h.io_error_count = 7;
+        let alerts = evaluate_rules(
+            &[r],
+            &zero_stats(),
+            &[],
+            &[],
+            &[h],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!((alerts[0].current_value - 7.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn evaluate_rules_bcachefs_scrub_and_reconcile() {
+        let scrub = rule(
+            AlertMetric::BcachefsScrubErrors,
+            AlertCondition::Equals,
+            1.0,
+        );
+        let reconcile = rule(
+            AlertMetric::BcachefsReconcileStalled,
+            AlertCondition::Equals,
+            1.0,
+        );
+        let mut h = bcachefs_health(vec![]);
+        h.scrub_errors = true;
+        h.reconcile_stalled = true;
+        let alerts = evaluate_rules(
+            &[scrub, reconcile],
+            &zero_stats(),
+            &[],
+            &[],
+            &[h],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert_eq!(alerts.len(), 2);
+    }
+
+    #[test]
+    fn evaluate_rules_kernel_errors_includes_categories_in_message() {
+        let r = rule(AlertMetric::KernelErrors, AlertCondition::Above, 0.0);
+        let kernel_errors = KernelErrorAlert {
+            total_count: 3,
+            categories: vec!["mce".into(), "oom".into()],
+        };
+        let alerts = evaluate_rules(&[r], &zero_stats(), &[], &[], &[], &kernel_errors, None);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].message.contains("mce"));
+        assert!(alerts[0].message.contains("oom"));
+    }
+
+    #[test]
+    fn evaluate_rules_root_disk_free_gb_fires_when_below_threshold() {
+        let r = rule(AlertMetric::RootDiskFreeGb, AlertCondition::Below, 10.0);
+        let rules = std::slice::from_ref(&r);
+        let alerts = evaluate_rules(
+            rules,
+            &zero_stats(),
+            &[],
+            &[],
+            &[],
+            &KernelErrorAlert::default(),
+            Some(5.0),
+        );
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "/");
+        // None means "unknown" — no fire.
+        let alerts = evaluate_rules(
+            rules,
+            &zero_stats(),
+            &[],
+            &[],
+            &[],
+            &KernelErrorAlert::default(),
+            None,
+        );
+        assert!(alerts.is_empty());
+    }
+
+    // ── default_rules smoke ────────────────────────────────────────
+
+    #[test]
+    fn default_rules_have_unique_ids() {
+        let rules = default_rules();
+        assert!(!rules.is_empty());
+        let mut ids: Vec<_> = rules.iter().map(|r| r.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            rules.len(),
+            "duplicate rule ids in default_rules"
+        );
+    }
 }
