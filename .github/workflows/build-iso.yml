@@ -75,14 +75,17 @@ jobs:
         run: |
           TAG="${{ env.version }}"
           if gh release view "$TAG" &>/dev/null; then
+            # Existing release — only upload the asset. Don't touch the
+            # prerelease flag so manually-promoted releases stay promoted
+            # if the workflow is re-run for the same tag.
             gh release upload "$TAG" "${{ env.iso_dest }}" --clobber
           else
-            PRERELEASE=""
-            if [[ "$TAG" != v* ]]; then
-              PRERELEASE="--prerelease"
-            fi
+            # All freshly-created releases start as prereleases — including
+            # tagged v* releases. The maintainer downloads the ISO, tests
+            # it, writes release notes, and then flips "Set as latest" in
+            # the GitHub Releases UI to promote it.
             gh release create "$TAG" "${{ env.iso_dest }}" \
               --title "NASty $TAG" \
               --notes "NASty ISO build — $(git rev-parse --short HEAD)" \
-              $PRERELEASE
+              --prerelease
           fi
