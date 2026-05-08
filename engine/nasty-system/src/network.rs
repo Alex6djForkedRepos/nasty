@@ -83,6 +83,8 @@ pub struct BondConfig {
     pub ipv4: IpConfig,
     #[serde(default)]
     pub ipv6: IpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -93,6 +95,8 @@ pub struct VlanConfig {
     pub ipv4: IpConfig,
     #[serde(default)]
     pub ipv6: IpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
 }
 
 /// A Linux bridge (e.g. `br0`) used as a virtual switch — typically for VMs
@@ -108,6 +112,8 @@ pub struct BridgeConfig {
     pub ipv4: IpConfig,
     #[serde(default)]
     pub ipv6: IpConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -384,6 +390,9 @@ async fn apply_config(config: &NetworkConfig) -> Result<(), String> {
         run_ip(&["link", "set", &bond.name, "up"])
             .await
             .map_err(|e| format!("bring up bond {}: {e}", bond.name))?;
+        if let Some(mtu) = bond.mtu {
+            let _ = run_ip(&["link", "set", &bond.name, "mtu", &mtu.to_string()]).await;
+        }
         apply_ip_config(&bond.name, &bond.ipv4, false).await?;
         apply_ip_config(&bond.name, &bond.ipv6, true).await?;
     }
@@ -404,6 +413,9 @@ async fn apply_config(config: &NetworkConfig) -> Result<(), String> {
         run_ip(&["link", "set", &bridge.name, "up"])
             .await
             .map_err(|e| format!("bring up bridge {}: {e}", bridge.name))?;
+        if let Some(mtu) = bridge.mtu {
+            let _ = run_ip(&["link", "set", &bridge.name, "mtu", &mtu.to_string()]).await;
+        }
         apply_ip_config(&bridge.name, &bridge.ipv4, false).await?;
         apply_ip_config(&bridge.name, &bridge.ipv6, true).await?;
     }
@@ -430,6 +442,9 @@ async fn apply_config(config: &NetworkConfig) -> Result<(), String> {
         run_ip(&["link", "set", &vlan_name, "up"])
             .await
             .map_err(|e| format!("bring up vlan {vlan_name}: {e}"))?;
+        if let Some(mtu) = vlan.mtu {
+            let _ = run_ip(&["link", "set", &vlan_name, "mtu", &mtu.to_string()]).await;
+        }
         apply_ip_config(&vlan_name, &vlan.ipv4, false).await?;
         apply_ip_config(&vlan_name, &vlan.ipv6, true).await?;
     }
@@ -557,7 +572,7 @@ fn generate_nix(config: &NetworkConfig) -> String {
             "  networking.bonds.{} = {{\n    interfaces = [ {} ];\n    driverOptions.mode = \"{}\";\n  }};\n",
             bond.name, members.join(" "), bond.mode.to_nix()
         ));
-        generate_iface_nix(&mut out, &bond.name, &bond.ipv4, &bond.ipv6, None);
+        generate_iface_nix(&mut out, &bond.name, &bond.ipv4, &bond.ipv6, bond.mtu);
     }
 
     // Bridges
@@ -568,7 +583,7 @@ fn generate_nix(config: &NetworkConfig) -> String {
             bridge.name,
             members.join(" ")
         ));
-        generate_iface_nix(&mut out, &bridge.name, &bridge.ipv4, &bridge.ipv6, None);
+        generate_iface_nix(&mut out, &bridge.name, &bridge.ipv4, &bridge.ipv6, bridge.mtu);
     }
 
     // VLANs
@@ -579,7 +594,7 @@ fn generate_nix(config: &NetworkConfig) -> String {
             vlan.vlan_id, vlan.parent
         ));
         let iface_name = format!("{}.{}", vlan.parent, vlan.vlan_id);
-        generate_iface_nix(&mut out, &iface_name, &vlan.ipv4, &vlan.ipv6, None);
+        generate_iface_nix(&mut out, &iface_name, &vlan.ipv4, &vlan.ipv6, vlan.mtu);
     }
 
     // DNS

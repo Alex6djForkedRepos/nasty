@@ -510,6 +510,7 @@ export interface BondConfig {
 	mode: BondMode;
 	ipv4: IpConfig;
 	ipv6: IpConfig;
+	mtu: number | null;
 }
 
 export interface VlanConfig {
@@ -517,6 +518,7 @@ export interface VlanConfig {
 	vlan_id: number;
 	ipv4: IpConfig;
 	ipv6: IpConfig;
+	mtu: number | null;
 }
 
 export interface BridgeConfig {
@@ -524,6 +526,7 @@ export interface BridgeConfig {
 	members: string[];
 	ipv4: IpConfig;
 	ipv6: IpConfig;
+	mtu: number | null;
 }
 
 export interface NetworkConfig {
