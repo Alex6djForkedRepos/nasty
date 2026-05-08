@@ -3,7 +3,7 @@
 	import { getClient } from '$lib/client';
 	import { withToast } from '$lib/toast.svelte';
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
-	import type { Settings, SystemInfo, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats } from '$lib/types';
+	import type { Settings, SystemInfo, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Copy, Check, ChevronDown, ChevronRight } from '@lucide/svelte';
@@ -37,19 +37,24 @@
 	// IPv6 form
 	let netIpv6Method: 'slaac' | 'static' | 'dhcp' | 'disabled' = $state('slaac');
 	let netIpv6Gateway = $state('');
+	// MTU on inline interface form (string so an empty value means "unset")
+	let netMtu = $state('');
 	// Bond form
 	let showBondForm = $state(false);
 	let bondName = $state('bond0');
 	let bondMembers: string[] = $state([]);
 	let bondMode: 'lacp' | 'active_backup' | 'balance_rr' | 'balance_xor' = $state('active_backup');
+	let bondMtu = $state('');
 	// VLAN form
 	let showVlanForm = $state(false);
 	let vlanParent = $state('');
 	let vlanId = $state(100);
+	let vlanMtu = $state('');
 	// Bridge form
 	let showBridgeForm = $state(false);
 	let bridgeName = $state('br0');
 	let bridgeMembers: string[] = $state([]);
+	let bridgeMtu = $state('');
 	// ── General tab state ───────────────────────────────────
 	let settings: Settings | null = $state(null);
 	let info: SystemInfo | null = $state(null);
@@ -331,47 +336,89 @@
 		}
 	}
 
+	function liveKind(name: string): string {
+		return networkState?.interfaces.find(i => i.name === name)?.kind ?? 'physical';
+	}
+
 	function selectInterface(name: string) {
 		selectedIface = selectedIface === name ? null : name;
-		if (selectedIface && network) {
-			const cfg = network.interfaces.find((i: {name: string}) => i.name === name);
-			if (cfg) {
-				netDhcp = cfg.ipv4.method === 'dhcp';
-				netIpv4Addrs = cfg.ipv4.addresses.length > 0 ? [...cfg.ipv4.addresses] : [''];
-				netGateway = cfg.ipv4.gateway ?? '';
-				netIpv6Method = cfg.ipv6.method as typeof netIpv6Method;
-				netIpv6Addrs = cfg.ipv6.addresses.length > 0 ? [...cfg.ipv6.addresses] : [''];
-				netIpv6Gateway = cfg.ipv6.gateway ?? '';
-			} else {
-				netDhcp = true; netIpv4Addrs = ['']; netGateway = '';
-				netIpv6Method = 'slaac'; netIpv6Addrs = ['']; netIpv6Gateway = '';
-			}
-			netChanged = false;
+		if (!selectedIface || !network) return;
+
+		const kind = liveKind(name);
+		let cfg: { ipv4: IpConfig; ipv6: IpConfig; mtu: number | null } | undefined;
+		if (kind === 'bond') {
+			cfg = network.bonds?.find(b => b.name === name);
+		} else if (kind === 'bridge') {
+			cfg = network.bridges?.find(b => b.name === name);
+		} else if (kind === 'vlan') {
+			cfg = network.vlans?.find(v => `${v.parent}.${v.vlan_id}` === name);
+		} else {
+			cfg = network.interfaces?.find(i => i.name === name);
 		}
+
+		if (cfg) {
+			netDhcp = cfg.ipv4.method === 'dhcp';
+			netIpv4Addrs = cfg.ipv4.addresses.length > 0 ? [...cfg.ipv4.addresses] : [''];
+			netGateway = cfg.ipv4.gateway ?? '';
+			netIpv6Method = cfg.ipv6.method as typeof netIpv6Method;
+			netIpv6Addrs = cfg.ipv6.addresses.length > 0 ? [...cfg.ipv6.addresses] : [''];
+			netIpv6Gateway = cfg.ipv6.gateway ?? '';
+			netMtu = cfg.mtu != null ? String(cfg.mtu) : '';
+		} else {
+			netDhcp = true; netIpv4Addrs = ['']; netGateway = '';
+			netIpv6Method = 'slaac'; netIpv6Addrs = ['']; netIpv6Gateway = '';
+			netMtu = '';
+		}
+		netChanged = false;
+	}
+
+	function parseMtu(v: string): number | null {
+		const t = v.trim();
+		if (!t) return null;
+		const n = parseInt(t, 10);
+		return Number.isFinite(n) && n > 0 ? n : null;
 	}
 
 	async function saveInterfaceConfig() {
 		if (!selectedIface || !network) return;
 		savingNetwork = true;
 		const nameservers = netNameservers.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
-		const ipv4 = {
-			method: netDhcp ? 'dhcp' as const : 'static' as const,
+		const ipv4: IpConfig = {
+			method: netDhcp ? 'dhcp' : 'static',
 			addresses: netDhcp ? [] : netIpv4Addrs.filter(a => a.trim()),
 			gateway: netDhcp ? null : (netGateway.trim() || null),
 		};
-		const ipv6 = {
+		const ipv6: IpConfig = {
 			method: netIpv6Method,
 			addresses: netIpv6Method === 'static' ? netIpv6Addrs.filter(a => a.trim()) : [],
 			gateway: netIpv6Method === 'static' ? (netIpv6Gateway || null) : null,
 		};
+		const mtu = parseMtu(netMtu);
+		const kind = liveKind(selectedIface);
 
-		// Update or add the interface in config
-		const ifaces = [...(network.interfaces || [])];
-		const idx = ifaces.findIndex((i: {name: string}) => i.name === selectedIface);
-		const entry = { name: selectedIface, enabled: true, ipv4, ipv6, mtu: null };
-		if (idx >= 0) ifaces[idx] = entry; else ifaces.push(entry);
+		const payload: NetworkConfig = {
+			interfaces: [...(network.interfaces || [])],
+			dns: nameservers,
+			bonds: [...(network.bonds || [])],
+			vlans: [...(network.vlans || [])],
+			bridges: [...(network.bridges || [])],
+		};
 
-		const payload = { interfaces: ifaces, dns: nameservers, bonds: network.bonds || [], vlans: network.vlans || [], bridges: network.bridges || [] };
+		if (kind === 'bond') {
+			const idx = payload.bonds.findIndex(b => b.name === selectedIface);
+			if (idx >= 0) payload.bonds[idx] = { ...payload.bonds[idx], ipv4, ipv6, mtu };
+		} else if (kind === 'bridge') {
+			const idx = payload.bridges.findIndex(b => b.name === selectedIface);
+			if (idx >= 0) payload.bridges[idx] = { ...payload.bridges[idx], ipv4, ipv6, mtu };
+		} else if (kind === 'vlan') {
+			const idx = payload.vlans.findIndex(v => `${v.parent}.${v.vlan_id}` === selectedIface);
+			if (idx >= 0) payload.vlans[idx] = { ...payload.vlans[idx], ipv4, ipv6, mtu };
+		} else {
+			const idx = payload.interfaces.findIndex(i => i.name === selectedIface);
+			const entry: InterfaceConfig = { name: selectedIface, enabled: true, ipv4, ipv6, mtu };
+			if (idx >= 0) payload.interfaces[idx] = entry; else payload.interfaces.push(entry);
+		}
+
 		await withToast(() => client.call('system.network.update', payload), 'Network configuration applied');
 		networkState = await client.call<NetworkState>('system.network.get');
 		netChanged = false;
@@ -380,44 +427,47 @@
 
 	async function createBond() {
 		if (!bondName || bondMembers.length < 2 || !network) return;
-		const payload = {
+		const mtu = parseMtu(bondMtu);
+		const payload: NetworkConfig = {
 			interfaces: network.interfaces || [],
 			dns: network.dns || [],
-			bonds: [...(network.bonds || []), { name: bondName, members: bondMembers, mode: bondMode, ipv4: { method: 'dhcp', addresses: [], gateway: null }, ipv6: { method: 'slaac', addresses: [], gateway: null } }],
+			bonds: [...(network.bonds || []), { name: bondName, members: bondMembers, mode: bondMode, ipv4: { method: 'dhcp', addresses: [], gateway: null }, ipv6: { method: 'slaac', addresses: [], gateway: null }, mtu }],
 			vlans: network.vlans || [],
 			bridges: network.bridges || [],
 		};
 		await withToast(() => client.call('system.network.update', payload), `Bond ${bondName} created`);
 		networkState = await client.call<NetworkState>('system.network.get');
-		showBondForm = false; bondName = 'bond0'; bondMembers = [];
+		showBondForm = false; bondName = 'bond0'; bondMembers = []; bondMtu = '';
 	}
 
 	async function createVlan() {
 		if (!vlanParent || vlanId < 1 || vlanId > 4094 || !network) return;
-		const payload = {
+		const mtu = parseMtu(vlanMtu);
+		const payload: NetworkConfig = {
 			interfaces: network.interfaces || [],
 			dns: network.dns || [],
 			bonds: network.bonds || [],
-			vlans: [...(network.vlans || []), { parent: vlanParent, vlan_id: vlanId, ipv4: { method: 'dhcp', addresses: [], gateway: null }, ipv6: { method: 'slaac', addresses: [], gateway: null } }],
+			vlans: [...(network.vlans || []), { parent: vlanParent, vlan_id: vlanId, ipv4: { method: 'dhcp', addresses: [], gateway: null }, ipv6: { method: 'slaac', addresses: [], gateway: null }, mtu }],
 			bridges: network.bridges || [],
 		};
 		await withToast(() => client.call('system.network.update', payload), `VLAN ${vlanParent}.${vlanId} created`);
 		networkState = await client.call<NetworkState>('system.network.get');
-		showVlanForm = false; vlanParent = ''; vlanId = 100;
+		showVlanForm = false; vlanParent = ''; vlanId = 100; vlanMtu = '';
 	}
 
 	async function createBridge() {
 		if (!bridgeName || !network) return;
-		const payload = {
+		const mtu = parseMtu(bridgeMtu);
+		const payload: NetworkConfig = {
 			interfaces: network.interfaces || [],
 			dns: network.dns || [],
 			bonds: network.bonds || [],
 			vlans: network.vlans || [],
-			bridges: [...(network.bridges || []), { name: bridgeName, members: bridgeMembers, ipv4: { method: 'dhcp' as const, addresses: [], gateway: null }, ipv6: { method: 'slaac' as const, addresses: [], gateway: null } }],
+			bridges: [...(network.bridges || []), { name: bridgeName, members: bridgeMembers, ipv4: { method: 'dhcp', addresses: [], gateway: null }, ipv6: { method: 'slaac', addresses: [], gateway: null }, mtu }],
 		};
 		await withToast(() => client.call('system.network.update', payload), `Bridge ${bridgeName} created`);
 		networkState = await client.call<NetworkState>('system.network.get');
-		showBridgeForm = false; bridgeName = 'br0'; bridgeMembers = [];
+		showBridgeForm = false; bridgeName = 'br0'; bridgeMembers = []; bridgeMtu = '';
 	}
 
 	async function loadNotifications() {
@@ -825,6 +875,13 @@
 										{/if}
 									</div>
 
+									<!-- MTU -->
+									<div>
+										<label for="net-mtu" class="text-xs text-muted-foreground">MTU</label>
+										<input id="net-mtu" type="number" min="68" max="65535" bind:value={netMtu} placeholder="default (1500)" oninput={() => netChanged = true} class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-sm" />
+										<p class="mt-1 text-[0.65rem] text-muted-foreground">Leave empty for default. 9000 enables jumbo frames (requires switch support end-to-end).</p>
+									</div>
+
 									<!-- DNS -->
 									<div>
 										<label for="net-dns" class="text-xs text-muted-foreground">DNS Servers</label>
@@ -888,6 +945,10 @@
 							</div>
 						{/if}
 					</div>
+					<div>
+						<label for="bond-mtu" class="text-xs text-muted-foreground">MTU (optional)</label>
+						<input id="bond-mtu" type="number" min="68" max="65535" bind:value={bondMtu} placeholder="default (1500), 9000 for jumbo frames" class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-sm font-mono" />
+					</div>
 					<Button size="sm" onclick={createBond} disabled={bondMembers.length < 2}>Create Bond</Button>
 				</div>
 			{/if}
@@ -914,6 +975,10 @@
 							</div>
 						{/if}
 					</div>
+					<div>
+						<label for="bridge-mtu" class="text-xs text-muted-foreground">MTU (optional)</label>
+						<input id="bridge-mtu" type="number" min="68" max="65535" bind:value={bridgeMtu} placeholder="default (1500), 9000 for jumbo frames" class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-sm font-mono" />
+					</div>
 					<Button size="sm" onclick={createBridge} disabled={!bridgeName}>Create Bridge</Button>
 				</div>
 			{/if}
@@ -939,6 +1004,10 @@
 							<input id="vlan-id" type="number" min="1" max="4094" bind:value={vlanId} class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-sm font-mono" />
 						</div>
 					</div>
+					<div>
+						<label for="vlan-mtu" class="text-xs text-muted-foreground">MTU (optional)</label>
+						<input id="vlan-mtu" type="number" min="68" max="65535" bind:value={vlanMtu} placeholder="default (1500), 9000 for jumbo frames" class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-sm font-mono" />
+					</div>
 					<Button size="sm" onclick={createVlan} disabled={!vlanParent}>Create VLAN</Button>
 				</div>
 			{/if}
@@ -950,20 +1019,21 @@
 							<div class="flex items-center gap-2 rounded px-2 py-1">
 								<Badge variant="outline" class="text-[0.6rem]">bond</Badge>
 								<span class="font-mono">{bond.name}</span>
-								<span class="text-xs text-muted-foreground">{bond.mode} · {bond.members.join(', ')}</span>
+								<span class="text-xs text-muted-foreground">{bond.mode} · {bond.members.join(', ')}{bond.mtu ? ` · MTU ${bond.mtu}` : ''}</span>
 							</div>
 						{/each}
 						{#each network.bridges ?? [] as bridge}
 							<div class="flex items-center gap-2 rounded px-2 py-1">
 								<Badge variant="outline" class="text-[0.6rem]">bridge</Badge>
 								<span class="font-mono">{bridge.name}</span>
-								<span class="text-xs text-muted-foreground">{bridge.members.length === 0 ? 'no members' : bridge.members.join(', ')}</span>
+								<span class="text-xs text-muted-foreground">{bridge.members.length === 0 ? 'no members' : bridge.members.join(', ')}{bridge.mtu ? ` · MTU ${bridge.mtu}` : ''}</span>
 							</div>
 						{/each}
 						{#each network.vlans as vlan}
 							<div class="flex items-center gap-2 rounded px-2 py-1">
 								<Badge variant="outline" class="text-[0.6rem]">vlan</Badge>
 								<span class="font-mono">{vlan.parent}.{vlan.vlan_id}</span>
+								{#if vlan.mtu}<span class="text-xs text-muted-foreground">MTU {vlan.mtu}</span>{/if}
 							</div>
 						{/each}
 					</div>
