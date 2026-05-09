@@ -1021,8 +1021,7 @@ mod tests {
         let outer = addr_data.try_clone().ok()?;
         // `address-data` is `aa{sv}` — array of dicts.
         let arr: zbus::zvariant::Array = outer.try_into().ok()?;
-        let mut iter = arr.into_iter();
-        let first: zbus::zvariant::Value = iter.next()?.try_clone().ok()?;
+        let first: zbus::zvariant::Value = arr.iter().next()?.try_clone().ok()?;
         let entry: zbus::zvariant::Dict = first.try_into().ok()?;
         let map: HashMap<String, OwnedValue> = entry.try_into().ok()?;
         let addr: String = map.get("address")?.try_clone().ok()?.try_into().ok()?;
