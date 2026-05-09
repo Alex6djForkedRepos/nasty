@@ -3,6 +3,8 @@
 	import { getClient } from '$lib/client';
 	import { withToast } from '$lib/toast.svelte';
 	import { applyNetworkUpdate } from '$lib/rollbackState.svelte';
+	import { promoteOrphanedMembers } from '$lib/network';
+	import { confirm } from '$lib/confirm.svelte';
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
 	import type { Settings, SystemInfo, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
@@ -476,9 +478,12 @@
 
 	async function deleteBond(name: string) {
 		if (!network) return;
-		if (!confirm(`Remove bond ${name}? Members will return to standalone interfaces.`)) return;
+		if (!await confirm(`Remove bond ${name}?`, 'Members will return to standalone interfaces.', { confirmLabel: 'Remove' })) return;
+		const removed = (network.bonds || []).find(b => b.name === name);
 		const payload: NetworkConfig = {
-			interfaces: network.interfaces || [],
+			interfaces: removed
+				? promoteOrphanedMembers(network, { kind: 'bond', name }, removed.members)
+				: network.interfaces || [],
 			dns: network.dns || [],
 			bonds: (network.bonds || []).filter(b => b.name !== name),
 			vlans: network.vlans || [],
@@ -490,9 +495,12 @@
 
 	async function deleteBridge(name: string) {
 		if (!network) return;
-		if (!confirm(`Remove bridge ${name}? Members will return to standalone interfaces.`)) return;
+		if (!await confirm(`Remove bridge ${name}?`, 'Members will return to standalone interfaces.', { confirmLabel: 'Remove' })) return;
+		const removed = (network.bridges || []).find(b => b.name === name);
 		const payload: NetworkConfig = {
-			interfaces: network.interfaces || [],
+			interfaces: removed
+				? promoteOrphanedMembers(network, { kind: 'bridge', name }, removed.members)
+				: network.interfaces || [],
 			dns: network.dns || [],
 			bonds: network.bonds || [],
 			vlans: network.vlans || [],
@@ -504,7 +512,7 @@
 
 	async function deleteVlan(parent: string, vlan_id: number) {
 		if (!network) return;
-		if (!confirm(`Remove VLAN ${parent}.${vlan_id}?`)) return;
+		if (!await confirm(`Remove VLAN ${parent}.${vlan_id}?`, undefined, { confirmLabel: 'Remove' })) return;
 		const payload: NetworkConfig = {
 			interfaces: network.interfaces || [],
 			dns: network.dns || [],
