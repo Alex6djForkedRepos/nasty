@@ -929,6 +929,9 @@ in {
         procps                       # sysctl (vm.dirty_* tuning)
         nftables                     # nft (dynamic firewall rules)
         getent                       # getent (user/group lookups)
+        pciutils                     # lspci — PCI passthrough enumeration + hardware page
+        usbutils                     # lsusb — USB enumeration for hardware page + VM USB passthrough
+        dmidecode                    # DMI tables for /system/hardware (BIOS, baseboard, memory)
       ] ++ lib.optionals cfg.nfs.enable [ nfs-utils ]
         ++ lib.optionals cfg.smb.enable [ samba shadow.out ]
         ++ lib.optionals cfg.iscsi.enable [ targetcli-fixed ]
