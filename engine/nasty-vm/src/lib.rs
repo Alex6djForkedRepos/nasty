@@ -32,6 +32,8 @@ pub enum VmError {
     KvmNotAvailable,
     #[error("invalid disk path: {0}")]
     InvalidDiskPath(String),
+    #[error("invalid USB device: {0}")]
+    InvalidUsbDevice(String),
     #[error("QEMU command failed: {0}")]
     QemuFailed(String),
     #[error("QMP error: {0}")]
@@ -49,6 +51,7 @@ impl VmError {
             Self::NotRunning(_) => -32004,
             Self::KvmNotAvailable => -32005,
             Self::InvalidDiskPath(_) => -32009,
+            Self::InvalidUsbDevice(_) => -32010,
             Self::QemuFailed(_) => -32006,
             Self::Qmp(_) => -32007,
             Self::Io(_) => -32008,
@@ -74,6 +77,13 @@ pub struct VmConfig {
     pub networks: Vec<VmNetwork>,
     /// PCI devices to pass through via VFIO.
     pub passthrough_devices: Vec<PassthroughDevice>,
+    /// USB devices to pass through. Identified by vendor/product ID
+    /// rather than bus/addr because USB enumeration order shuffles
+    /// across reboots; pinning to IDs is the stable choice. Caveat:
+    /// all devices matching a (vendor, product) pair attach, so
+    /// plugging in two identical keyboards passes both through.
+    #[serde(default)]
+    pub usb_devices: Vec<UsbPassthrough>,
     /// Path to boot ISO (for installation). Removed after first boot if desired.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_iso: Option<String>,
@@ -173,6 +183,20 @@ pub struct PassthroughDevice {
     pub label: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct UsbPassthrough {
+    /// 4-hex-digit USB vendor ID (e.g. "0bda"). Stored lowercase
+    /// without the `0x` prefix to match `lsusb` formatting.
+    pub vendor_id: String,
+    /// 4-hex-digit USB product ID.
+    pub product_id: String,
+    /// Human-readable label preserved for the UI (e.g. "Realtek
+    /// Bluetooth dongle"). The kernel can't tell us this — it comes
+    /// from the original `lsusb` listing the user picked from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct VmStatus {
     /// VM configuration.
@@ -204,6 +228,8 @@ pub struct CreateVmRequest {
     pub networks: Option<Vec<VmNetwork>>,
     /// PCI devices to pass through.
     pub passthrough_devices: Option<Vec<PassthroughDevice>>,
+    /// USB devices to pass through (vendor:product pairs).
+    pub usb_devices: Option<Vec<UsbPassthrough>>,
     /// Path to boot ISO for installation.
     pub boot_iso: Option<String>,
     /// Boot order: "disk", "cdrom", or "network".
@@ -232,6 +258,8 @@ pub struct UpdateVmRequest {
     pub networks: Option<Vec<VmNetwork>>,
     /// Replace passthrough devices.
     pub passthrough_devices: Option<Vec<PassthroughDevice>>,
+    /// Replace USB passthrough devices.
+    pub usb_devices: Option<Vec<UsbPassthrough>>,
     /// Set or clear boot ISO.
     pub boot_iso: Option<String>,
     /// Boot order.
@@ -337,6 +365,28 @@ fn validate_vm_path(path: &str) -> Result<(), VmError> {
 /// Path to the QMP unix socket for a given VM.
 fn qmp_socket_path(vm_id: &str) -> String {
     format!("{QMP_DIR}/{vm_id}.qmp")
+}
+
+/// Validate a USB vendor/product ID. We format these directly into the
+/// QEMU command line, so anything but a 4-hex-digit string is a
+/// rejection (defends against a malformed manifest sneaking arbitrary
+/// args onto the qemu invocation).
+fn validate_usb_id(id: &str) -> Result<(), VmError> {
+    if id.len() != 4 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(VmError::InvalidUsbDevice(format!(
+            "USB id '{id}' must be 4 hex digits"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate every USB passthrough entry in a config.
+fn validate_usb_passthroughs(devices: &[UsbPassthrough]) -> Result<(), VmError> {
+    for d in devices {
+        validate_usb_id(&d.vendor_id)?;
+        validate_usb_id(&d.product_id)?;
+    }
+    Ok(())
 }
 
 /// Path to the VNC unix socket for a given VM.
@@ -464,6 +514,9 @@ impl VmService {
             }
             validate_vm_path(iso)?;
         }
+        if let Some(ref usb) = req.usb_devices {
+            validate_usb_passthroughs(usb)?;
+        }
 
         let id = Uuid::new_v4().to_string();
 
@@ -481,6 +534,7 @@ impl VmService {
                 }]
             }),
             passthrough_devices: req.passthrough_devices.unwrap_or_default(),
+            usb_devices: req.usb_devices.unwrap_or_default(),
             boot_iso: req.boot_iso,
             boot_order: req.boot_order.unwrap_or_else(|| "disk".to_string()),
             uefi: req.uefi.unwrap_or(true),
@@ -524,6 +578,7 @@ impl VmService {
                 || req.disks.is_some()
                 || req.networks.is_some()
                 || req.passthrough_devices.is_some()
+                || req.usb_devices.is_some()
                 || req.boot_iso.is_some()
                 || req.boot_order.is_some()
                 || req.uefi.is_some()
@@ -551,6 +606,10 @@ impl VmService {
             }
             if let Some(pt) = req.passthrough_devices {
                 config.passthrough_devices = pt;
+            }
+            if let Some(usb) = req.usb_devices {
+                validate_usb_passthroughs(&usb)?;
+                config.usb_devices = usb;
             }
             if let Some(ref iso) = req.boot_iso {
                 config.boot_iso = if iso.is_empty() {
@@ -928,6 +987,25 @@ fn build_qemu_args(config: &VmConfig) -> Vec<String> {
         ]);
     }
 
+    // USB passthrough — only emit the XHCI controller when there's at
+    // least one device, so VMs without USB passthrough stay minimal.
+    if !config.usb_devices.is_empty() {
+        args.extend_from_slice(&["-device".to_string(), "qemu-xhci,id=xhci".to_string()]);
+        for dev in &config.usb_devices {
+            // QEMU expects the `0x` prefix; lsusb-style 4-hex is what
+            // we store, so prepend here. Validation lives in
+            // `validate_usb_id` so a malformed manifest can't sneak
+            // garbage onto the command line.
+            args.extend_from_slice(&[
+                "-device".to_string(),
+                format!(
+                    "usb-host,bus=xhci.0,vendorid=0x{},productid=0x{}",
+                    dev.vendor_id, dev.product_id
+                ),
+            ]);
+        }
+    }
+
     // QMP control socket
     args.extend_from_slice(&[
         "-qmp".to_string(),
@@ -1044,4 +1122,104 @@ async fn list_pci_devices() -> Vec<PciDevice> {
     }
 
     devices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> VmConfig {
+        VmConfig {
+            id: "test-id".to_string(),
+            name: "test".to_string(),
+            cpus: 1,
+            memory_mib: 512,
+            disks: vec![],
+            networks: vec![],
+            passthrough_devices: vec![],
+            usb_devices: vec![],
+            boot_iso: None,
+            boot_order: "disk".to_string(),
+            uefi: false,
+            description: None,
+            autostart: false,
+            cpu_model: None,
+            machine_type: None,
+            vga: None,
+            extra_args: None,
+        }
+    }
+
+    #[test]
+    fn usb_id_validator_accepts_lowercase_hex() {
+        assert!(validate_usb_id("0bda").is_ok());
+        assert!(validate_usb_id("ffff").is_ok());
+    }
+
+    #[test]
+    fn usb_id_validator_accepts_uppercase_hex() {
+        assert!(validate_usb_id("0BDA").is_ok());
+    }
+
+    #[test]
+    fn usb_id_validator_rejects_wrong_length() {
+        assert!(validate_usb_id("0bd").is_err());
+        assert!(validate_usb_id("0bdaa").is_err());
+        assert!(validate_usb_id("").is_err());
+    }
+
+    #[test]
+    fn usb_id_validator_rejects_non_hex() {
+        // Catches injection attempts like " -device foo".
+        assert!(validate_usb_id("0xff").is_err()); // the leading "0x" is 4 chars but not hex
+        assert!(validate_usb_id("zzzz").is_err());
+        assert!(validate_usb_id("00 0").is_err());
+    }
+
+    #[test]
+    fn qemu_args_omit_xhci_when_no_usb_devices() {
+        let cfg = base_config();
+        let args = build_qemu_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a.contains("qemu-xhci")),
+            "got: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("usb-host")),
+            "got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn qemu_args_emit_xhci_controller_and_each_usb_device() {
+        let mut cfg = base_config();
+        cfg.usb_devices = vec![
+            UsbPassthrough {
+                vendor_id: "0bda".to_string(),
+                product_id: "8153".to_string(),
+                label: Some("Realtek USB Ethernet".to_string()),
+            },
+            UsbPassthrough {
+                vendor_id: "046d".to_string(),
+                product_id: "c52b".to_string(),
+                label: None,
+            },
+        ];
+        let args = build_qemu_args(&cfg);
+        // Exactly one XHCI controller, regardless of device count.
+        let xhci_count = args.iter().filter(|a| a.contains("qemu-xhci")).count();
+        assert_eq!(xhci_count, 1, "args: {args:?}");
+        assert!(
+            args.iter()
+                .any(|a| a == "usb-host,bus=xhci.0,vendorid=0x0bda,productid=0x8153"),
+            "missing first device, args: {args:?}"
+        );
+        assert!(
+            args.iter().any(
+                |a| a == "usb-host,bus=xhci.0,vendorid=0x046d,productid=0x52b"
+                    || a == "usb-host,bus=xhci.0,vendorid=0x046d,productid=0xc52b"
+            ),
+            "missing second device, args: {args:?}"
+        );
+    }
 }

@@ -861,6 +861,16 @@ export interface PassthroughDevice {
 	label?: string;
 }
 
+/** USB device pinned for passthrough. We identify by vendor:product
+ * because USB enumeration order is not stable across reboots; the
+ * tradeoff is that any device matching the pair attaches (plugging
+ * two identical dongles passes both through). */
+export interface UsbPassthrough {
+	vendor_id: string;
+	product_id: string;
+	label?: string;
+}
+
 export interface VmConfig {
 	id: string;
 	name: string;
@@ -869,6 +879,7 @@ export interface VmConfig {
 	disks: VmDisk[];
 	networks: VmNetwork[];
 	passthrough_devices: PassthroughDevice[];
+	usb_devices?: UsbPassthrough[];
 	boot_iso?: string;
 	boot_order: string;
 	uefi: boolean;

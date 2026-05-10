@@ -4,7 +4,7 @@
 	import { getClient } from '$lib/client';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { VmStatus, VmCapabilities, Subvolume, FsDependents, NetworkState } from '$lib/types';
+	import type { VmStatus, VmCapabilities, Subvolume, FsDependents, NetworkState, UsbPassthrough, HardwareSummary, UsbDevice } from '$lib/types';
 	import { unlockFs } from '$lib/unlock-fs.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -57,6 +57,11 @@
 	let newBootOrder = $state('disk');
 	let newAutostart = $state(false);
 	let newPassthrough = $state<string[]>([]);
+	/** USB devices selected for the new-VM wizard. Stored as `vid:pid`
+	 * strings so we can reuse Set/array operations; converted to
+	 * `UsbPassthrough` objects right before the create call. */
+	let newUsbPassthrough = $state<string[]>([]);
+	let usbDevices = $state<UsbDevice[]>([]);
 
 	// Passthrough edit state (for running/stopped VM detail view)
 	let editPtVm = $state<string | null>(null);
@@ -85,9 +90,18 @@
 	async function openWizard() {
 		newName = ''; newCpus = 1; newMemory = 1024; newDisk = ''; newDiskCreate = false;
 		newDiskFs = ''; newDiskSize = 10; newIso = ''; newDescription = '';
-		newBootOrder = 'disk'; newAutostart = false; newPassthrough = [];
-		await Promise.all([loadSubvolumes(), loadFilesystems(), loadImages()]);
+		newBootOrder = 'disk'; newAutostart = false; newPassthrough = []; newUsbPassthrough = [];
+		await Promise.all([loadSubvolumes(), loadFilesystems(), loadImages(), loadUsbDevices()]);
 		wizardStep = canCreateVm ? 1 : -1; // -1 = prerequisites
+	}
+
+	async function loadUsbDevices() {
+		try {
+			const hw = await client.call<HardwareSummary>('system.hardware.summary');
+			usbDevices = hw.usb;
+		} catch {
+			usbDevices = [];
+		}
 	}
 
 	// Network state for create wizard
@@ -375,6 +389,13 @@
 				return { address: addr, label: dev?.description ?? null };
 			});
 		}
+		if (newUsbPassthrough.length > 0) {
+			params.usb_devices = newUsbPassthrough.map(key => {
+				const [vendor_id, product_id] = key.split(':');
+				const dev = usbDevices.find(d => d.vendor_id === vendor_id && d.product_id === product_id);
+				return { vendor_id, product_id, label: dev?.description ?? null };
+			});
+		}
 
 		const ok = await withToast(
 			() => client.call('vm.create', params),
@@ -385,7 +406,7 @@
 			newName = ''; newCpus = 1; newMemory = 1024; newDisk = '';
 			newDiskCreate = false; newDiskFs = ''; newDiskSize = 10;
 			newIso = ''; newDescription = ''; newBootOrder = 'disk';
-			newAutostart = false; newPassthrough = [];
+			newAutostart = false; newPassthrough = []; newUsbPassthrough = [];
 			newNetMode = 'user'; newNetBridge = ''; newNetMac = '';
 			await refresh();
 		}
@@ -972,6 +993,37 @@
 					<p class="mt-1 text-xs text-muted-foreground">No PCI devices available. Enable VT-d (Intel) or AMD-Vi in BIOS/UEFI settings. Not available on virtual machines.</p>
 				{/if}
 			</div>
+			<div class="mb-4">
+				<Label>USB Passthrough</Label>
+				{#if usbDevices.length > 0}
+					<div class="mt-1 max-h-40 overflow-y-auto rounded border border-input p-2 space-y-1">
+						{#each usbDevices as dev}
+							{@const key = `${dev.vendor_id}:${dev.product_id}`}
+							<label class="flex items-start gap-2 text-xs cursor-pointer hover:bg-muted/30 rounded p-1">
+								<input
+									type="checkbox"
+									class="mt-0.5 rounded border-input"
+									checked={newUsbPassthrough.includes(key)}
+									onchange={() => {
+										if (newUsbPassthrough.includes(key)) {
+											newUsbPassthrough = newUsbPassthrough.filter(k => k !== key);
+										} else {
+											newUsbPassthrough = [...newUsbPassthrough, key];
+										}
+									}}
+								/>
+								<div>
+									<span class="font-mono">{dev.vendor_id}:{dev.product_id}</span>
+									<span class="text-muted-foreground ml-1">{dev.description}</span>
+								</div>
+							</label>
+						{/each}
+					</div>
+					<span class="mt-1 block text-xs text-muted-foreground">Matched by vendor:product — stable across reboots. Any device with this ID attaches, so two identical dongles would both pass through.</span>
+				{:else}
+					<p class="mt-1 text-xs text-muted-foreground">No USB devices detected.</p>
+				{/if}
+			</div>
 			<div class="flex gap-2">
 				<Button variant="secondary" size="sm" onclick={() => wizardStep = 4}>← Back</Button>
 				<Button size="sm" onclick={() => wizardStep = 6}>Next: Review →</Button>
@@ -999,8 +1051,12 @@
 				<span class="text-muted-foreground">Network</span>
 				<span>{newNetMode === 'bridge' ? `Bridge (${newNetBridge || 'none selected'})` : 'NAT'}</span>
 				{#if newPassthrough.length > 0}
-					<span class="text-muted-foreground">Passthrough</span>
+					<span class="text-muted-foreground">PCI passthrough</span>
 					<span>{newPassthrough.length} device{newPassthrough.length !== 1 ? 's' : ''}</span>
+				{/if}
+				{#if newUsbPassthrough.length > 0}
+					<span class="text-muted-foreground">USB passthrough</span>
+					<span>{newUsbPassthrough.length} device{newUsbPassthrough.length !== 1 ? 's' : ''}</span>
 				{/if}
 				{#if newDescription}
 					<span class="text-muted-foreground">Description</span>
