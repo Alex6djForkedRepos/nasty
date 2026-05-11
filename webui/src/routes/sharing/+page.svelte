@@ -5,7 +5,7 @@
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type {
-		NfsShare, SmbShare, IscsiTarget, NvmeofSubsystem,
+		SmbShare, IscsiTarget, NvmeofSubsystem,
 		Subvolume, ProtocolStatus, SmbGroup
 	} from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
@@ -15,6 +15,12 @@
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import SortTh from '$lib/components/SortTh.svelte';
 	import { AlertTriangle } from '@lucide/svelte';
+	import NfsPanel from './NfsPanel.svelte';
+	import {
+		nfs,
+		nfsRefresh,
+		nfsLoadProtocol,
+	} from '$lib/sharing/nfs.svelte';
 
 	// ── Share creation wizard ────────────────────────────
 	let shareWizardStep: 0 | 1 | 2 | 3 | 4 = $state(0);
@@ -198,115 +204,13 @@
 
 	const client = getClient();
 
-	// ── NFS state ────────────────────────────────────────
-	let nfsShares: NfsShare[] = $state([]);
-	let nfsLoading = $state(true);
-	let nfsProtocol: ProtocolStatus | null = $state(null);
-	let nfsShowCreate = $state(false);
-	let nfsSubvolumes: Subvolume[] = $state([]);
-	let nfsNewSubvolume = $state('');
-	let nfsNewComment = $state('');
-	let nfsNewHost = $state('');
-	let nfsNewOptions = $state('rw,sync,no_subtree_check');
-	let nfsExpanded = $state<Record<string, boolean>>({});
-	let nfsAddClientShare = $state<string | null>(null);
-	let nfsAddClientHost = $state('');
-	let nfsAddClientOptions = $state('rw,sync,no_subtree_check');
-	let nfsSearch = $state('');
-	type NfsSortKey = 'path' | 'status';
-	let nfsSortKey = $state<NfsSortKey | null>(null);
-	let nfsSortDir = $state<'asc' | 'desc'>('asc');
-
-	$effect(() => { if (nfsShowCreate) nfsLoadSubvolumes(); });
-
-	function nfsToggleSort(key: NfsSortKey) {
-		if (nfsSortKey === key) nfsSortDir = nfsSortDir === 'asc' ? 'desc' : 'asc';
-		else { nfsSortKey = key; nfsSortDir = 'asc'; }
-	}
-
-	const nfsFiltered = $derived(
-		nfsSearch.trim()
-			? nfsShares.filter(s =>
-				s.path.toLowerCase().includes(nfsSearch.toLowerCase()) ||
-				s.comment?.toLowerCase().includes(nfsSearch.toLowerCase()) ||
-				s.clients.some(c => c.host.includes(nfsSearch)))
-			: nfsShares
-	);
-
-	const nfsSorted = $derived.by(() => {
-		if (!nfsSortKey) return nfsFiltered;
-		return [...nfsFiltered].sort((a, b) => {
-			let cmp = 0;
-			if (nfsSortKey === 'path') cmp = a.path.localeCompare(b.path);
-			else if (nfsSortKey === 'status') cmp = Number(b.enabled) - Number(a.enabled);
-			return nfsSortDir === 'asc' ? cmp : -cmp;
-		});
-	});
-
-	async function nfsRefresh() {
-		await withToast(async () => { nfsShares = await client.call<NfsShare[]>('share.nfs.list'); });
-	}
-	async function nfsLoadProtocol() {
-		try {
-			const all = await client.call<ProtocolStatus[]>('service.protocol.list');
-			nfsProtocol = all.find(p => p.name === 'nfs') ?? null;
-		} catch { /* ignore */ }
-	}
-	async function nfsLoadSubvolumes() {
-		await withToast(async () => {
-			const all = await client.call<Subvolume[]>('subvolume.list_all');
-			nfsSubvolumes = all.filter(s => s.subvolume_type === 'filesystem');
-		});
-	}
-	async function nfsCreate() {
-		if (!nfsNewSubvolume || !nfsNewHost) return;
-		const ok = await withToast(
-			() => client.call('share.nfs.create', {
-				path: nfsNewSubvolume,
-				comment: nfsNewComment || undefined,
-				clients: [{ host: nfsNewHost, options: nfsNewOptions }],
-			}),
-			'NFS share created'
-		);
-		if (ok !== undefined) {
-			nfsShowCreate = false;
-			nfsNewSubvolume = '';
-			nfsNewComment = '';
-			nfsNewHost = '';
-			await nfsRefresh();
-		}
-	}
-	async function nfsToggleEnabled(share: NfsShare) {
-		await withToast(
-			() => client.call('share.nfs.update', { id: share.id, enabled: !share.enabled }),
-			`Share ${share.enabled ? 'disabled' : 'enabled'}`
-		);
-		await nfsRefresh();
-	}
-	async function nfsRemove(id: string) {
-		if (!await confirm('Delete this NFS share?')) return;
-		await withToast(() => client.call('share.nfs.delete', { id }), 'NFS share deleted');
-		await nfsRefresh();
-	}
-	async function nfsRemoveClient(share: NfsShare, host: string) {
-		const clients = share.clients.filter(c => c.host !== host);
-		await withToast(() => client.call('share.nfs.update', { id: share.id, clients }), 'Client removed');
-		await nfsRefresh();
-	}
-	async function nfsAddClient(share: NfsShare) {
-		if (!nfsAddClientHost) return;
-		const clients = [...share.clients, { host: nfsAddClientHost, options: nfsAddClientOptions }];
-		const ok = await withToast(
-			() => client.call('share.nfs.update', { id: share.id, clients }),
-			'Client added'
-		);
-		if (ok !== undefined) {
-			nfsAddClientShare = null;
-			nfsAddClientHost = '';
-			nfsAddClientOptions = 'rw,sync,no_subtree_check';
-		}
-		await nfsRefresh();
-	}
+	// ── NFS state ──
+	// All NFS state + handlers live in lib/sharing/nfs.svelte.ts and
+	// the <NfsPanel> component. We import only what the cross-protocol
+	// wizard, onMount, and event broadcasts need to reach into:
+	// `nfs.protocol` (for the wizard's "Protocol" step / toggle button),
+	// `nfsRefresh()` (triggered after wizard create + on share.nfs
+	// events), and `nfsLoadProtocol()` (triggered on protocol events).
 
 	// ── SMB state ────────────────────────────────────────
 	let smbShares: SmbShare[] = $state([]);
@@ -728,7 +632,7 @@
 	onMount(async () => {
 		client.onEvent(handleEvent);
 		await Promise.all([
-			nfsRefresh().then(() => { nfsLoading = false; }),
+			nfsRefresh().then(() => { nfs.loading = false; }),
 			smbRefresh().then(() => { smbLoading = false; }),
 			iscsiRefresh().then(() => { iscsiLoading = false; }),
 			nvmeRefresh().then(() => { nvmeLoading = false; }),
@@ -766,7 +670,7 @@
 
 			<!-- Step 1: Protocol -->
 			{#if shareWizardStep === 1}
-			{@const selectedProto = ({ nfs: nfsProtocol, smb: smbProtocol, iscsi: iscsiProtocol, nvmeof: nvmeProtocol })[shareProtocol]}
+			{@const selectedProto = ({ nfs: nfs.protocol, smb: smbProtocol, iscsi: iscsiProtocol, nvmeof: nvmeProtocol })[shareProtocol]}
 			<div class="mb-4">
 				<Label>Protocol</Label>
 				<select bind:value={shareProtocol} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
@@ -1071,8 +975,8 @@
 <!-- Tab bar with inline status -->
 <div class="mb-6 flex items-center border-b border-border">
 	{#each TABS as tab}
-		{@const proto = ({ nfs: nfsProtocol, smb: smbProtocol, iscsi: iscsiProtocol, nvmeof: nvmeProtocol })[tab.key]}
-		{@const count = ({ nfs: nfsShares.length, smb: smbShares.length, iscsi: iscsiTargets.length, nvmeof: nvmeSubsystems.length })[tab.key]}
+		{@const proto = ({ nfs: nfs.protocol, smb: smbProtocol, iscsi: iscsiProtocol, nvmeof: nvmeProtocol })[tab.key]}
+		{@const count = ({ nfs: nfs.shares.length, smb: smbShares.length, iscsi: iscsiTargets.length, nvmeof: nvmeSubsystems.length })[tab.key]}
 		<button
 			onclick={() => switchTab(tab.key)}
 			class="flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors {activeTab === tab.key
@@ -1099,104 +1003,7 @@
 
 <!-- ════════════════════════════════════════════════════ NFS ════════════════════════════════════════════════════ -->
 {#if activeTab === 'nfs'}
-
-<div class="mb-4 flex items-center gap-3">
-	<Input bind:value={nfsSearch} placeholder="Search..." class="h-9 w-48" />
-</div>
-
-
-{#if nfsLoading}
-	<p class="text-muted-foreground">Loading...</p>
-{:else if nfsShares.length === 0}
-	<p class="text-muted-foreground">No shares configured.</p>
-{:else}
-	<table class="w-full text-sm">
-		<thead>
-			<tr>
-				<SortTh label="Path" active={nfsSortKey === 'path'} dir={nfsSortDir} onclick={() => nfsToggleSort('path')} />
-				<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Clients</th>
-				<SortTh label="Status" active={nfsSortKey === 'status'} dir={nfsSortDir} onclick={() => nfsToggleSort('status')} />
-				<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground w-px whitespace-nowrap">Actions</th>
-			</tr>
-		</thead>
-		<tbody>
-			{#each nfsSorted as share}
-				<tr
-					class="border-b border-border cursor-pointer hover:bg-muted/30 transition-colors"
-					onclick={() => nfsExpanded[share.id] = !nfsExpanded[share.id]}
-				>
-					<td class="p-3">
-						<span class="font-mono text-sm">{share.path}</span>
-						{#if share.comment}<br /><span class="text-xs text-muted-foreground">{share.comment}</span>{/if}
-					</td>
-					<td class="p-3 text-xs text-muted-foreground">
-						{share.clients.length} client{share.clients.length !== 1 ? 's' : ''}
-					</td>
-					<td class="p-3">
-						<Badge variant={share.enabled ? 'default' : 'secondary'}>
-							{share.enabled ? 'Enabled' : 'Disabled'}
-						</Badge>
-					</td>
-					<td class="p-3" onclick={(e) => e.stopPropagation()}>
-						<div class="flex gap-2">
-							<Button variant="secondary" size="xs" onclick={() => nfsExpanded[share.id] = !nfsExpanded[share.id]}>
-								{nfsExpanded[share.id] ? 'Hide' : 'Details'}
-							</Button>
-							<Button variant="secondary" size="xs" onclick={() => nfsToggleEnabled(share)}>
-								{share.enabled ? 'Disable' : 'Enable'}
-							</Button>
-							<Button variant="destructive" size="xs" onclick={() => nfsRemove(share.id)}>Delete</Button>
-						</div>
-					</td>
-				</tr>
-				{#if nfsExpanded[share.id]}
-					<tr class="border-b border-border bg-muted/20">
-						<td colspan="4" class="px-6 py-4">
-							<p class="mb-2 text-xs font-semibold uppercase text-muted-foreground">Allowed Clients</p>
-							{#if share.clients.length === 0}
-								<p class="mb-3 text-xs text-muted-foreground">No clients configured.</p>
-							{:else}
-								<div class="mb-3 space-y-1.5">
-									{#each share.clients as c}
-										<div class="flex items-center gap-3">
-											<code class="text-xs">{c.host}</code>
-											<span class="text-xs text-muted-foreground">({c.options})</span>
-											{#if c.options.includes('no_root_squash')}
-												<span class="text-xs text-yellow-500" title="no_root_squash disables quota enforcement for root clients">⚠ quota</span>
-											{/if}
-											<Button variant="destructive" size="xs" onclick={() => nfsRemoveClient(share, c.host)}>Remove</Button>
-										</div>
-									{/each}
-								</div>
-							{/if}
-							{#if nfsAddClientShare === share.id}
-								<div class="flex items-end gap-2">
-									<div>
-										<Label class="text-xs">Host / Network</Label>
-										<Input bind:value={nfsAddClientHost} placeholder="192.168.1.0/24" class="mt-1 h-8 w-44 text-xs" />
-									</div>
-									<div>
-										<Label class="text-xs">Options</Label>
-										<Input bind:value={nfsAddClientOptions} class="mt-1 h-8 w-56 text-xs" />
-									</div>
-									<Button size="xs" onclick={() => nfsAddClient(share)} disabled={!nfsAddClientHost}>Add</Button>
-									<Button variant="secondary" size="xs" onclick={() => { nfsAddClientShare = null; nfsAddClientHost = ''; }}>Cancel</Button>
-								</div>
-								{#if nfsAddClientOptions.includes('no_root_squash')}
-									<p class="mt-1 text-xs text-yellow-500">Warning: <code>no_root_squash</code> disables quota enforcement for root NFS clients.</p>
-								{/if}
-							{:else}
-								<Button variant="secondary" size="xs" onclick={() => { nfsAddClientShare = share.id; nfsAddClientHost = ''; nfsAddClientOptions = 'rw,sync,no_subtree_check'; }}>
-									Add Client
-								</Button>
-							{/if}
-						</td>
-					</tr>
-				{/if}
-			{/each}
-		</tbody>
-	</table>
-{/if}
+	<NfsPanel />
 
 
 <!-- ════════════════════════════════════════════════════ SMB ════════════════════════════════════════════════════ -->
