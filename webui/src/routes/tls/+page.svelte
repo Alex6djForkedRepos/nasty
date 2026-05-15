@@ -13,11 +13,9 @@
 	let tlsAcmeEnabled = $state(false);
 	let acmeStatus: { state: string; message: string; domain?: string; expires?: string; issued?: string; issuer?: string; last_attempt?: string } | null = $state(null);
 	let tlsAcmeStaging = $state(false);
-	let tlsChallengeType = $state<'tls-alpn' | 'dns'>('tls-alpn');
+	let tlsChallengeType = $state<'tls-alpn' | 'http' | 'dns'>('tls-alpn');
 	let tlsDnsProvider = $state('');
 	let tlsDnsCredentials = $state('');
-	let tlsDnsResolver = $state('');
-	let tlsDnsPropagationWait = $state(30);
 	let savingTls = $state(false);
 	let tlsChanged = $state(false);
 	let editing = $state(false);
@@ -50,8 +48,6 @@
 		tlsDnsProvider = settings?.tls_dns_provider ?? '';
 		tlsDnsCredentials = settings?.tls_dns_credentials ?? '';
 		tlsAcmeStaging = (settings as any)?.tls_acme_staging ?? false;
-		tlsDnsResolver = (settings as any)?.tls_dns_resolver ?? '';
-		tlsDnsPropagationWait = (settings as any)?.tls_dns_propagation_wait ?? 30;
 		try { acmeStatus = await client.call('system.acme.status'); } catch { /* ignore */ }
 	});
 
@@ -66,8 +62,6 @@
 				tls_dns_provider: tlsDnsProvider || null,
 				tls_dns_credentials: tlsDnsCredentials || null,
 				tls_acme_staging: tlsAcmeStaging,
-				tls_dns_resolver: tlsDnsResolver || null,
-				tls_dns_propagation_wait: tlsDnsPropagationWait,
 			}),
 			tlsAcmeEnabled ? 'Let\'s Encrypt certificate requested — check status below' : 'TLS settings saved'
 		);
@@ -212,7 +206,8 @@
 						/>
 					{/if}
 					<span class="mt-1 block text-xs text-muted-foreground">
-						See <a href="https://go-acme.github.io/lego/dns/" target="_blank" class="text-blue-400 hover:underline">lego DNS providers</a> for the full list and required credentials.
+						The provider name must match a DNS plugin compiled into the Caddy build shipped with NASty.
+						Currently only HTTP-01 / TLS-ALPN-01 are wired up; DNS-01 plugin support lands in a follow-up release.
 					</span>
 				</div>
 
@@ -224,42 +219,12 @@
 						oninput={() => tlsChanged = true}
 						rows={4}
 						class="w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
-						placeholder={"CLOUDFLARE_DNS_API_TOKEN=xxxxx\nCLOUDFLARE_ZONE_API_TOKEN=xxxxx"}
+						placeholder={"CF_API_TOKEN=xxxxx"}
 					></textarea>
 					<span class="mt-1 block text-xs text-muted-foreground">
-						One KEY=VALUE per line. These are passed as environment variables to the ACME client.
-						No inbound ports needed — verification happens via DNS records.
-					</span>
-				</div>
-
-				<div class="mb-4">
-					<label for="tls-dns-resolver" class="mb-1 block text-xs text-muted-foreground">DNS Resolver for propagation checks</label>
-					<input
-						id="tls-dns-resolver"
-						type="text"
-						bind:value={tlsDnsResolver}
-						oninput={() => tlsChanged = true}
-						class="w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-						placeholder="1.1.1.1:53 (default)"
-					/>
-					<span class="mt-1 block text-xs text-muted-foreground">
-						Public resolver used to verify TXT record propagation. Default: 1.1.1.1. Change if your setup uses a different public DNS.
-					</span>
-				</div>
-
-				<div class="mb-4">
-					<label for="tls-dns-wait" class="mb-1 block text-xs text-muted-foreground">Propagation wait (seconds)</label>
-					<input
-						id="tls-dns-wait"
-						type="number"
-						min="0"
-						max="300"
-						bind:value={tlsDnsPropagationWait}
-						oninput={() => tlsChanged = true}
-						class="w-24 rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-					/>
-					<span class="mt-1 block text-xs text-muted-foreground">
-						Wait this many seconds after creating the TXT record before checking propagation. Default: 30. Increase if propagation checks keep timing out.
+						One KEY=VALUE per line. Written to a Caddy <code>EnvironmentFile</code> and referenced from the
+						generated <code>tls</code> block via <code>{'{env.KEY}'}</code> placeholders. No inbound ports needed —
+						verification happens via DNS records.
 					</span>
 				</div>
 			{/if}

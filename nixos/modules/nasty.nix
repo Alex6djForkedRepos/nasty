@@ -576,7 +576,6 @@ in {
       qemu              # QEMU/KVM for virtual machines
       pciutils          # lspci for passthrough device discovery
       docker-compose    # Docker Compose for multi-container apps
-      lego              # ACME client for Let's Encrypt certificates
       croc              # peer-to-peer file transfer for sending debug reports
       rustic             # deduplicating encrypted backups (restic-compatible)
       restic-rest-server # REST API server for receiving backups from other machines
@@ -821,6 +820,14 @@ in {
     systemd.tmpfiles.rules = [
       "d /var/lib/nasty 0751 root root -"
       "d /var/lib/nasty/tls 0750 root caddy -"
+      # Engine-managed Caddy snippets — vhosts.conf is imported by the
+      # main Caddyfile (hostname-bound ACME vhost when enabled, empty
+      # otherwise); acme.env feeds DNS-01 provider creds into Caddy via
+      # EnvironmentFile. Seeded empty so Caddy can start before the
+      # engine has had a chance to write either.
+      "d /var/lib/nasty/caddy 0750 root caddy -"
+      "f /var/lib/nasty/caddy/vhosts.conf 0644 root caddy -"
+      "f /var/lib/nasty/caddy/acme.env 0640 root caddy -"
       "d /var/lib/nasty/subvolumes 0750 root root -"
       "d /var/lib/nasty/shares 0750 root root -"
       "d /var/lib/nasty/shares/nfs 0750 root root -"
@@ -948,7 +955,6 @@ in {
         docker                       # Docker for apps runtime
         docker-compose               # Docker Compose for multi-container apps
         fwupd                        # fwupdmgr for firmware updates
-        lego                         # ACME client for Let's Encrypt
         curl                         # HTTP debugging
         rsync                        # file sync
         procps                       # sysctl (vm.dirty_* tuning)
@@ -1003,7 +1009,7 @@ in {
         KeyringMode = "private";
         # Allow only the address families the engine actually uses:
         #   AF_UNIX   — docker/QMP/libvirt sockets
-        #   AF_INET/6 — outbound HTTPS (lego, telemetry, registries)
+        #   AF_INET/6 — outbound HTTPS (Caddy ACME, telemetry, registries)
         #   AF_NETLINK — nft, ip, mount/umount kernel chatter
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
       };
@@ -1213,23 +1219,26 @@ in {
     # Caddy's admin-API config: the engine talks to
     # http://127.0.0.1:2019/config/... on install / remove and the
     # routes apply immediately, no file rewrite, no reload.
+    # Caddy is configured as a single named snippet (`nasty_webui_routes`)
+    # that holds every reverse-proxy / file-server / websocket / header
+    # rule, plus a static `:<port>` vhost that mounts the snippet with the
+    # self-signed (or user-supplied) cert. The engine then optionally
+    # writes a hostname-bound ACME vhost to `/var/lib/nasty/caddy/vhosts.conf`
+    # which the main Caddyfile imports — Caddy issues + serves a real cert
+    # for that hostname while the static `:<port>` block stays as the IP
+    # fallback. Both vhosts share routes through the snippet, so we don't
+    # have to keep them in sync by hand.
+    #
+    # `auto_https off` because we never want Caddy enrolling for IP-bound
+    # vhosts; the engine-managed snippet drives ACME explicitly via the
+    # `tls EMAIL` form on a hostname-bound block.
     services.caddy = mkIf (cfg.webui.package != null) {
       enable = true;
-      # `auto_https off` because we ship a self-signed (or
-      # user-supplied) cert and don't want Caddy issuing its own;
-      # the explicit `tls` block below points at the same cert
-      # files the nginx era used.
       globalConfig = ''
         auto_https off
       '';
-      virtualHosts.":${toString cfg.webui.httpPort}" = {
-        extraConfig = ''
-          redir https://{host}{uri} permanent
-        '';
-      };
-      virtualHosts.":${toString cfg.webui.port}" = {
-        extraConfig = ''
-          tls ${tlsCertFile} ${tlsKeyFile}
+      extraConfig = ''
+        (nasty_webui_routes) {
           root * ${cfg.webui.package}/share/nasty-webui
 
           # Security headers on every response.  CSP keeps
@@ -1367,9 +1376,34 @@ in {
             try_files {path} {path}/ /index.html
             file_server
           }
-        '';
-      };
+        }
+
+        # HTTP -> HTTPS redirect, port-only (works for IP and hostname).
+        :${toString cfg.webui.httpPort} {
+          redir https://{host}{uri} permanent
+        }
+
+        # Always-on static-cert vhost. Serves the self-signed (or
+        # user-supplied) cert on the IP path. When ACME is enabled,
+        # Caddy prefers the hostname-bound vhost from the import below
+        # for matching SNI, and this block becomes the IP fallback.
+        :${toString cfg.webui.port} {
+          tls ${tlsCertFile} ${tlsKeyFile}
+          import nasty_webui_routes
+        }
+
+        # Engine-managed: hostname-bound ACME vhost when the user has
+        # enabled Let's Encrypt in Settings → TLS. Empty otherwise.
+        import /var/lib/nasty/caddy/vhosts.conf
+      '';
     };
+
+    # Caddy reads DNS-01 provider creds (when the user picks DNS
+    # challenge) from this EnvironmentFile. The `-` prefix means
+    # "ignore if missing" so the unit still starts on a fresh box
+    # before the engine has written anything.
+    systemd.services.caddy.serviceConfig.EnvironmentFile =
+      mkIf (cfg.webui.package != null) "-/var/lib/nasty/caddy/acme.env";
 
     # ── Journald ───────────────────────────────────────────────
     services.journald.extraConfig = ''

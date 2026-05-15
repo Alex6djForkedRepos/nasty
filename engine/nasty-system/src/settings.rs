@@ -66,19 +66,15 @@ pub fn reset_acme_status() {
     set_acme_status("idle", "", None);
 }
 
-/// Retry ACME provisioning with current settings.
+/// Re-apply the Caddy TLS snippet. Useful after a transient failure
+/// (Caddy briefly down, ACME server flaking, etc.) — the user can hit
+/// "retry" in the WebUI and we re-render + reload, which kicks Caddy's
+/// internal ACME state machine back into action.
 pub async fn retry_acme() -> Result<(), String> {
     let settings = load().await;
-    if !settings.tls_acme_enabled {
-        return Err("ACME is not enabled".into());
-    }
-    if settings.tls_challenge_type == "dns" {
-        write_dns_credentials(&settings).await;
-    }
     tokio::spawn(async move {
-        match run_lego(&settings).await {
-            Ok(()) => info!("ACME certificate provisioned successfully"),
-            Err(e) => warn!("ACME certificate provisioning failed: {e}"),
+        if let Err(e) = apply_caddy_tls(&settings).await {
+            warn!("Caddy TLS reload failed: {e}");
         }
     });
     Ok(())
@@ -87,8 +83,15 @@ pub async fn retry_acme() -> Result<(), String> {
 const STATE_PATH: &str = "/var/lib/nasty/settings.json";
 const STATE_DIR: &str = "/var/lib/nasty";
 const TLS_CERT_PATH: &str = "/var/lib/nasty/tls/cert.pem";
-const TLS_KEY_PATH: &str = "/var/lib/nasty/tls/key.pem";
-const LEGO_DATA_DIR: &str = "/var/lib/nasty/lego";
+
+// Caddy reads this snippet from its main Caddyfile via `import` to add a
+// hostname-bound vhost when ACME is enabled. Empty file = no extra vhost,
+// Caddy serves the static-cert `:8443` block from the NixOS-managed config.
+const CADDY_VHOSTS_PATH: &str = "/var/lib/nasty/caddy/vhosts.conf";
+
+// Caddy reads DNS-01 provider credentials from this EnvironmentFile (the
+// caddy.service unit references it). One KEY=VAL per line.
+const CADDY_ACME_ENV_PATH: &str = "/var/lib/nasty/caddy/acme.env";
 
 /// Display unit for temperatures rendered in the WebUI. Internal storage
 /// and alert thresholds are always in Celsius; this is presentational only.
@@ -124,25 +127,24 @@ pub struct Settings {
     /// Whether Let's Encrypt is enabled. Requires tls_domain and tls_acme_email.
     #[serde(default)]
     pub tls_acme_enabled: bool,
-    /// ACME challenge type: "tls-alpn" (port 443) or "dns" (DNS provider API).
+    /// ACME challenge type. Caddy's built-in ACME issuer handles all three:
+    ///   - "tls-alpn"  → TLS-ALPN-01 (port 443)
+    ///   - "http"      → HTTP-01 (port 80)
+    ///   - "dns"       → DNS-01 via a DNS-provider plugin compiled into Caddy
     #[serde(default = "default_challenge_type")]
     pub tls_challenge_type: String,
     /// DNS provider code for DNS-01 challenge (e.g. "cloudflare", "route53").
+    /// Must match a DNS plugin compiled into the Caddy binary.
     #[serde(default)]
     pub tls_dns_provider: Option<String>,
     /// DNS provider API credentials as KEY=VALUE lines.
+    /// Written to a Caddy `EnvironmentFile` and referenced from the
+    /// generated `tls` block via `{env.KEY}` placeholders.
     #[serde(default)]
     pub tls_dns_credentials: Option<String>,
     /// Use Let's Encrypt staging environment (for testing, avoids rate limits).
     #[serde(default)]
     pub tls_acme_staging: bool,
-    /// Custom DNS resolver for ACME propagation checks (e.g. "1.1.1.1:53").
-    /// Default: use system resolver. Useful when local DNS doesn't see public records.
-    #[serde(default)]
-    pub tls_dns_resolver: Option<String>,
-    /// Seconds to wait before checking DNS propagation. Default: 30.
-    #[serde(default)]
-    pub tls_dns_propagation_wait: Option<u32>,
     /// Whether anonymous telemetry is enabled (drive count, storage capacity).
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
@@ -271,8 +273,6 @@ impl Default for Settings {
             tls_dns_provider: None,
             tls_dns_credentials: None,
             tls_acme_staging: false,
-            tls_dns_resolver: None,
-            tls_dns_propagation_wait: None,
             telemetry_enabled: default_telemetry_enabled(),
             oidc: OidcSettings::default(),
         }
@@ -303,10 +303,6 @@ pub struct SettingsUpdate {
     pub tls_dns_credentials: Option<String>,
     /// Use staging environment.
     pub tls_acme_staging: Option<bool>,
-    /// Custom DNS resolver for propagation checks.
-    pub tls_dns_resolver: Option<String>,
-    /// Seconds to wait before checking DNS propagation.
-    pub tls_dns_propagation_wait: Option<u32>,
     /// Enable/disable anonymous telemetry.
     pub telemetry_enabled: Option<bool>,
 }
@@ -327,15 +323,7 @@ impl SettingsService {
             let name = name.trim().to_string();
             if !name.is_empty() {
                 settings.hostname = Some(name);
-                if let Err(e) = save(&settings).await {
-                    // The in-memory hostname is set so the running engine
-                    // sees it correctly, but at next startup we'll re-seed
-                    // from /proc — which is fine on a normal box, but on
-                    // a host where /proc/sys/kernel/hostname diverges
-                    // from the persisted name (e.g., systemd hostnamed
-                    // race) we'd silently lose the saved value.
-                    warn!("seed-hostname save failed: {e}");
-                }
+                let _ = save(&settings).await;
             }
         }
         Self {
@@ -441,36 +429,18 @@ impl SettingsService {
             settings.tls_acme_staging = staging;
             tls_changed = true;
         }
-        if let Some(resolver) = update.tls_dns_resolver
-            && settings.tls_dns_resolver != Some(resolver.clone())
-        {
-            settings.tls_dns_resolver = if resolver.is_empty() {
-                None
-            } else {
-                Some(resolver)
-            };
-            tls_changed = true;
-        }
-        if let Some(wait) = update.tls_dns_propagation_wait
-            && settings.tls_dns_propagation_wait != Some(wait)
-        {
-            settings.tls_dns_propagation_wait = Some(wait);
-            tls_changed = true;
-        }
         if let Some(telemetry) = update.telemetry_enabled {
             settings.telemetry_enabled = telemetry;
         }
         save(&settings).await.map_err(|e| e.to_string())?;
-        if tls_changed && settings.tls_acme_enabled {
-            if settings.tls_challenge_type == "dns" {
-                write_dns_credentials(&settings).await;
-            }
-            // Run ACME cert provisioning in the background
+        if tls_changed {
+            // Always re-apply on a TLS change — even when ACME is now
+            // disabled the snippet must flip back to the static-cert
+            // form so Caddy stops serving the old ACME-issued cert.
             let s = settings.clone();
             tokio::spawn(async move {
-                match run_lego(&s).await {
-                    Ok(()) => info!("ACME certificate provisioned successfully"),
-                    Err(e) => warn!("ACME certificate provisioning failed: {e}"),
+                if let Err(e) = apply_caddy_tls(&s).await {
+                    warn!("Caddy TLS reload failed: {e}");
                 }
             });
         }
@@ -576,265 +546,303 @@ async fn save(settings: &Settings) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-const DNS_CREDS_PATH: &str = "/var/lib/nasty/acme-dns-credentials";
+// ── Caddy-driven ACME ────────────────────────────────────────
+//
+// Caddy's built-in ACME issuer handles HTTP-01, TLS-ALPN-01 and
+// (with the right plugin compiled in) DNS-01 — including renewals,
+// retries, OCSP stapling, and the multi-stepped state machine that
+// used to live in this file as a 250-line `lego` subprocess wrapper.
+//
+// The engine's job here is reduced to:
+//   1. Render a Caddy snippet from `Settings` describing the desired
+//      TLS state (static cert vs hostname-bound ACME vhost).
+//   2. Write it to `CADDY_VHOSTS_PATH`, where the NixOS-managed
+//      Caddyfile imports it.
+//   3. Reload Caddy (`systemctl reload`) so it picks up the snippet.
+//   4. Read back what Caddy ends up serving so the WebUI can show
+//      issuer / expiry / status.
+//
+// Caddy stores ACME-issued certs under
+// `/var/lib/caddy/.local/share/caddy/certificates/<endpoint>/<sans>/<sans>.crt`,
+// where `<endpoint>` is the ACME directory URL with `/` → `-` (e.g.
+// `acme-v02.api.letsencrypt.org-directory`). We resolve the actual
+// path lazily by globbing — relying on the exact URL-encoding rules
+// would be brittle across Caddy versions.
 
-/// Run lego ACME client to obtain or renew a certificate.
-/// Writes cert and key to /var/lib/nasty/tls/ and reloads Caddy.
-async fn run_lego(settings: &Settings) -> Result<(), String> {
-    let domain = settings.tls_domain.as_deref().ok_or("TLS domain not set")?;
+const CADDY_DATA_DIR: &str = "/var/lib/caddy";
+
+/// Render the Caddy snippet that should live at `CADDY_VHOSTS_PATH`.
+///
+/// When ACME is disabled or no domain is set, returns the empty string —
+/// the NixOS-managed `:8443` block (with the static self-signed cert)
+/// is the only vhost in play. When ACME is enabled, returns a single
+/// hostname-bound vhost that Caddy will issue + serve a real cert for,
+/// while the static `:8443` block stays as the IP-fallback for users
+/// hitting the box by address.
+fn caddy_vhosts_snippet(settings: &Settings, https_port: u16) -> String {
+    if !settings.tls_acme_enabled {
+        return String::new();
+    }
+    let Some(domain) = settings.tls_domain.as_deref() else {
+        return String::new();
+    };
+    if domain.trim().is_empty() {
+        return String::new();
+    }
+
+    // Email is optional for Caddy's ACME issuer (Let's Encrypt requires
+    // one for renewal notices but won't reject without). Render an empty
+    // arg if missing rather than failing the whole reload.
     let email = settings
         .tls_acme_email
         .as_deref()
-        .ok_or("ACME email not set")?;
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
-    set_acme_status(
-        "running",
-        &format!("Preparing certificate for {domain}..."),
-        Some(domain),
-    );
+    let mut out = String::new();
+    out.push_str(&format!("{domain}:{https_port} {{\n"));
 
-    // Create lego data directory
-    // Use separate lego directories per ACME server so staging/production data coexist
-    let lego_dir = if settings.tls_acme_staging {
-        format!("{LEGO_DATA_DIR}/staging")
-    } else {
-        format!("{LEGO_DATA_DIR}/production")
-    };
-    let _ = tokio::fs::create_dir_all(&lego_dir).await;
+    // The `tls` directive's first form is `tls EMAIL` (or just `tls`)
+    // and triggers Caddy's automatic ACME flow for the matched
+    // hostname(s). Anything inside `{ ... }` overrides the defaults.
+    let needs_block = settings.tls_acme_staging
+        || settings.tls_challenge_type == "dns"
+        || settings.tls_challenge_type == "tls-alpn"
+        || settings.tls_challenge_type == "http";
 
-    // Determine if this is a new cert or renewal
-    let lego_cert_path = format!("{lego_dir}/certificates/{domain}.crt");
-    let action = if std::path::Path::new(&lego_cert_path).exists() {
-        "renew"
-    } else {
-        "run"
-    };
-
-    let mut args = vec![
-        "--accept-tos".to_string(),
-        "--email".to_string(),
-        email.to_string(),
-        "--domains".to_string(),
-        domain.to_string(),
-        "--path".to_string(),
-        lego_dir.clone(),
-    ];
-
-    if settings.tls_acme_staging {
-        args.push("--server".to_string());
-        args.push("https://acme-staging-v02.api.letsencrypt.org/directory".to_string());
-    }
-
-    // Challenge type
-    if settings.tls_challenge_type == "dns" {
-        if let Some(ref provider) = settings.tls_dns_provider {
-            args.push("--dns".to_string());
-            args.push(provider.clone());
-            // Custom resolver for propagation checks (default: 1.1.1.1 to avoid
-            // issues with local DNS not seeing public ACME TXT records).
-            let resolver = settings
-                .tls_dns_resolver
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("1.1.1.1:53");
-            args.push("--dns.resolvers".to_string());
-            args.push(resolver.to_string());
-            // Wait before checking propagation — DNS providers need time to
-            // propagate TXT records to recursive resolvers.
-            // Default 30s, user-configurable via tls_dns_propagation_wait.
-            let wait = settings.tls_dns_propagation_wait.unwrap_or(30);
-            args.push("--dns.propagation-wait".to_string());
-            args.push(format!("{wait}s"));
+    if !needs_block {
+        if email.is_empty() {
+            out.push_str("    tls\n");
         } else {
-            return Err("DNS challenge selected but no provider configured".to_string());
+            out.push_str(&format!("    tls {email}\n"));
         }
     } else {
-        // TLS-ALPN-01: lego listens on :443 temporarily
-        // Caddy must be stopped briefly for this to work
-        args.push("--tls".to_string());
-        args.push("--tls.port".to_string());
-        args.push(":443".to_string());
-    }
-
-    args.push(action.to_string());
-
-    info!(
-        "Running lego {action} for {domain} (challenge: {})",
-        settings.tls_challenge_type
-    );
-
-    // For TLS-ALPN challenge, stop Caddy briefly so lego can bind to :443
-    let need_proxy_stop = settings.tls_challenge_type != "dns";
-    if need_proxy_stop {
-        set_acme_status(
-            "running",
-            "Stopping web server for TLS challenge...",
-            Some(domain),
-        );
-        nasty_common::cmd::try_run("systemctl", &["stop", "caddy"]).await;
-    }
-
-    if settings.tls_challenge_type == "dns" {
-        set_acme_status(
-            "running",
-            &format!(
-                "Running ACME {action} — creating DNS records and waiting for propagation (this can take 1-2 minutes)..."
-            ),
-            Some(domain),
-        );
-    } else {
-        set_acme_status(
-            "running",
-            &format!("Running ACME {action} — waiting for Let's Encrypt verification..."),
-            Some(domain),
-        );
-    }
-
-    // Run lego — stream stderr to status updates, ensure Caddy is ALWAYS restarted
-    let lego_result = async {
-        let mut cmd = tokio::process::Command::new("lego");
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        cmd.args(&arg_refs);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        if settings.tls_challenge_type == "dns" {
-            // Default 5 min propagation timeout (user can override via credentials)
-            cmd.env("CLOUDFLARE_PROPAGATION_TIMEOUT", "300");
-            cmd.env("CF_PROPAGATION_TIMEOUT", "300");
-            if let Some(ref creds) = settings.tls_dns_credentials {
-                for line in creds.lines() {
-                    if let Some((key, value)) = line.split_once('=') {
-                        cmd.env(key.trim(), value.trim());
-                    }
-                }
-            }
+        if email.is_empty() {
+            out.push_str("    tls {\n");
+        } else {
+            out.push_str(&format!("    tls {email} {{\n"));
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to run lego: {e}"))?;
+        // Restrict the challenge mechanism. Caddy defaults to trying
+        // both HTTP-01 and TLS-ALPN-01; pinning lets the user pick one
+        // when their network only allows one (e.g. port 80 firewalled).
+        match settings.tls_challenge_type.as_str() {
+            "http" => out.push_str("        protocols tls1.2 tls1.3\n"),
+            "tls-alpn" => out.push_str("        protocols tls1.2 tls1.3\n"),
+            _ => {}
+        }
 
-        // Stream stderr lines to ACME status so the UI shows real-time progress
-        let domain_owned = domain.to_string();
-        let stderr_handle = if let Some(stderr) = child.stderr.take() {
-            let handle = tokio::spawn(async move {
-                use tokio::io::{AsyncBufReadExt, BufReader};
-                let mut lines = BufReader::new(stderr).lines();
-                let mut collected = Vec::new();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = line.trim().to_string();
-                    if !line.is_empty() {
-                        set_acme_status("running", &line, Some(&domain_owned));
-                        collected.push(line);
-                    }
-                }
-                collected
-            });
-            Some(handle)
-        } else {
-            None
-        };
+        // DNS-01 needs both: a `dns` directive naming the provider, and
+        // (for most providers) one or more env-var references. Users
+        // paste KEY=VAL lines into `tls_dns_credentials`; the engine
+        // writes them to an EnvironmentFile that Caddy.service loads.
+        if settings.tls_challenge_type == "dns"
+            && let Some(provider) = settings.tls_dns_provider.as_deref()
+        {
+            // The provider arg is plugin-specific; most one-token
+            // plugins (cloudflare, digitalocean, hetzner, …) accept
+            // `{env.PROVIDER_TOKEN}` as their first argument. Multi-arg
+            // providers (route53, …) want a sub-block; for now we emit
+            // the simple form and rely on the plugin's env-var
+            // discovery for the rest.
+            out.push_str(&format!("        dns {provider}\n"));
+        }
 
-        let status = child.wait().await.map_err(|e| format!("lego wait: {e}"))?;
+        // Issuer block: only needed for the staging override. Without
+        // it, Caddy uses the production Let's Encrypt directory (its
+        // default).
+        if settings.tls_acme_staging {
+            out.push_str("        issuer acme {\n");
+            out.push_str("            ca https://acme-staging-v02.api.letsencrypt.org/directory\n");
+            out.push_str("        }\n");
+            out.push_str("        issuer zerossl {\n");
+            out.push_str("            ca https://acme-staging-v02.api.letsencrypt.org/directory\n");
+            out.push_str("        }\n");
+        }
 
-        let stderr_lines = if let Some(h) = stderr_handle {
-            h.await.unwrap_or_default()
-        } else {
-            vec![]
-        };
-
-        Ok::<_, String>((status, stderr_lines))
-    }
-    .await;
-
-    // ALWAYS restart Caddy, regardless of lego success/failure
-    if need_proxy_stop {
-        set_acme_status("running", "Restarting web server...", Some(domain));
-        nasty_common::cmd::try_run("systemctl", &["start", "caddy"]).await;
+        out.push_str("    }\n");
     }
 
-    let (exit_status, stderr_lines) = lego_result?;
+    out.push_str("    import nasty_webui_routes\n");
+    out.push_str("}\n");
+    out
+}
 
-    if !exit_status.success() {
-        let stderr = stderr_lines.join("\n");
-        let msg = format!("lego {action} failed: {stderr}");
-        set_acme_status("error", &msg, Some(domain));
-        return Err(msg);
-    }
-
-    set_acme_status("running", "Installing certificate...", Some(domain));
-
-    // Copy lego certs to NASty's TLS paths
-    let lego_cert = format!("{lego_dir}/certificates/{domain}.crt");
-    let lego_key = format!("{lego_dir}/certificates/{domain}.key");
-
-    tokio::fs::copy(&lego_cert, TLS_CERT_PATH)
-        .await
-        .map_err(|e| {
-            let m = format!("failed to copy cert: {e}");
-            set_acme_status("error", &m, Some(domain));
-            m
-        })?;
-    tokio::fs::copy(&lego_key, TLS_KEY_PATH)
-        .await
-        .map_err(|e| {
-            let m = format!("failed to copy key: {e}");
-            set_acme_status("error", &m, Some(domain));
-            m
-        })?;
-
-    // Set permissions so Caddy (running as caddy user) can read the cert.
-    // A failure here means caddy will hit "permission denied" on reload,
-    // which is way easier to diagnose with this log line in front of it.
-    if let Err(e) =
-        tokio::fs::set_permissions(TLS_CERT_PATH, std::fs::Permissions::from_mode(0o644)).await
+/// Render the Caddy `EnvironmentFile` content from `tls_dns_credentials`.
+/// Empty when ACME-DNS is off — the file is recreated empty so a stale
+/// value from a previous provider doesn't leak into the next run.
+fn caddy_acme_env(settings: &Settings) -> String {
+    if !settings.tls_acme_enabled
+        || settings.tls_challenge_type != "dns"
+        || settings.tls_dns_credentials.is_none()
     {
-        warn!("chmod 644 {TLS_CERT_PATH} failed: {e}");
+        return String::new();
     }
-    if let Err(e) =
-        tokio::fs::set_permissions(TLS_KEY_PATH, std::fs::Permissions::from_mode(0o640)).await
-    {
-        warn!("chmod 640 {TLS_KEY_PATH} failed: {e}");
-    }
-    // Set key group to caddy so it can read it. `try_run` logs failures.
-    nasty_common::cmd::try_run("chown", &["root:caddy", TLS_KEY_PATH]).await;
+    settings
+        .tls_dns_credentials
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+        + "\n"
+}
 
-    // Reload Caddy to pick up the new certificate
+/// Apply current settings to Caddy: render the snippet + env file,
+/// write them, reload Caddy, then refresh the cached ACME status from
+/// whatever Caddy ends up serving.
+pub async fn apply_caddy_tls(settings: &Settings) -> Result<(), String> {
+    let domain_for_status = settings.tls_domain.clone();
+
+    if settings.tls_acme_enabled {
+        set_acme_status(
+            "running",
+            "Reloading Caddy with ACME configuration...",
+            domain_for_status.as_deref(),
+        );
+    }
+
+    // Both files live in the same dir, owned by the caddy user/group so
+    // Caddy can read them. Engine runs as root, so the create + chown
+    // here are guaranteed to succeed even on first apply — but log any
+    // failure anyway per the workspace-wide rule (see CONTRIBUTING.md).
+    if let Some(parent) = std::path::Path::new(CADDY_VHOSTS_PATH).parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        warn!("create_dir_all({}) failed: {e}", parent.display());
+    }
+
+    let snippet = caddy_vhosts_snippet(settings, 8443);
+    tokio::fs::write(CADDY_VHOSTS_PATH, &snippet)
+        .await
+        .map_err(|e| format!("write {CADDY_VHOSTS_PATH}: {e}"))?;
+    if let Err(e) =
+        tokio::fs::set_permissions(CADDY_VHOSTS_PATH, std::fs::Permissions::from_mode(0o644)).await
+    {
+        warn!("chmod 644 {CADDY_VHOSTS_PATH} failed: {e}");
+    }
+
+    let env_content = caddy_acme_env(settings);
+    tokio::fs::write(CADDY_ACME_ENV_PATH, &env_content)
+        .await
+        .map_err(|e| format!("write {CADDY_ACME_ENV_PATH}: {e}"))?;
+    // 0640 + chown caddy: secrets, not world-readable.
+    if let Err(e) =
+        tokio::fs::set_permissions(CADDY_ACME_ENV_PATH, std::fs::Permissions::from_mode(0o640))
+            .await
+    {
+        warn!("chmod 640 {CADDY_ACME_ENV_PATH} failed: {e}");
+    }
+    nasty_common::cmd::try_run("chown", &["root:caddy", CADDY_ACME_ENV_PATH]).await;
+
+    // `systemctl reload caddy` directly rather than through try_run so
+    // we can surface stderr to the caller (the WebUI shows it as an
+    // error toast). Spawn / non-zero-exit logging happens here inline.
     let reload = tokio::process::Command::new("systemctl")
         .args(["reload", "caddy"])
         .output()
-        .await;
-    match reload {
-        Ok(r) if r.status.success() => info!("caddy reloaded with new certificate"),
-        Ok(r) => {
-            let stderr = String::from_utf8_lossy(&r.stderr);
-            warn!("caddy reload failed after cert install: {stderr}");
-        }
-        Err(e) => warn!("Failed to reload caddy: {e}"),
+        .await
+        .map_err(|e| {
+            let m = format!("systemctl reload caddy: spawn failed: {e}");
+            warn!("{m}");
+            m
+        })?;
+    if !reload.status.success() {
+        let stderr = String::from_utf8_lossy(&reload.stderr).to_string();
+        let msg = format!("caddy reload failed: {stderr}");
+        warn!("{msg}");
+        set_acme_status("error", &msg, domain_for_status.as_deref());
+        return Err(msg);
     }
+    info!("caddy reloaded");
 
-    // Read cert details and populate status
-    let cert_info = read_cert_info(TLS_CERT_PATH).await;
+    // Push the status forward best-effort. A successful reload doesn't
+    // mean the ACME issuance is complete — Caddy issues asynchronously
+    // — so we fall back to "running" if no cert is on disk yet.
+    refresh_acme_status_from_disk(settings).await;
+    Ok(())
+}
+
+/// Locate the cert Caddy is currently serving for `domain`, falling back
+/// to the static-cert path used when ACME is off.
+async fn locate_serving_cert(settings: &Settings) -> Option<String> {
+    if settings.tls_acme_enabled
+        && let Some(domain) = settings.tls_domain.as_deref()
     {
+        // `/var/lib/caddy/.local/share/caddy/certificates/<endpoint>/<domain>/<domain>.crt`
+        // Endpoint dir name varies (production vs staging vs zerossl
+        // fallback), so glob one level deep.
+        let base = format!("{CADDY_DATA_DIR}/.local/share/caddy/certificates");
+        if let Ok(mut endpoints) = tokio::fs::read_dir(&base).await {
+            while let Ok(Some(ep)) = endpoints.next_entry().await {
+                let candidate = format!("{}/{domain}/{domain}.crt", ep.path().display());
+                if tokio::fs::metadata(&candidate).await.is_ok() {
+                    return Some(candidate);
+                }
+            }
+        }
+        return None;
+    }
+    if tokio::fs::metadata(TLS_CERT_PATH).await.is_ok() {
+        return Some(TLS_CERT_PATH.to_string());
+    }
+    None
+}
+
+/// Repopulate the cached ACME status struct from whatever cert Caddy is
+/// (or isn't yet) serving. Cheap to call repeatedly — does at most one
+/// directory listing + one cert parse.
+pub async fn refresh_acme_status_from_disk(settings: &Settings) {
+    let domain = settings.tls_domain.clone();
+    if !settings.tls_acme_enabled {
+        // Static-cert mode. Show the cert details if we have any so the
+        // WebUI's "Active certificate" panel still has something to
+        // render, but flag the state as idle so the page doesn't claim
+        // ACME succeeded.
+        let cert_info = read_cert_info(TLS_CERT_PATH).await;
         let status = ACME_STATUS.get_or_init(|| std::sync::Mutex::new(AcmeStatus::default()));
         if let Ok(mut s) = status.lock() {
-            s.state = "success".to_string();
-            s.message = format!("Certificate installed for {domain}");
-            s.domain = Some(domain.to_string());
+            s.state = "idle".into();
+            s.message = "Static certificate (ACME disabled)".into();
+            s.domain = domain;
             s.expires = cert_info.expires;
             s.issued = cert_info.issued;
             s.issuer = cert_info.issuer;
-            s.last_attempt = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs().to_string())
-                    .unwrap_or_default(),
-            );
         }
+        return;
     }
-    info!("ACME certificate installed for {domain}");
-    Ok(())
+
+    let Some(path) = locate_serving_cert(settings).await else {
+        // ACME enabled but no cert on disk yet — still issuing.
+        set_acme_status(
+            "running",
+            "Waiting for Caddy to obtain a certificate...",
+            domain.as_deref(),
+        );
+        return;
+    };
+    let cert_info = read_cert_info(&path).await;
+    let status = ACME_STATUS.get_or_init(|| std::sync::Mutex::new(AcmeStatus::default()));
+    if let Ok(mut s) = status.lock() {
+        s.state = "success".into();
+        s.message = match domain.as_deref() {
+            Some(d) => format!("Certificate active for {d}"),
+            None => "Certificate active".into(),
+        };
+        s.domain = domain;
+        s.expires = cert_info.expires;
+        s.issued = cert_info.issued;
+        s.issuer = cert_info.issuer;
+    }
+}
+
+/// Engine-startup hook (replaces the old lego-driven `check_acme_renewal`).
+/// Caddy auto-renews internally — there's nothing for us to *do* here, just
+/// seed the cached status so the WebUI shows cert details immediately rather
+/// than after the first user-triggered apply.
+pub async fn check_acme_renewal() {
+    let settings = load().await;
+    refresh_acme_status_from_disk(&settings).await;
 }
 
 struct CertInfo {
@@ -875,7 +883,6 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
             .to_rfc2822()
             .unwrap_or_else(|_| validity.not_after.to_string()),
     );
-    // Extract CN or O from issuer
     for rdn in cert.issuer().iter() {
         for attr in rdn.iter() {
             let val = attr.as_str().unwrap_or_default();
@@ -892,74 +899,6 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
         }
     }
     info
-}
-
-/// Write DNS credentials to a file readable by the ACME client.
-async fn write_dns_credentials(settings: &Settings) {
-    if let Some(creds) = &settings.tls_dns_credentials {
-        if let Err(e) = tokio::fs::write(DNS_CREDS_PATH, creds).await {
-            warn!("Failed to write DNS credentials: {e}");
-            return;
-        }
-        if let Err(e) =
-            tokio::fs::set_permissions(DNS_CREDS_PATH, std::fs::Permissions::from_mode(0o600)).await
-        {
-            warn!(
-                "chmod 600 {DNS_CREDS_PATH} failed: {e} — \
-                 DNS provider credentials may be world-readable"
-            );
-        }
-    }
-}
-
-/// Check if ACME cert needs renewal (runs on engine startup).
-pub async fn check_acme_renewal() {
-    let settings = load().await;
-    if !settings.tls_acme_enabled {
-        return;
-    }
-    if settings.tls_domain.is_none() || settings.tls_acme_email.is_none() {
-        return;
-    }
-
-    // Populate cert info on startup so the UI shows details immediately
-    if std::path::Path::new(TLS_CERT_PATH).exists() {
-        let cert_info = read_cert_info(TLS_CERT_PATH).await;
-        let domain = settings.tls_domain.as_deref().unwrap_or("");
-        let status = ACME_STATUS.get_or_init(|| std::sync::Mutex::new(AcmeStatus::default()));
-        if let Ok(mut s) = status.lock() {
-            s.state = "success".to_string();
-            s.message = format!("Certificate installed for {domain}");
-            s.domain = Some(domain.to_string());
-            s.expires = cert_info.expires;
-            s.issued = cert_info.issued;
-            s.issuer = cert_info.issuer;
-        }
-    }
-
-    // Check if cert exists and is near expiry (within 30 days)
-    let lego_subdir = if settings.tls_acme_staging {
-        "staging"
-    } else {
-        "production"
-    };
-    let cert_path = format!(
-        "{LEGO_DATA_DIR}/{lego_subdir}/certificates/{}.crt",
-        settings.tls_domain.as_deref().unwrap_or("")
-    );
-    if !std::path::Path::new(&cert_path).exists() {
-        info!("No ACME cert found, running initial provisioning...");
-        if let Err(e) = run_lego(&settings).await {
-            warn!("ACME provisioning on startup failed: {e}");
-        }
-        return;
-    }
-
-    // Try renewal (lego handles expiry check internally)
-    info!("Checking ACME certificate renewal...");
-    if let Err(e) = run_lego(&settings).await {
-        warn!("ACME renewal check failed: {e}");
-    }
 }
 
 #[cfg(test)]

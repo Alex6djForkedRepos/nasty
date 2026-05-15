@@ -237,32 +237,13 @@ async fn main() -> anyhow::Result<()> {
     state.system.info().await;
     info!("Caches warm in {}ms", t0.elapsed().as_millis());
 
-    // Check ACME cert renewal on startup and daily thereafter. The
-    // observer spawn logs if the loop ever exits — either cleanly
-    // (which would be a bug; this loop is meant to run forever) or
-    // with a panic (which would silently kill cert renewal until the
-    // next engine restart, with no log connecting "my cert expired"
-    // to the original failure).
-    let acme_loop = tokio::spawn(async {
+    // Seed the cached ACME status from whatever cert Caddy is already
+    // serving so the WebUI shows the issuer/expiry on first page load
+    // instead of after the user clicks anything. Renewal itself runs
+    // inside Caddy now — no daily cron from us, so no long-running
+    // loop to wrap with the observer pattern used elsewhere.
+    tokio::spawn(async {
         nasty_system::settings::check_acme_renewal().await;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
-        interval.tick().await; // skip first immediate tick
-        loop {
-            interval.tick().await;
-            nasty_system::settings::check_acme_renewal().await;
-        }
-    });
-    tokio::spawn(async move {
-        match acme_loop.await {
-            Ok(()) => tracing::error!(
-                "ACME renewal loop exited unexpectedly — cert renewal will not happen \
-                 until next engine restart"
-            ),
-            Err(e) => tracing::error!(
-                "ACME renewal loop panicked / cancelled: {e} — cert renewal will not \
-                 happen until next engine restart"
-            ),
-        }
     });
 
     // Build the OIDC client if SSO is configured. Failures are logged, not
