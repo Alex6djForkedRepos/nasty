@@ -571,6 +571,55 @@ async fn save(settings: &Settings) -> Result<(), std::io::Error> {
 
 const CADDY_DATA_DIR: &str = "/var/lib/caddy";
 
+/// Render the `dns <provider>` directive body for a DNS-01 challenge.
+///
+/// Each plugin's Caddyfile syntax is slightly different:
+///   - Single-token plugins (cloudflare, duckdns, linode, hetzner, desec)
+///     take the credential as the first positional argument; we render it
+///     as a `{env.NAME}` placeholder so Caddy reads it from the
+///     `EnvironmentFile` written from `tls_dns_credentials`.
+///   - Two-token plugins (porkbun) take both as positional args.
+///   - Multi-arg plugins (namecheap, rfc2136) require a sub-block.
+///   - route53 reads AWS_* env vars automatically; the empty form works.
+///   - Anything not in this table falls back to a bare `dns <name>` and
+///     hopes the plugin can self-configure from environment. If the
+///     plugin isn't compiled into the Caddy binary at all, Caddy's
+///     reload will reject the config with a clear "unknown module"
+///     message — caller surfaces that error through the WebUI.
+///
+/// The result may be multi-line; the caller is responsible for
+/// indenting each line to the enclosing `tls { ... }` block.
+fn dns_directive_for(provider: &str) -> String {
+    match provider {
+        "cloudflare" => "dns cloudflare {env.CF_API_TOKEN}".to_string(),
+        "duckdns" => "dns duckdns {env.DUCKDNS_TOKEN}".to_string(),
+        "linode" => "dns linode {env.LINODE_TOKEN}".to_string(),
+        "desec" => "dns desec {env.DESEC_TOKEN}".to_string(),
+        "hetzner" => "dns hetzner {env.HETZNER_API_TOKEN}".to_string(),
+        // route53 plugin reads AWS_REGION / AWS_ACCESS_KEY_ID /
+        // AWS_SECRET_ACCESS_KEY (+ AWS_SESSION_TOKEN) from env on its
+        // own when given no positional args.
+        "route53" => "dns route53".to_string(),
+        // porkbun takes two positional args (api_key, secret_api_key).
+        "porkbun" => "dns porkbun {env.PORKBUN_API_KEY} {env.PORKBUN_SECRET_API_KEY}".to_string(),
+        "namecheap" => "dns namecheap {\n    \
+                        user {env.NAMECHEAP_USER}\n    \
+                        api_key {env.NAMECHEAP_API_KEY}\n    \
+                        api_endpoint https://api.namecheap.com/xml.response\n    \
+                        client_ip {env.NAMECHEAP_CLIENT_IP}\n\
+                        }"
+        .to_string(),
+        "rfc2136" => "dns rfc2136 {\n    \
+                      key_name {env.RFC2136_KEY_NAME}\n    \
+                      key {env.RFC2136_KEY}\n    \
+                      key_alg {env.RFC2136_KEY_ALG}\n    \
+                      server {env.RFC2136_SERVER}\n\
+                      }"
+        .to_string(),
+        _ => format!("dns {provider}"),
+    }
+}
+
 /// Render the Caddy snippet that should live at `CADDY_VHOSTS_PATH`.
 ///
 /// When ACME is disabled or no domain is set, returns the empty string —
@@ -633,20 +682,21 @@ fn caddy_vhosts_snippet(settings: &Settings, https_port: u16) -> String {
             _ => {}
         }
 
-        // DNS-01 needs both: a `dns` directive naming the provider, and
-        // (for most providers) one or more env-var references. Users
-        // paste KEY=VAL lines into `tls_dns_credentials`; the engine
-        // writes them to an EnvironmentFile that Caddy.service loads.
+        // DNS-01 needs a `dns` directive whose shape varies per
+        // plugin: single-token plugins take the credential as the
+        // first positional arg, multi-arg plugins want a sub-block
+        // with named keys. Either way, we render `{env.X}` placeholders
+        // that Caddy expands at request time from its EnvironmentFile
+        // (sourced from `tls_dns_credentials`). Caller is responsible
+        // for pasting matching KEY=VAL lines into credentials.
         if settings.tls_challenge_type == "dns"
             && let Some(provider) = settings.tls_dns_provider.as_deref()
         {
-            // The provider arg is plugin-specific; most one-token
-            // plugins (cloudflare, digitalocean, hetzner, …) accept
-            // `{env.PROVIDER_TOKEN}` as their first argument. Multi-arg
-            // providers (route53, …) want a sub-block; for now we emit
-            // the simple form and rely on the plugin's env-var
-            // discovery for the rest.
-            out.push_str(&format!("        dns {provider}\n"));
+            for line in dns_directive_for(provider).lines() {
+                out.push_str("        ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
 
         // Issuer block: only needed for the staging override. Without
@@ -903,7 +953,176 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::to_nix_string;
+    use super::{Settings, caddy_acme_env, caddy_vhosts_snippet, dns_directive_for, to_nix_string};
+
+    fn acme_enabled_settings(challenge: &str) -> Settings {
+        Settings {
+            tls_domain: Some("nas.example.com".into()),
+            tls_acme_email: Some("admin@example.com".into()),
+            tls_acme_enabled: true,
+            tls_challenge_type: challenge.into(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn dns_directive_for_known_single_token_plugins() {
+        // Single-token plugins (Cloudflare et al.) take the credential as
+        // the first positional arg; we render `{env.NAME}` so Caddy reads
+        // it from the EnvironmentFile we write at apply time. Pin the
+        // exact env-var name per plugin — getting it wrong here means
+        // users paste the right secret under the wrong key and the
+        // plugin silently fails to authenticate.
+        assert_eq!(
+            dns_directive_for("cloudflare"),
+            "dns cloudflare {env.CF_API_TOKEN}"
+        );
+        assert_eq!(
+            dns_directive_for("duckdns"),
+            "dns duckdns {env.DUCKDNS_TOKEN}"
+        );
+        assert_eq!(dns_directive_for("linode"), "dns linode {env.LINODE_TOKEN}");
+        assert_eq!(dns_directive_for("desec"), "dns desec {env.DESEC_TOKEN}");
+        assert_eq!(
+            dns_directive_for("hetzner"),
+            "dns hetzner {env.HETZNER_API_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn dns_directive_for_route53_relies_on_aws_env_discovery() {
+        // route53 plugin reads AWS_REGION / AWS_ACCESS_KEY_ID /
+        // AWS_SECRET_ACCESS_KEY directly from process env when given no
+        // positional args — exactly what we want for the
+        // EnvironmentFile-driven flow.
+        assert_eq!(dns_directive_for("route53"), "dns route53");
+    }
+
+    #[test]
+    fn dns_directive_for_porkbun_takes_two_positional_tokens() {
+        assert_eq!(
+            dns_directive_for("porkbun"),
+            "dns porkbun {env.PORKBUN_API_KEY} {env.PORKBUN_SECRET_API_KEY}"
+        );
+    }
+
+    #[test]
+    fn dns_directive_for_namecheap_emits_sub_block_with_four_keys() {
+        // Namecheap needs user, api_key, api_endpoint, and client_ip —
+        // a positional form doesn't exist. The api_endpoint is fixed at
+        // the v2 XML endpoint (the only one the Caddy plugin supports).
+        let directive = dns_directive_for("namecheap");
+        assert!(directive.starts_with("dns namecheap {"));
+        assert!(directive.contains("user {env.NAMECHEAP_USER}"));
+        assert!(directive.contains("api_key {env.NAMECHEAP_API_KEY}"));
+        assert!(directive.contains("api_endpoint https://api.namecheap.com/xml.response"));
+        assert!(directive.contains("client_ip {env.NAMECHEAP_CLIENT_IP}"));
+        assert!(directive.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn dns_directive_for_rfc2136_emits_sub_block_with_four_keys() {
+        let directive = dns_directive_for("rfc2136");
+        assert!(directive.starts_with("dns rfc2136 {"));
+        assert!(directive.contains("key_name {env.RFC2136_KEY_NAME}"));
+        assert!(directive.contains("key {env.RFC2136_KEY}"));
+        assert!(directive.contains("key_alg {env.RFC2136_KEY_ALG}"));
+        assert!(directive.contains("server {env.RFC2136_SERVER}"));
+    }
+
+    #[test]
+    fn dns_directive_for_unknown_provider_falls_through_to_bare_name() {
+        // Unknown / not-yet-baked-in providers get a bare `dns <name>`.
+        // Caddy will reject the reload with a clear "unknown module"
+        // error if the plugin isn't compiled into the binary, which is
+        // what we want — the caller surfaces that error via the WebUI.
+        assert_eq!(dns_directive_for("madeup"), "dns madeup");
+    }
+
+    #[test]
+    fn vhosts_snippet_empty_when_acme_disabled() {
+        // The static-cert `:8443` vhost in nasty.nix is the only one
+        // active; no hostname-bound block.
+        let s = Settings::default();
+        assert!(caddy_vhosts_snippet(&s, 8443).is_empty());
+    }
+
+    #[test]
+    fn vhosts_snippet_tls_alpn_emits_short_form() {
+        // The simplest happy path: TLS-ALPN-01 with no DNS provider and
+        // no staging server. Caddy's automatic HTTP-01/TLS-ALPN-01 flow
+        // kicks in from a bare `tls EMAIL` directive (inside a block
+        // because we pin protocols).
+        let s = acme_enabled_settings("tls-alpn");
+        let out = caddy_vhosts_snippet(&s, 8443);
+        assert!(out.contains("nas.example.com:8443 {"));
+        assert!(out.contains("tls admin@example.com {"));
+        assert!(out.contains("import nasty_webui_routes"));
+        // No DNS plugin directive, no staging-CA override.
+        assert!(!out.contains("dns "));
+        assert!(!out.contains("acme-staging"));
+    }
+
+    #[test]
+    fn vhosts_snippet_dns_challenge_inlines_directive_at_indent() {
+        // The DNS directive needs to land inside the `tls { … }` block
+        // at the 8-space indent level the caller adds, so a sub-block
+        // (e.g., namecheap) ends up correctly nested. Verifying the
+        // structure here means a future plugin-table edit can't sneak
+        // a malformed Caddyfile past CI.
+        let mut s = acme_enabled_settings("dns");
+        s.tls_dns_provider = Some("cloudflare".into());
+        let out = caddy_vhosts_snippet(&s, 8443);
+        assert!(out.contains("        dns cloudflare {env.CF_API_TOKEN}"));
+    }
+
+    #[test]
+    fn vhosts_snippet_dns_sub_block_provider_keeps_inner_indent() {
+        let mut s = acme_enabled_settings("dns");
+        s.tls_dns_provider = Some("namecheap".into());
+        let out = caddy_vhosts_snippet(&s, 8443);
+        // First line of the sub-block at 8-space indent…
+        assert!(out.contains("        dns namecheap {"));
+        // …and the inner keys at 12 (the directive itself uses 4 spaces
+        // of internal indent, the caller adds 8).
+        assert!(out.contains("            user {env.NAMECHEAP_USER}"));
+        assert!(out.contains("            api_key {env.NAMECHEAP_API_KEY}"));
+    }
+
+    #[test]
+    fn vhosts_snippet_staging_emits_issuer_ca_override() {
+        let mut s = acme_enabled_settings("tls-alpn");
+        s.tls_acme_staging = true;
+        let out = caddy_vhosts_snippet(&s, 8443);
+        assert!(out.contains("issuer acme {"));
+        assert!(out.contains("ca https://acme-staging-v02.api.letsencrypt.org/directory"));
+    }
+
+    #[test]
+    fn acme_env_empty_unless_dns_challenge_with_creds() {
+        // Three negative cases that should all yield "".
+        assert_eq!(caddy_acme_env(&Settings::default()), "");
+        let mut s = acme_enabled_settings("tls-alpn");
+        s.tls_dns_credentials = Some("CF_API_TOKEN=ignored\n".into());
+        assert_eq!(
+            caddy_acme_env(&s),
+            "",
+            "tls-alpn challenge must not leak DNS creds to env file"
+        );
+        let mut s = acme_enabled_settings("dns");
+        s.tls_dns_credentials = None;
+        assert_eq!(caddy_acme_env(&s), "");
+    }
+
+    #[test]
+    fn acme_env_preserves_user_pasted_kv_lines_exactly() {
+        // The user's KEY=VAL textarea is the source of truth — the
+        // engine writes it verbatim (after a trim) so Caddy's
+        // EnvironmentFile parser sees it as-is.
+        let mut s = acme_enabled_settings("dns");
+        s.tls_dns_credentials = Some("CF_API_TOKEN=abc123\nFOO=bar\n".into());
+        assert_eq!(caddy_acme_env(&s), "CF_API_TOKEN=abc123\nFOO=bar\n");
+    }
 
     #[test]
     fn nix_string_renders_a_plain_hostname_unchanged() {

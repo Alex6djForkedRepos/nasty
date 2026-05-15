@@ -21,22 +21,20 @@
 	let editing = $state(false);
 	const certActive = $derived.by(() => Boolean(acmeStatus && acmeStatus.state === 'success' && tlsAcmeEnabled));
 
+	// DNS-01 plugins compiled into the Caddy binary shipped with NASty
+	// (see `pkgs.caddy.withPlugins` in nixos/modules/nasty.nix). Picking
+	// anything outside this list will fail at Caddy reload time with an
+	// "unknown module" error, so we don't expose them.
 	const popularDnsProviders = [
 		{ code: 'cloudflare', name: 'Cloudflare' },
 		{ code: 'route53', name: 'Amazon Route 53' },
-		{ code: 'gcloud', name: 'Google Cloud' },
-		{ code: 'azuredns', name: 'Azure DNS' },
-		{ code: 'digitalocean', name: 'DigitalOcean' },
 		{ code: 'hetzner', name: 'Hetzner' },
-		{ code: 'godaddy', name: 'GoDaddy' },
-		{ code: 'namecheap', name: 'Namecheap' },
-		{ code: 'ovh', name: 'OVH' },
-		{ code: 'porkbun', name: 'Porkbun' },
-		{ code: 'vultr', name: 'Vultr' },
 		{ code: 'linode', name: 'Linode' },
+		{ code: 'porkbun', name: 'Porkbun' },
+		{ code: 'namecheap', name: 'Namecheap' },
 		{ code: 'duckdns', name: 'Duck DNS' },
 		{ code: 'desec', name: 'deSEC.io' },
-		{ code: 'oraclecloud', name: 'Oracle Cloud' },
+		{ code: 'rfc2136', name: 'RFC 2136 (BIND / Knot / PowerDNS)' },
 	];
 
 	onMount(async () => {
@@ -206,8 +204,8 @@
 						/>
 					{/if}
 					<span class="mt-1 block text-xs text-muted-foreground">
-						The provider name must match a DNS plugin compiled into the Caddy build shipped with NASty.
-						Currently only HTTP-01 / TLS-ALPN-01 are wired up; DNS-01 plugin support lands in a follow-up release.
+						The provider must be one of the plugins compiled into NASty's Caddy build (the dropdown lists all of them).
+						Need a different one? Open an issue — adding it is a one-line change to the Nix package definition.
 					</span>
 				</div>
 
