@@ -820,7 +820,7 @@ in {
 
     systemd.tmpfiles.rules = [
       "d /var/lib/nasty 0751 root root -"
-      "d /var/lib/nasty/tls 0750 root nginx -"
+      "d /var/lib/nasty/tls 0750 root caddy -"
       "d /var/lib/nasty/subvolumes 0750 root root -"
       "d /var/lib/nasty/shares 0750 root root -"
       "d /var/lib/nasty/shares/nfs 0750 root root -"
@@ -828,7 +828,10 @@ in {
       "d /var/lib/nasty/shares/iscsi 0750 root root -"
       "d /var/lib/nasty/shares/nvmeof 0750 root root -"
       "d /var/lib/nasty/vms 0750 root root -"
-      "f /var/lib/nasty/apps-proxy.conf 0644 root root - # empty = no app proxies"
+      # Note: no `apps-proxy.caddy` tmpfile — apps ingress lives in
+      # Caddy's admin-API config, not on disk.  The engine PATCHes
+      # `/config/apps/http/servers/.../routes` directly on install /
+      # remove.
       "C /var/lib/nasty/sshd_override.conf 0644 root root - ${pkgs.writeText "sshd-default" "PasswordAuthentication yes\n"}"
       "d ${cfg.storage.mountBase} 0755 root root -"
       "d /etc/exports.d 0755 root root -"
@@ -844,8 +847,8 @@ in {
     systemd.services.nasty-selfsigned-cert = mkIf useSelfSigned {
       description = "Generate NASty self-signed TLS certificate";
       wantedBy = [ "multi-user.target" ];
-      before = [ "nginx.service" ];
-      requiredBy = [ "nginx.service" ];
+      before = [ "caddy.service" ];
+      requiredBy = [ "caddy.service" ];
 
       serviceConfig = {
         Type = "oneshot";
@@ -855,24 +858,25 @@ in {
           CERT="${tlsCertFile}"
           KEY="${tlsKeyFile}"
 
-          if [ -f "$CERT" ] && [ -f "$KEY" ]; then
-            echo "TLS certificate already exists, skipping generation"
-            exit 0
+          if [ ! -f "$CERT" ] || [ ! -f "$KEY" ]; then
+            echo "Generating self-signed TLS certificate for NASty..."
+            ${pkgs.openssl}/bin/openssl req -x509 -newkey ec \
+              -pkeyopt ec_paramgen_curve:prime256v1 \
+              -keyout "$KEY" -out "$CERT" \
+              -days 3650 -nodes \
+              -subj "/CN=nasty.local/O=NASty NAS" \
+              -addext "subjectAltName=DNS:nasty.local,DNS:localhost,IP:127.0.0.1"
+            echo "Self-signed certificate generated at $CERT"
+          else
+            echo "TLS certificate already exists; re-applying ownership"
           fi
 
-          echo "Generating self-signed TLS certificate for NASty..."
-          ${pkgs.openssl}/bin/openssl req -x509 -newkey ec \
-            -pkeyopt ec_paramgen_curve:prime256v1 \
-            -keyout "$KEY" -out "$CERT" \
-            -days 3650 -nodes \
-            -subj "/CN=nasty.local/O=NASty NAS" \
-            -addext "subjectAltName=DNS:nasty.local,DNS:localhost,IP:127.0.0.1"
-
+          # Always re-apply ownership / mode so an upgrade from the
+          # nginx era (where the key was group `nginx`) gets the key
+          # readable by Caddy without forcing a regeneration.
           chmod 640 "$KEY"
-          chown root:nginx "$KEY"
+          chown root:caddy "$KEY"
           chmod 644 "$CERT"
-
-          echo "Self-signed certificate generated at $CERT"
         '';
       };
     };
@@ -910,8 +914,14 @@ in {
     systemd.services.nasty-engine = {
       description = "NASty Engine";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network.target" "nasty-metrics.service" ];
-      wants = [ "nasty-metrics.service" ];
+      # caddy.service ordering: the engine pushes per-app ingress
+      # routes via Caddy's admin API at startup (and on every
+      # install/remove).  `after` keeps boot ordering clean; `wants`
+      # (vs `requires`) means a broken Caddy doesn't block the engine
+      # from running — the admin-API client has retry/backoff and
+      # logs a warn! if it can't reach :2019.
+      after = [ "network.target" "nasty-metrics.service" "caddy.service" ];
+      wants = [ "nasty-metrics.service" "caddy.service" ];
 
       path = with pkgs; [
         bashInteractive  # bash for terminal
@@ -1194,112 +1204,170 @@ in {
       wantedBy = lib.mkForce [];  # engine starts on demand
     };
 
-    # ── WebUI via nginx ────────────────────────────────────────
+    # ── WebUI via Caddy ────────────────────────────────────────
 
-    services.nginx = mkIf (cfg.webui.package != null) {
+    # ── Reverse proxy: Caddy ───────────────────────────────────
+    #
+    # Caddy serves the WebUI, terminates TLS, and proxies the
+    # engine RPC + API.  Per-app `/apps/<name>/` ingress lives in
+    # Caddy's admin-API config: the engine talks to
+    # http://127.0.0.1:2019/config/... on install / remove and the
+    # routes apply immediately, no file rewrite, no reload.
+    services.caddy = mkIf (cfg.webui.package != null) {
       enable = true;
-
-      # Recommended TLS settings
-      recommendedTlsSettings = true;
-      recommendedProxySettings = true;
-
-      virtualHosts."nasty" = {
-        listen = [
-          { addr = "0.0.0.0"; port = cfg.webui.httpPort; }
-          { addr = "0.0.0.0"; port = cfg.webui.port; ssl = true; }
-        ];
-        forceSSL = true;
-        root = "${cfg.webui.package}/share/nasty-webui";
-        sslCertificate = tlsCertFile;
-        sslCertificateKey = tlsKeyFile;
-
+      # `auto_https off` because we ship a self-signed (or
+      # user-supplied) cert and don't want Caddy issuing its own;
+      # the explicit `tls` block below points at the same cert
+      # files the nginx era used.
+      globalConfig = ''
+        auto_https off
+      '';
+      virtualHosts.":${toString cfg.webui.httpPort}" = {
         extraConfig = ''
-          add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-          add_header X-Content-Type-Options "nosniff" always;
-          add_header X-Frame-Options "DENY" always;
-          add_header Referrer-Policy "same-origin" always;
-          # CSP: 'unsafe-inline' is required because SvelteKit emits inline
-          # bootstrap and theme-detection scripts in index.html. Tightening to
-          # nonces/hashes is a follow-up; this still blocks third-party script
-          # loads, object embeds, and cross-origin form submission.
-          add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws: wss:; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
-          proxy_set_header X-Real-IP $remote_addr;
-          include /var/lib/nasty/apps-proxy.conf;
+          redir https://{host}{uri} permanent
         '';
+      };
+      virtualHosts.":${toString cfg.webui.port}" = {
+        extraConfig = ''
+          tls ${tlsCertFile} ${tlsKeyFile}
+          root * ${cfg.webui.package}/share/nasty-webui
 
-        locations."/" = {
-          tryFiles = "$uri $uri/ /index.html";
-        };
+          # Security headers on every response.  CSP keeps
+          # 'unsafe-inline' for now because SvelteKit emits inline
+          # bootstrap + theme-detection scripts in index.html;
+          # nonces / hashes are a follow-up.
+          header {
+            Strict-Transport-Security "max-age=31536000; includeSubDomains"
+            X-Content-Type-Options "nosniff"
+            X-Frame-Options "DENY"
+            Referrer-Policy "same-origin"
+            Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' ws: wss:; frame-src 'self' blob:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+          }
 
-        # Proxy WebSocket to engine
-        locations."/ws" = {
-          proxyPass = "http://127.0.0.1:${toString cfg.engine.port}";
-          proxyWebsockets = true;
-          priority = 500;
-        };
+          # File-content preview: same engine endpoint, but a much
+          # tighter sandbox CSP and SAMEORIGIN frame-ancestors so a
+          # previewed HTML/SVG can't run scripts in the WebUI's
+          # origin.  Block order matters — this exact-path handle
+          # must come before the broader /api/* one.
+          handle /api/files/content {
+            header {
+              Content-Security-Policy "sandbox; default-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'unsafe-inline'; frame-ancestors 'self'"
+              X-Frame-Options "SAMEORIGIN"
+            }
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 3600s
+                write_timeout 3600s
+              }
+            }
+          }
 
-        locations."/ws/terminal" = {
-          proxyPass = "http://127.0.0.1:${toString cfg.engine.port}";
-          proxyWebsockets = true;
-          priority = 400;
-          extraConfig = ''
-            proxy_read_timeout 28800s;
-            proxy_send_timeout 28800s;
-          '';
-        };
+          # Long-running websockets — terminal, VM console (vnc /
+          # serial), apps-deploy streaming, log-stream viewer, VM
+          # disk-import upload.  8h read/write timeouts so an idle
+          # session doesn't get axed.  Caddy's reverse_proxy detects
+          # Upgrade headers automatically — no explicit websocket
+          # directive needed.  All of these need X-Real-IP set so
+          # the engine's IP-bound session validation matches what it
+          # saw on the /api/login that issued the token (see /ws
+          # comment below).
+          #
+          # The final `/ws/*` block is a catch-all for any future
+          # engine WS route that might be added without a
+          # corresponding nasty.nix update — without it, a new
+          # `/ws/foo` route would silently 404 through the SPA
+          # fallback (the exact bug that broke `/ws/apps/deploy` and
+          # `/ws/system/logs` after the nginx → Caddy swap).  Caddy
+          # evaluates routes in declaration order, so the specific
+          # handlers above still win for their paths; this one only
+          # catches what nothing else claimed.
+          handle /ws/terminal {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 28800s
+                write_timeout 28800s
+              }
+            }
+          }
+          handle /ws/vm/* {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 28800s
+                write_timeout 28800s
+              }
+            }
+          }
+          handle /ws/apps/deploy {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 28800s
+                write_timeout 28800s
+              }
+            }
+          }
+          handle /ws/system/logs {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 28800s
+                write_timeout 28800s
+              }
+            }
+          }
 
-        locations."/ws/vm/" = {
-          proxyPass = "http://127.0.0.1:${toString cfg.engine.port}";
-          proxyWebsockets = true;
-          priority = 400;
-          extraConfig = ''
-            proxy_read_timeout 28800s;
-            proxy_send_timeout 28800s;
-          '';
-        };
+          # Main engine RPC websocket.  Must propagate X-Real-IP so
+          # the engine's IP-bound session validation sees the same
+          # client address it saw on the /api/login that issued the
+          # token — without this, login through Caddy succeeds and the
+          # immediate /ws upgrade through Caddy fails as "invalid
+          # token" because the engine sees Caddy's loopback address
+          # instead of the user's real IP.
+          handle /ws {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+            }
+          }
 
-        # Proxy API calls to engine
-        locations."/api/" = {
-          proxyPass = "http://127.0.0.1:${toString cfg.engine.port}";
-          extraConfig = ''
-            client_max_body_size 10G;
-            proxy_request_buffering off;
-            proxy_read_timeout 3600s;
-            proxy_send_timeout 3600s;
-          '';
-        };
+          # Catch-all for future `/ws/*` routes the engine grows
+          # without us updating this block.  Same long timeouts as the
+          # explicit websocket handlers above.
+          handle /ws/* {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 28800s
+                write_timeout 28800s
+              }
+            }
+          }
 
-        # Serve user-uploaded file content under a sandbox CSP so a previewed
-        # HTML/SVG file cannot run scripts in the WebUI's origin.
-        #
-        # nginx gotcha: when a location declares ANY add_header, it stops
-        # inheriting *all* parent add_header directives — not just the
-        # overridden one. Every header we want on this response has to be
-        # re-declared here, including HSTS / Referrer-Policy.
-        #
-        # X-Frame-Options is intentionally SAMEORIGIN (not DENY like the
-        # vhost) because the WebUI's file preview iframes this endpoint.
-        # frame-ancestors 'self' in the CSP enforces the same constraint
-        # for modern browsers that prefer CSP over the older header.
-        locations."/api/files/content" = {
-          proxyPass = "http://127.0.0.1:${toString cfg.engine.port}";
-          priority = 300;
-          extraConfig = ''
-            proxy_request_buffering off;
-            proxy_read_timeout 3600s;
-            proxy_send_timeout 3600s;
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header X-Frame-Options "SAMEORIGIN" always;
-            add_header Referrer-Policy "same-origin" always;
-            add_header Content-Security-Policy "sandbox; default-src 'none'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'unsafe-inline'; frame-ancestors 'self'" always;
-          '';
-        };
+          # /api/* — generic engine API.  3600s timeout +
+          # request-body streaming for large uploads.
+          handle /api/* {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port} {
+              header_up X-Real-IP {remote_host}
+              transport http {
+                read_timeout 3600s
+                write_timeout 3600s
+              }
+            }
+          }
 
-        locations."/health" = {
-          proxyPass = "http://127.0.0.1:${toString cfg.engine.port}";
-        };
+          handle /health {
+            reverse_proxy 127.0.0.1:${toString cfg.engine.port}
+          }
 
+          # Static WebUI with SPA fallback.  Anything not matched
+          # above falls through here.
+          handle {
+            try_files {path} {path}/ /index.html
+            file_server
+          }
+        '';
       };
     };
 

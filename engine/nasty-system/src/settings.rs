@@ -579,7 +579,7 @@ async fn save(settings: &Settings) -> Result<(), std::io::Error> {
 const DNS_CREDS_PATH: &str = "/var/lib/nasty/acme-dns-credentials";
 
 /// Run lego ACME client to obtain or renew a certificate.
-/// Writes cert and key to /var/lib/nasty/tls/ and reloads nginx.
+/// Writes cert and key to /var/lib/nasty/tls/ and reloads Caddy.
 async fn run_lego(settings: &Settings) -> Result<(), String> {
     let domain = settings.tls_domain.as_deref().ok_or("TLS domain not set")?;
     let email = settings
@@ -650,7 +650,7 @@ async fn run_lego(settings: &Settings) -> Result<(), String> {
         }
     } else {
         // TLS-ALPN-01: lego listens on :443 temporarily
-        // nginx must be stopped briefly for this to work
+        // Caddy must be stopped briefly for this to work
         args.push("--tls".to_string());
         args.push("--tls.port".to_string());
         args.push(":443".to_string());
@@ -663,15 +663,15 @@ async fn run_lego(settings: &Settings) -> Result<(), String> {
         settings.tls_challenge_type
     );
 
-    // For TLS-ALPN challenge, stop nginx briefly so lego can bind to :443
-    let need_nginx_stop = settings.tls_challenge_type != "dns";
-    if need_nginx_stop {
+    // For TLS-ALPN challenge, stop Caddy briefly so lego can bind to :443
+    let need_proxy_stop = settings.tls_challenge_type != "dns";
+    if need_proxy_stop {
         set_acme_status(
             "running",
             "Stopping web server for TLS challenge...",
             Some(domain),
         );
-        nasty_common::cmd::try_run("systemctl", &["stop", "nginx"]).await;
+        nasty_common::cmd::try_run("systemctl", &["stop", "caddy"]).await;
     }
 
     if settings.tls_challenge_type == "dns" {
@@ -690,7 +690,7 @@ async fn run_lego(settings: &Settings) -> Result<(), String> {
         );
     }
 
-    // Run lego — stream stderr to status updates, ensure nginx is ALWAYS restarted
+    // Run lego — stream stderr to status updates, ensure Caddy is ALWAYS restarted
     let lego_result = async {
         let mut cmd = tokio::process::Command::new("lego");
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -748,10 +748,10 @@ async fn run_lego(settings: &Settings) -> Result<(), String> {
     }
     .await;
 
-    // ALWAYS restart nginx, regardless of lego success/failure
-    if need_nginx_stop {
+    // ALWAYS restart Caddy, regardless of lego success/failure
+    if need_proxy_stop {
         set_acme_status("running", "Restarting web server...", Some(domain));
-        nasty_common::cmd::try_run("systemctl", &["start", "nginx"]).await;
+        nasty_common::cmd::try_run("systemctl", &["start", "caddy"]).await;
     }
 
     let (exit_status, stderr_lines) = lego_result?;
@@ -784,8 +784,8 @@ async fn run_lego(settings: &Settings) -> Result<(), String> {
             m
         })?;
 
-    // Set permissions so nginx (running as nginx user) can read the cert.
-    // A failure here means nginx will hit "permission denied" on reload,
+    // Set permissions so Caddy (running as caddy user) can read the cert.
+    // A failure here means caddy will hit "permission denied" on reload,
     // which is way easier to diagnose with this log line in front of it.
     if let Err(e) =
         tokio::fs::set_permissions(TLS_CERT_PATH, std::fs::Permissions::from_mode(0o644)).await
@@ -797,24 +797,21 @@ async fn run_lego(settings: &Settings) -> Result<(), String> {
     {
         warn!("chmod 640 {TLS_KEY_PATH} failed: {e}");
     }
-    // Set key group to nginx so it can read it. `try_run` logs failures
-    // — a chown failure here means nginx can't read the cert and reload
-    // will surface that as a "permission denied" anyway, but logging the
-    // chown error directly makes the chain easier to follow.
-    nasty_common::cmd::try_run("chown", &["root:nginx", TLS_KEY_PATH]).await;
+    // Set key group to caddy so it can read it. `try_run` logs failures.
+    nasty_common::cmd::try_run("chown", &["root:caddy", TLS_KEY_PATH]).await;
 
-    // Reload nginx to pick up the new certificate
+    // Reload Caddy to pick up the new certificate
     let reload = tokio::process::Command::new("systemctl")
-        .args(["reload", "nginx"])
+        .args(["reload", "caddy"])
         .output()
         .await;
     match reload {
-        Ok(r) if r.status.success() => info!("nginx reloaded with new certificate"),
+        Ok(r) if r.status.success() => info!("caddy reloaded with new certificate"),
         Ok(r) => {
             let stderr = String::from_utf8_lossy(&r.stderr);
-            warn!("nginx reload failed after cert install: {stderr}");
+            warn!("caddy reload failed after cert install: {stderr}");
         }
-        Err(e) => warn!("Failed to reload nginx: {e}"),
+        Err(e) => warn!("Failed to reload caddy: {e}"),
     }
 
     // Read cert details and populate status
