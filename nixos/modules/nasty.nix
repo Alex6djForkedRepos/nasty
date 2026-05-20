@@ -1258,6 +1258,17 @@ in {
         # tries to add its own redirect server on :80 and the two
         # collide.
         auto_https disable_redirects
+
+        # When a TLS connection arrives with no SNI (direct-IP access,
+        # `curl https://10.x.x.x/`) or an SNI we don't recognise,
+        # Caddy substitutes this value before site routing. Pairs with
+        # the `nasty.local:443 { tls internal }` block below — every
+        # such connection ends up served by the internal-CA cert
+        # instead of TLS-handshake-failing. Without this, port-only
+        # `:443 { tls internal }` had no hostname to issue against and
+        # every IP-direct curl got `tlsv1 alert internal error`
+        # (caught by appliance-smoke CI).
+        default_sni nasty.local
       '';
       extraConfig = ''
         (nasty_webui_routes) {
@@ -1424,14 +1435,26 @@ in {
           redir https://{host}{uri} permanent
         }
 
-        # Fallback :443 vhost for unknown SNIs and direct-IP access.
-        # Either Caddy's internal CA (default, `tls internal`) or a
-        # user-supplied cert/key pair. When ACME is enabled, the engine
-        # pushes `tls.automation.policies` per managed hostname via the
-        # admin API and `auto_https` adds per-SNI connection policies
-        # in front of this fallback. Both share routes through the
-        # named snippet above.
-        :${toString cfg.webui.port} {
+        # Fallback site bound to `nasty.local` AND the port-only
+        # catch-all on :${toString cfg.webui.port}. The hostname is
+        # what `tls internal` issues the self-signed cert against (a
+        # port-only listener alone has no hostname for the internal CA
+        # to bind to). The port-only address makes the same site catch
+        # any TLS connection on this listener — combined with the
+        # `default_sni nasty.local` global directive, every SNI-less
+        # or unmatched-SNI connection ends up here and gets served the
+        # `nasty.local` cert.
+        #
+        # When ACME is enabled, the engine pushes
+        # `tls.automation.policies` per managed hostname via the admin
+        # API; `auto_https` adds per-SNI connection policies in front
+        # of this fallback so SNI=<managed-host> wins. Both share
+        # routes through the named snippet above.
+        #
+        # User-supplied cert + key still honoured via
+        # `cfg.tls.certFile/keyFile`; we pick that path instead of
+        # `tls internal` when both are set.
+        nasty.local, :${toString cfg.webui.port} {
           ${caddyTlsDirective}
           import nasty_webui_routes
         }
