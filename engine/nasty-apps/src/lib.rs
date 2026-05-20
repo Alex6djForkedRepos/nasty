@@ -829,10 +829,18 @@ async fn save_ingress_subdomain(app_name: &str, subdomain: Option<&str>) -> Resu
     let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s)
             .map_err(|e| AppsError::CommandFailed(format!("manifest parse: {e}")))?,
-        // Compose apps don't have a flat manifest; we silently no-op
-        // in that case rather than create a stub that masks the real
-        // compose dir layout. V1 subdomain mode is simple-only anyway.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // Compose apps don't have a flat manifest (their storage lives
+        // under `<COMPOSE_DIR>/<name>/docker-compose.yml`), but we
+        // still need a place to persist their ingress_subdomain so it
+        // survives a reboot — without that, set_app_route puts the
+        // host-match route in Caddy and `compute_desired_routes` then
+        // forgets the choice on restart (the "subdomain ingress
+        // reverts on reboot" half of #247 for compose apps). Create
+        // a stub `<name>.json` next to the compose dir to hold the
+        // field; the on-remove path (lib.rs ~2015) already deletes
+        // it, so no leak. Mirrors how `save_proxy_disabled_reason`
+        // handles the same NotFound case.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(AppsError::CommandFailed(format!("manifest read: {e}"))),
     };
     let map = match manifest.as_object_mut() {
