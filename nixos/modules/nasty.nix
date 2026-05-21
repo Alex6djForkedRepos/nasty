@@ -1038,6 +1038,39 @@ in {
         Restart = "always";
         RestartSec = 5;
         StateDirectory = "nasty";
+
+        # nasty-metrics is a read-only system inspector + Prometheus
+        # endpoint. Unlike nasty-engine it does NOT manage mounts /
+        # services / kernel tunables, so we can apply the full
+        # service-hardening set without breaking what it does.
+        #
+        # The two `Protect*` directives we intentionally leave off:
+        #   - ProtectKernelLogs: it shells out to `dmesg` for kernel
+        #     error metrics. Setting this would block /dev/kmsg.
+        #   - PrivateDevices:    smartctl needs /dev/sd*, /dev/nvme*
+        #     to read SMART data. PrivateDevices hides all of /dev.
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        NoNewPrivileges = true;
+        RestrictSUIDSGID = true;
+        KeyringMode = "private";
+        # AF_NETLINK for `ip -j addr show`; AF_INET/INET6 for the
+        # Prometheus HTTP endpoint on :2138.
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
+        SystemCallArchitectures = "native";
+        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        UMask = "0077";
       };
     };
 
@@ -1137,6 +1170,20 @@ in {
         #   AF_INET/6 — outbound HTTPS (Caddy ACME, telemetry, registries)
         #   AF_NETLINK — nft, ip, mount/umount kernel chatter
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
+        # Block the 32-bit syscall ABI on x86_64. NixOS doesn't ship
+        # 32-bit binaries on the appliance image, and SystemCallArchitectures
+        # applies recursively to descendants — but container processes
+        # run under dockerd (a separate unit), not under the engine, so
+        # this only constrains the engine + its direct subprocesses
+        # (docker CLI, qemu-system, smartctl, bcachefs, …) all of which
+        # are 64-bit-only.
+        SystemCallArchitectures = "native";
+        # Default-tight file creation: any file the engine writes
+        # without an explicit chmod gets owner-only access. State
+        # files (audit log, settings.json, oidc client_secret) already
+        # set 0o600 explicitly; this is belt-and-braces for any future
+        # writer that forgets to.
+        UMask = "0077";
       };
     };
 
