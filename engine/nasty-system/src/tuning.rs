@@ -463,10 +463,7 @@ async fn apply_iscsi_login_timeout(timeout: u32) -> Result<(), String> {
 // ── Persistence ──────────────────────────────────────────────
 
 async fn load() -> TuningConfig {
-    match tokio::fs::read_to_string(STATE_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => TuningConfig::default(),
-    }
+    nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
 async fn save(config: &TuningConfig) -> Result<(), std::io::Error> {

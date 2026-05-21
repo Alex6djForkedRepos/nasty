@@ -544,10 +544,7 @@ pub async fn load_config() -> NutConfig {
 }
 
 async fn load() -> NutConfig {
-    match tokio::fs::read_to_string(STATE_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => NutConfig::default(),
-    }
+    nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
 async fn save(config: &NutConfig) -> Result<(), std::io::Error> {

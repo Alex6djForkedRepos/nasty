@@ -252,10 +252,7 @@ async fn query_status() -> (bool, Option<String>, Option<String>, Option<String>
 // ── Persistence ─────────────────────────────────────────────────
 
 async fn load_config() -> TailscaleConfig {
-    match tokio::fs::read_to_string(STATE_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => TailscaleConfig::default(),
-    }
+    nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
 async fn save_config(config: &TailscaleConfig) -> Result<(), std::io::Error> {
