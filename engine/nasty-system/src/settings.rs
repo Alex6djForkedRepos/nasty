@@ -856,8 +856,20 @@ pub async fn apply_caddy_tls_with_apps(
         dns_propagation_wait_secs: settings.tls_dns_propagation_wait,
     };
 
+    // Local IP SANs for the internal-CA fallback policy. Adding the
+    // box's reachable IPs to the cert means `https://10.x.x.x` and
+    // `https://[fd00::1]` don't trip a browser CN-mismatch warning
+    // — only the "self-signed CA" warning remains, which goes away
+    // once the operator imports Caddy's root via the TLS page's
+    // existing "download CA root" button. Refreshed every time TLS
+    // is reapplied (engine startup, settings change, and after every
+    // network apply via the hook in network.rs::apply_config).
+    let extra_subjects = crate::network::local_tls_subjects().await;
     let api = nasty_apps::caddy::CaddyApi::new();
-    if let Err(e) = api.set_tls_automation(&policies, &issuer).await {
+    if let Err(e) = api
+        .set_tls_automation(&policies, &issuer, &extra_subjects)
+        .await
+    {
         warn!("caddy: set_tls_automation failed: {e}");
         set_acme_status("error", &e, domain_for_status.as_deref());
         return Err(e);

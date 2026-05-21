@@ -970,6 +970,61 @@ async fn load_config() -> NetworkConfig {
 
 // ── Interface enumeration ──────────────────────────────────────
 
+/// Local IPs to include as additional SANs on the internal-CA cert
+/// (alongside the always-present `nasty.local`). Hitting the box at
+/// `https://10.x.x.x` or `https://[fd00::1]` should not throw a
+/// CN-mismatch warning just because the user didn't type the .local
+/// name.
+///
+/// Filters applied:
+///   - loopback (127.0.0.1, ::1): never useful as a cert SAN.
+///   - IPv4 link-local (169.254.0.0/16, APIPA): only meaningful when
+///     DHCP failed; would just bloat the SAN list.
+///   - IPv6 link-local (fe80::/10): already filtered by
+///     `get_addresses`, but kept here as a belt-and-braces guard.
+///   - the loopback interface itself (`lo`): already skipped by
+///     `enumerate_interfaces`.
+///
+/// Tailscale CGNAT addresses (100.64/10) are NOT filtered — those
+/// are real reachable addresses for tailnet clients and want to be
+/// on the cert.
+///
+/// Returns bare IP strings without the CIDR `/prefix` suffix that
+/// `ip addr show` emits. Deduplicated.
+pub async fn local_tls_subjects() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for iface in enumerate_interfaces().await {
+        for cidr in iface
+            .ipv4_addresses
+            .iter()
+            .chain(iface.ipv6_addresses.iter())
+        {
+            let ip = cidr.split('/').next().unwrap_or(cidr).trim();
+            if ip.is_empty() {
+                continue;
+            }
+            if ip == "127.0.0.1" || ip == "::1" {
+                continue;
+            }
+            // IPv4 link-local (APIPA)
+            if ip.starts_with("169.254.") {
+                continue;
+            }
+            // IPv6 link-local (defence in depth — get_addresses already filters)
+            if ip.starts_with("fe80:") || ip.starts_with("FE80:") {
+                continue;
+            }
+            // Strip any IPv6 zone identifier (`fd00::1%eth0`).
+            let bare = ip.split('%').next().unwrap_or(ip).to_string();
+            if seen.insert(bare.clone()) {
+                out.push(bare);
+            }
+        }
+    }
+    out
+}
+
 async fn enumerate_interfaces() -> Vec<LiveInterface> {
     let mut result = Vec::new();
     let sys_net = std::path::Path::new("/sys/class/net");
@@ -1594,6 +1649,17 @@ async fn apply_config(
     // Discovery is what actually breaks under a bridge change — the
     // data path is interface-agnostic by default.
     rebind_discovery_daemons().await;
+
+    // Re-issue the internal-CA cert so its SAN list matches the box's
+    // current IP set. Without this, a freshly-added bridge / VLAN / IP
+    // would not be on the cert until the next ACME settings change or
+    // engine restart, and `https://<new-ip>/` would throw a
+    // CN-mismatch warning the operator already paid for. Cheap when
+    // nothing changed — Caddy compares the PATCH body against the
+    // running config and no-ops if identical.
+    tokio::spawn(async {
+        crate::settings::reapply_tls_from_disk().await;
+    });
 
     Ok(outcome)
 }

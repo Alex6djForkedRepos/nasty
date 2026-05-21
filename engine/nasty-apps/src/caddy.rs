@@ -478,6 +478,7 @@ impl CaddyApi {
         &self,
         policies: &[TlsPolicy],
         issuer: &TlsIssuer,
+        extra_internal_subjects: &[String],
     ) -> Result<(), String> {
         // Single PATCH against `/config/apps/tls` that replaces both
         // `automation` and `certificates` at once.
@@ -504,8 +505,9 @@ impl CaddyApi {
             .iter()
             .map(|p| p.host.as_str())
             .chain(std::iter::once("nasty.local"))
+            .chain(extra_internal_subjects.iter().map(String::as_str))
             .collect();
-        let automation = build_tls_automation_json(policies, issuer);
+        let automation = build_tls_automation_json(policies, issuer, extra_internal_subjects);
         let body = json!({
             "automation": automation,
             "certificates": { "automate": automate },
@@ -606,7 +608,11 @@ fn build_route_json(route: &AppRoute) -> Value {
 ///
 /// Order matters: managed hosts first, so Caddy's SNI matching hits
 /// them before falling through to nasty.local.
-fn build_tls_automation_json(policies: &[TlsPolicy], issuer: &TlsIssuer) -> Value {
+fn build_tls_automation_json(
+    policies: &[TlsPolicy],
+    issuer: &TlsIssuer,
+    extra_internal_subjects: &[String],
+) -> Value {
     let mut policy_values: Vec<Value> = policies
         .iter()
         .map(|p| {
@@ -616,8 +622,20 @@ fn build_tls_automation_json(policies: &[TlsPolicy], issuer: &TlsIssuer) -> Valu
             })
         })
         .collect();
+    // Subjects on the internal-CA fallback: `nasty.local` is always
+    // there (the Caddyfile's `default_sni nasty.local` substitutes it
+    // for SNI-less or unknown-SNI connections, and the cert needs a
+    // matching subject), plus every local IP the caller hands in.
+    // Adding IPs as SANs lets `https://10.x.x.x` and `https://[fd00::1]`
+    // skip the CN-mismatch warning — only the "self-signed CA"
+    // warning remains, and that goes away once the operator imports
+    // Caddy's root via the existing "download CA root" button.
+    let mut fallback_subjects = vec![Value::String("nasty.local".into())];
+    for s in extra_internal_subjects {
+        fallback_subjects.push(Value::String(s.clone()));
+    }
     policy_values.push(json!({
-        "subjects": ["nasty.local"],
+        "subjects": fallback_subjects,
         "issuers": [{ "module": "internal" }],
     }));
     json!({ "policies": policy_values })
@@ -1131,11 +1149,69 @@ mod tests {
                 staging: false,
                 ..Default::default()
             },
+            &[],
         );
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1);
         assert_eq!(policies[0]["subjects"][0], "nasty.local");
         assert_eq!(policies[0]["issuers"][0]["module"], "internal");
+    }
+
+    #[test]
+    fn tls_automation_extra_subjects_attach_to_internal_policy() {
+        // Local IPs flow into the internal-CA fallback policy's
+        // `subjects` array alongside `nasty.local`, so the cert
+        // Caddy auto-issues covers direct-IP access without a
+        // CN-mismatch warning. Order: nasty.local first (default_sni
+        // target — keep it as the policy's leading subject), IPs
+        // after.
+        let body = build_tls_automation_json(
+            &[],
+            &TlsIssuer {
+                email: None,
+                dns_provider: None,
+                staging: false,
+                ..Default::default()
+            },
+            &["10.10.10.67".to_string(), "fd00::1".to_string()],
+        );
+        let policies = body["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 1);
+        let subjects = policies[0]["subjects"].as_array().unwrap();
+        assert_eq!(subjects.len(), 3);
+        assert_eq!(subjects[0], "nasty.local");
+        assert_eq!(subjects[1], "10.10.10.67");
+        assert_eq!(subjects[2], "fd00::1");
+        assert_eq!(policies[0]["issuers"][0]["module"], "internal");
+    }
+
+    #[test]
+    fn tls_automation_extra_subjects_do_not_leak_into_acme_policies() {
+        // ACME policies must NOT include the local IPs — those go
+        // only on the internal-CA fallback. Otherwise Let's Encrypt
+        // would refuse the order (LE doesn't issue for IPs / private
+        // names).
+        let body = build_tls_automation_json(
+            &[TlsPolicy {
+                host: "nas.example.com".into(),
+            }],
+            &TlsIssuer {
+                email: Some("ops@example.com".into()),
+                dns_provider: None,
+                staging: false,
+                ..Default::default()
+            },
+            &["10.10.10.67".to_string()],
+        );
+        let policies = body["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 2);
+        // Managed-host policy: subjects = [host] only.
+        assert_eq!(policies[0]["subjects"][0], "nas.example.com");
+        assert_eq!(policies[0]["subjects"].as_array().unwrap().len(), 1);
+        // Internal fallback: nasty.local + IP.
+        let fallback = policies[1]["subjects"].as_array().unwrap();
+        assert_eq!(fallback[0], "nasty.local");
+        assert_eq!(fallback[1], "10.10.10.67");
     }
 
     #[test]
@@ -1155,6 +1231,7 @@ mod tests {
                 staging: false,
                 ..Default::default()
             },
+            &[],
         );
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 2);
@@ -1174,6 +1251,7 @@ mod tests {
                 staging: false,
                 ..Default::default()
             },
+            &[],
         );
         let p = &body["policies"][0];
         assert_eq!(p["subjects"][0], "nas.example.com");
@@ -1199,6 +1277,7 @@ mod tests {
                 staging: true,
                 ..Default::default()
             },
+            &[],
         );
         let issuer = &body["policies"][0]["issuers"][0];
         assert_eq!(
@@ -1224,6 +1303,7 @@ mod tests {
                 dns_resolvers: Some(vec!["10.0.0.53".into(), "10.0.0.54".into()]),
                 dns_propagation_wait_secs: None,
             },
+            &[],
         );
         let resolvers = body["policies"][0]["issuers"][0]["challenges"]["dns"]["resolvers"]
             .as_array()
@@ -1248,6 +1328,7 @@ mod tests {
                 dns_resolvers: None,
                 dns_propagation_wait_secs: Some(120),
             },
+            &[],
         );
         let delay = &body["policies"][0]["issuers"][0]["challenges"]["dns"]["propagation_delay"];
         assert_eq!(delay, "120s");
@@ -1272,6 +1353,7 @@ mod tests {
                 staging: false,
                 ..Default::default()
             },
+            &[],
         );
         let resolvers = &body["policies"][0]["issuers"][0]["challenges"]["dns"]["resolvers"];
         let resolvers = resolvers.as_array().expect("resolvers array present");
@@ -1297,6 +1379,7 @@ mod tests {
                 staging: false,
                 ..Default::default()
             },
+            &[],
         );
         let issuer = &body["policies"][0]["issuers"][0];
         assert!(issuer.get("challenges").is_none());
@@ -1323,6 +1406,7 @@ mod tests {
                 staging: false,
                 ..Default::default()
             },
+            &[],
         );
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 3);
