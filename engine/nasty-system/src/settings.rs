@@ -649,10 +649,7 @@ async fn apply_timezone(tz: &str) -> Result<(), String> {
 }
 
 async fn load() -> Settings {
-    match tokio::fs::read_to_string(STATE_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => Settings::default(),
-    }
+    nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
 async fn save(settings: &Settings) -> Result<(), std::io::Error> {

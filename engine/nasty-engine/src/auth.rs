@@ -1032,10 +1032,7 @@ fn generate_id() -> String {
 }
 
 async fn load_state() -> AuthState {
-    match tokio::fs::read_to_string(STATE_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AuthState::default(),
-    }
+    nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
 async fn save_state(state: &AuthState) -> Result<(), AuthError> {
@@ -1048,10 +1045,7 @@ async fn save_state(state: &AuthState) -> Result<(), AuthError> {
 }
 
 async fn load_rate_limit() -> RateLimitState {
-    match tokio::fs::read_to_string(RATE_LIMIT_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => RateLimitState::default(),
-    }
+    nasty_common::load_singleton_or_recover(RATE_LIMIT_PATH).await
 }
 
 async fn save_rate_limit(state: &RateLimitState) -> Result<(), AuthError> {

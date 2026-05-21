@@ -4,4 +4,4 @@ pub mod metrics_types;
 pub mod state;
 
 pub use jsonrpc::{Error as RpcError, ErrorCode, Notification, Request, Response};
-pub use state::{HasId, StateDir};
+pub use state::{HasId, StateDir, load_singleton_or_recover};

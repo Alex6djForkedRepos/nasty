@@ -72,10 +72,7 @@ static STATE_LOCK: Mutex<()> = Mutex::const_new(());
 
 pub async fn load() -> PassthroughConfig {
     let _guard = STATE_LOCK.lock().await;
-    match tokio::fs::read_to_string(STATE_PATH).await {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => PassthroughConfig::default(),
-    }
+    nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
 /// Apply a request: validate against the management interface
