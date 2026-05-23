@@ -154,12 +154,21 @@ async fn main() -> anyhow::Result<()> {
     // so a single misbehaving subsystem (a hung mount, a slow Tailscale
     // login, an unreachable Docker socket) can't take the whole engine
     // down via systemd's `TimeoutStartSec`. See #299 for the design.
-    let mount_phase = std::time::Duration::from_secs(180);
-    let restore_phase = std::time::Duration::from_secs(60);
+    //
+    // Budgets are per-phase, sized for the worst realistic case
+    // (many filesystems, many VMs/apps, big subvolume tree) rather
+    // than the median, with generous headroom above that. If the
+    // sum of every phase hitting its ceiling exceeds systemd's
+    // default `TimeoutStartSec` (90 s), the engine still reaches
+    // READY because each phase fires its own timeout independently
+    // and we keep going — but the actual common-case boot is in
+    // seconds and the ceilings are never reached.
+    use std::time::Duration;
+    let secs = Duration::from_secs;
 
     let mount_failures = run_phase(
         "filesystems.restore_mounts",
-        mount_phase,
+        secs(300), // per-FS 60s device-wait × multi-disk pools, plus mount + possible fsck
         state.filesystems.restore_mounts(),
     )
     .await;
@@ -176,27 +185,27 @@ async fn main() -> anyhow::Result<()> {
     // files must be patched before their respective restore steps run.
     let dev_map = run_phase(
         "subvolumes.restore_block_devices",
-        restore_phase,
+        secs(30), // losetup per block subvolume + state-file write
         state.subvolumes.restore_block_devices(),
     )
     .await;
     if !dev_map.is_empty() {
         run_phase(
             "nvmeof.remap_device_paths",
-            restore_phase,
+            secs(15), // string substitution + state-file save
             state.nvmeof.remap_device_paths(&dev_map),
         )
         .await;
         run_phase(
             "iscsi.remap_device_paths",
-            restore_phase,
+            secs(15),
             state.iscsi.remap_device_paths(&dev_map),
         )
         .await;
     }
     run_phase(
         "protocols.restore",
-        restore_phase,
+        secs(90), // 9 systemd services × up to ~10s each on a bursty box
         state.protocols.restore(),
     )
     .await;
@@ -204,12 +213,27 @@ async fn main() -> anyhow::Result<()> {
     // SSH password auth is managed via /var/lib/nasty/sshd_override.conf
     // (created by tmpfiles with default "yes", toggled by the WebUI).
 
-    run_phase("nvmeof.restore", restore_phase, state.nvmeof.restore()).await;
-    run_phase("vms.restore", restore_phase, state.vms.restore()).await;
-    run_phase("apps.restore", restore_phase, state.apps.restore()).await;
+    run_phase(
+        "nvmeof.restore",
+        secs(30), // configfs writes — fast unless many subsystems
+        state.nvmeof.restore(),
+    )
+    .await;
+    run_phase(
+        "vms.restore",
+        secs(300), // 10-20s per autostart VM × N
+        state.vms.restore(),
+    )
+    .await;
+    run_phase(
+        "apps.restore",
+        secs(300), // `docker compose up -d` per autostart app, may pull layers
+        state.apps.restore(),
+    )
+    .await;
     run_phase(
         "tailscale.restore",
-        restore_phase,
+        secs(60), // network round-trip to login.tailscale.com
         state.tailscale.restore(),
     )
     .await;
@@ -221,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     // so a confirm can't race the rollback.
     run_phase(
         "network.restore_pending_revert",
-        restore_phase,
+        secs(60), // file check is instant; revert path runs nmcli
         state.network.restore_pending_revert(),
     )
     .await;
@@ -237,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     // the cleaned-on-disk state.
     run_phase(
         "network.reconcile_orphans",
-        restore_phase,
+        secs(30), // a handful of NM connection deletes at most
         state.network.reconcile_orphans(),
     )
     .await;
@@ -250,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
     // row. Best-effort; failures are logged and don't block startup.
     run_phase(
         "subvolumes.reconcile_project_ids",
-        restore_phase,
+        secs(90), // repquota scan + setproject per subvolume, scales with subvol count
         state.subvolumes.reconcile_project_ids(),
     )
     .await;
@@ -264,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
     // from there.
     run_phase(
         "apps.reconcile_app_routes",
-        restore_phase,
+        secs(30), // localhost HTTP to Caddy admin :2019
         state.apps.reconcile_app_routes(),
     )
     .await;
@@ -294,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Initialize firewall based on current protocol states
-    run_phase("firewall.init", restore_phase, {
+    run_phase("firewall.init", secs(15), {
         let state = state.clone();
         async move {
             use nasty_system::protocol::Protocol;
@@ -309,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     // Sync NVMe-oF ports with Tailscale IP (if Tailscale reconnected on boot)
-    run_phase("nvmeof.ensure_tailscale_ports", restore_phase, {
+    run_phase("nvmeof.ensure_tailscale_ports", secs(15), {
         let state = state.clone();
         async move {
             let ts_status = state.tailscale.get().await;
@@ -325,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
     // Pre-warm caches so first page loads are fast.
     // Runs before sd_notify_ready() — Caddy won't serve until this completes.
     info!("Warming caches...");
-    run_phase("caches.warm", restore_phase, {
+    run_phase("caches.warm", secs(30), {
         let state = state.clone();
         async move {
             state.system.info().await;
