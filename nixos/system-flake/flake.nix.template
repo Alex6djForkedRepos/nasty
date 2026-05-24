@@ -29,7 +29,21 @@
     # on their hardware.
     nasty.url = "github:nasty-project/nasty/@NASTY_VERSION@";
     nixpkgs.follows = "nasty/nixpkgs";
-    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/@BCACHEFS_TOOLS_REF@";
+    # bcachefs-tools defaults to the same rev nasty's CI is tested
+    # against; operators retain the right to pin a different version
+    # by editing this line (or via the WebUI's Upstream editor, which
+    # calls `version_switch` → `rewrite_flake_input_urls` to mutate
+    # this URL surgically without re-rendering the template).
+    #
+    # Intentionally NOT a `@BCACHEFS_TOOLS_REF@` placeholder: an
+    # earlier iteration tried that, and pre-#312 engines (notably
+    # the v0.0.8 release) silently no-op on unknown placeholders
+    # during rebootstrap — so when they fetched main's template and
+    # re-rendered the wrapper, the literal text `@BCACHEFS_TOOLS_REF@`
+    # ended up in `bcachefs-tools.url`, breaking the next
+    # `nix flake update`. The hardcoded default below renders cleanly
+    # under any historical renderer.
+    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
   };
 
   outputs = { self, nixpkgs, nasty, ... }:
