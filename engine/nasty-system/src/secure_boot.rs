@@ -205,6 +205,15 @@ fn compute_blocker(r: &ReadinessReport) -> Option<String> {
 /// fails (path doesn't exist, not a mount point, EACCES). Matches
 /// the helper used in `alerts.rs` so behavior is consistent across
 /// the codebase.
+///
+/// `#[allow(clippy::unnecessary_cast)]` is load-bearing here. The
+/// `libc::statvfs` struct layout is target-dependent: on Linux glibc
+/// (CI's clippy target) `f_bavail` is already `u64`, so `as u64` is
+/// flagged as unnecessary; on macOS (the dev target) it's `u32`, so
+/// dropping the cast breaks the multiplication. Neither `u64::from`
+/// nor an explicit `if cfg!(target_os = …)` is cleaner than naming
+/// the lint we're knowingly suppressing.
+#[allow(clippy::unnecessary_cast)]
 fn statvfs_free_bytes(path: &str) -> Option<u64> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
@@ -215,11 +224,7 @@ fn statvfs_free_bytes(path: &str) -> Option<u64> {
         return None;
     }
     let stat = unsafe { buf.assume_init() };
-    // libc::statvfs's `f_bavail` is `u64` on Linux glibc but `u32` on
-    // macOS — `u64::from(_)` widens portably (identity on u64,
-    // infallible widen on u32) without tripping clippy's
-    // unnecessary-cast lint either way. `f_frsize` is u64 on both.
-    Some(u64::from(stat.f_bavail) * stat.f_frsize)
+    Some(stat.f_bavail as u64 * stat.f_frsize)
 }
 
 /// Scan `/etc/nixos/flake.nix` for a top-level `lanzaboote.url`
