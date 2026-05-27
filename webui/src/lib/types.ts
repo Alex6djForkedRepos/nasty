@@ -116,6 +116,23 @@ export interface SecureBootStatus {
 	note: string | null;
 }
 
+/** Wire shape of `system.secure_boot.enrollment.status`. Drives the
+ * highly-experimental SB onboarding wizard on the Hardware page.
+ * `phase.kind` is the discriminator; per-variant fields land
+ * inline alongside it (serde flattens — `OverlayWritten` ships
+ * `{kind: "overlay_written", overlay_at: 12345}`). */
+export type SecureBootEnrollmentPhase =
+	| { kind: 'not_started' }
+	| { kind: 'overlay_written'; overlay_at: number }
+	| { kind: 'post_enrollment'; detected_at: number; stale_tpm_bindings: string[] }
+	| { kind: 'complete'; completed_at: number }
+	| { kind: 'aborted'; aborted_at: number; reason: string };
+
+export interface SecureBootEnrollmentState {
+	phase: SecureBootEnrollmentPhase;
+	initiated_by: string | null;
+}
+
 /** Structured checklist returned by `system.secure_boot.readiness`.
  * Drives the Hardware-page panel that shows whether a box is ready
  * for the lanzaboote opt-in. `ready === true` means every check
