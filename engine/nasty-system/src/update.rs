@@ -2347,7 +2347,10 @@ fn inject_lanzaboote_input(content: &str) -> Result<String, UpdateError> {
         // (single-line `inputs = { ... };`) we fall back to
         // inserting just before the `}` — produces ugly formatting
         // but stays correct.
-        let insert_at = content[..end - 1].rfind('\n').map(|n| n + 1).unwrap_or(end - 1);
+        let insert_at = content[..end - 1]
+            .rfind('\n')
+            .map(|n| n + 1)
+            .unwrap_or(end - 1);
         let mut out = String::with_capacity(content.len() + LANZABOOTE_INPUT_BLOCK.len());
         out.push_str(&content[..insert_at]);
         out.push_str(LANZABOOTE_INPUT_BLOCK);
@@ -2366,9 +2369,7 @@ fn strip_lanzaboote_input(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     for line in content.split_inclusive('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("lanzaboote.url")
-            || trimmed.starts_with("lanzaboote.inputs.")
-        {
+        if trimmed.starts_with("lanzaboote.url") || trimmed.starts_with("lanzaboote.inputs.") {
             continue;
         }
         out.push_str(line);

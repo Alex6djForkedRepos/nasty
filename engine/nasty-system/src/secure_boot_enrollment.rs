@@ -316,7 +316,8 @@ impl SecureBootEnrollmentService {
         // update prunes it). Surface the failure so the wizard can
         // show it, but don't bounce the abort back — the operator's
         // intent (cancel) succeeded at the SB-config level.
-        if let Err(e) = crate::update::remove_lanzaboote_input_from_wrapper(WRAPPER_FLAKE_PATH).await
+        if let Err(e) =
+            crate::update::remove_lanzaboote_input_from_wrapper(WRAPPER_FLAKE_PATH).await
         {
             warn!(
                 target: "nasty::secure_boot_enrollment",
