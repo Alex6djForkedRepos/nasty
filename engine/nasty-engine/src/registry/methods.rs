@@ -417,7 +417,10 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     name: "device.wipe",
                     desc: "Erase all filesystem signatures from a device (wipefs). The device must not be in use.",
                     role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("path", "Block device path (e.g. /dev/sdb).")),
+                    params: MethodParams::AdHoc(ad_hoc_one(
+                        "path",
+                        "Block device path (e.g. /dev/sdb).",
+                    )),
                     result: None,
                 },
             ],
@@ -613,8 +616,10 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Any,
                     // BUGFIX: docs said "pool" but the runtime parses "filesystem".
                     params: MethodParams::AdHoc(ad_hoc_two(
-                        "filesystem", "Filesystem name.",
-                        "name", "Subvolume name.",
+                        "filesystem",
+                        "Filesystem name.",
+                        "name",
+                        "Subvolume name.",
                     )),
                     result: Some(gen_schema::<Subvolume>(generator)),
                 },
@@ -638,8 +643,10 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Operator,
                     // BUGFIX: docs said "pool" but the runtime parses "filesystem".
                     params: MethodParams::AdHoc(ad_hoc_two(
-                        "filesystem", "Filesystem name.",
-                        "name", "Subvolume name.",
+                        "filesystem",
+                        "Filesystem name.",
+                        "name",
+                        "Subvolume name.",
                     )),
                     result: Some(gen_schema::<Subvolume>(generator)),
                 },
@@ -649,8 +656,10 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Operator,
                     // BUGFIX: docs said "pool" but the runtime parses "filesystem".
                     params: MethodParams::AdHoc(ad_hoc_two(
-                        "filesystem", "Filesystem name.",
-                        "name", "Subvolume name.",
+                        "filesystem",
+                        "Filesystem name.",
+                        "name",
+                        "Subvolume name.",
                     )),
                     result: Some(gen_schema::<Subvolume>(generator)),
                 },

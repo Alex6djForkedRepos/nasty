@@ -117,9 +117,9 @@ async fn main() -> anyhow::Result<()> {
     // writes docs/api.md straight out of the in-engine method registry, so
     // the docs and the dispatcher live in the same crate and stop drifting.
     if matches!(args.get(1).map(String::as_str), Some("--dump-docs")) {
-        let out_dir = args.get(2).ok_or_else(|| {
-            anyhow::anyhow!("--dump-docs requires an output directory argument")
-        })?;
+        let out_dir = args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("--dump-docs requires an output directory argument"))?;
         let (_g, groups) = registry::build_full_registry();
         let md = registry::render_markdown(&groups);
         let out_path = std::path::Path::new(out_dir).join("api.md");

@@ -255,4 +255,3 @@ fn collect_defs(groups: &[(&str, Vec<Method>)]) -> BTreeMap<String, Value> {
     }
     all
 }
-

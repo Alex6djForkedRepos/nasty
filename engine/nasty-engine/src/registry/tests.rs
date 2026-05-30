@@ -150,9 +150,7 @@ fn render_properties_marks_optional_fields_no() {
 #[test]
 fn render_properties_returns_none_for_empty_object() {
     assert!(render_properties(&json!({"type": "object"}), &json!({})).is_none());
-    assert!(
-        render_properties(&json!({"type": "object", "properties": {}}), &json!({})).is_none()
-    );
+    assert!(render_properties(&json!({"type": "object", "properties": {}}), &json!({})).is_none());
 }
 
 #[test]
@@ -165,4 +163,3 @@ fn registry_builds_without_panic() {
     let total: usize = groups.iter().map(|(_, ms)| ms.len()).sum();
     assert!(total > 100, "expected >100 methods, got {total}");
 }
-
