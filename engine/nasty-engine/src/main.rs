@@ -28,6 +28,7 @@ mod registry;
 mod rest_gateway;
 mod router;
 mod subvolume_dependents;
+mod swagger_ui;
 mod telemetry;
 mod terminal;
 mod vm_console;
@@ -539,6 +540,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(ws_routes)
         .merge(rest_gateway::routes())
+        .merge(swagger_ui::routes())
         .route("/api/openapi.json", get(openapi_handler))
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))

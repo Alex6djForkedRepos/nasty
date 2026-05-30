@@ -36,6 +36,10 @@ serde_yaml_ng = "0.10"
 tokio-util = { workspace = true, features = ["io"] }
 openidconnect = { version = "4", default-features = false, features = ["accept-rfc3339-timestamps", "accept-string-booleans"] }
 http = "1"
+# Vendored Swagger UI assets, embedded into the binary at compile time
+# (see vendor/swagger-ui/). include_dir is pure Rust — no -sys deps and
+# nothing for the Nix derivation to learn about.
+include_dir = "0.7"
 url = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # WebAuthn third login backend (issue #289). 0.5 is the current
