@@ -884,6 +884,26 @@ impl AuthService {
     // other user-record write. The webauthn module owns the
     // crypto + challenge state; this module owns the on-disk shape.
 
+    /// Whether ANY user has at least one registered WebAuthn
+    /// credential. Used by the unauthenticated
+    /// `/api/auth/webauthn/available` endpoint to gate the login
+    /// page's "Sign in with security key" button — on a fresh
+    /// install with no keys registered yet the button is just
+    /// visual noise that fails at click time.
+    ///
+    /// One-bit leak (an unauthenticated caller learns whether any
+    /// keys exist) is intentional and matches the parallel
+    /// `/api/auth/oidc/available` — both endpoints exist to let
+    /// the login page render the right buttons without first
+    /// requiring auth.
+    pub async fn any_webauthn_credentials_registered(&self) -> bool {
+        let state = self.state.read().await;
+        state
+            .users
+            .iter()
+            .any(|u| !u.webauthn_credentials.is_empty())
+    }
+
     /// Snapshot of a user's registered WebAuthn credentials. Returns
     /// an empty vec when the user doesn't exist (caller is the
     /// session-bound user, so a missing entry is degenerate and
