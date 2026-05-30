@@ -520,6 +520,10 @@ async fn main() -> anyhow::Result<()> {
             post(webauthn_login_finish_handler),
         )
         .route("/api/auth/oidc/available", get(oidc_available_handler))
+        .route(
+            "/api/auth/webauthn/available",
+            get(webauthn_available_handler),
+        )
         .route("/api/boot_status", get(boot_status_handler))
         .route("/api/auth/oidc/start", get(oidc_start_handler))
         .route("/api/auth/oidc/callback", get(oidc_callback_handler))
@@ -2254,6 +2258,26 @@ async fn oidc_available_handler(State(state): State<Arc<AppState>>) -> impl Into
     let configured = state.oidc.current().await.is_some();
     Json(serde_json::json!({
         "enabled": oidc.enabled && configured,
+    }))
+}
+
+/// Unauthenticated probe for the login page's "Sign in with security
+/// key" button visibility. Returns `{ "has_credentials": bool }` —
+/// true iff at least one user has at least one registered WebAuthn
+/// credential. On a fresh install the button is just visual noise
+/// (clicking it fails at the engine's "no credentials for user"
+/// check), so the WebUI gates the button on this AND the browser's
+/// own WebAuthn API support.
+///
+/// Parallels `/api/auth/oidc/available`. The one-bit leak (an
+/// unauthenticated caller learns whether any keys are registered)
+/// is acceptable for the same reason it is there: rendering the
+/// login page right requires answering this question before auth
+/// has happened.
+async fn webauthn_available_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let has_credentials = state.auth.any_webauthn_credentials_registered().await;
+    Json(serde_json::json!({
+        "has_credentials": has_credentials,
     }))
 }
 

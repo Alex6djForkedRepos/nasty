@@ -82,6 +82,14 @@
 	let loginPass = $state('');
 	let loginError = $state('');
 	let ssoEnabled = $state(false);
+	// Whether the engine reports at least one user has registered a
+	// WebAuthn credential. Gates the "Sign in with security key"
+	// button on top of the browser-capability check — on a fresh
+	// install with no keys yet, clicking the button just fails at
+	// "no credentials for user", so hide it until there's something
+	// to sign in with. Populated by /api/auth/webauthn/available
+	// (unauthenticated, parallel to /api/auth/oidc/available).
+	let webauthnHasCredentials = $state(false);
 
 	// Boot status — populated by polling /api/boot_status. While
 	// `overall === 'booting'` we show a TrueNAS-style overlay
@@ -184,6 +192,18 @@
 				ssoEnabled = false;
 			}
 		} catch { ssoEnabled = false; }
+	}
+
+	async function refreshWebauthnAvailability() {
+		try {
+			const res = await fetch('/api/auth/webauthn/available');
+			if (res.ok) {
+				const body = await res.json();
+				webauthnHasCredentials = !!body.has_credentials;
+			} else {
+				webauthnHasCredentials = false;
+			}
+		} catch { webauthnHasCredentials = false; }
 	}
 
 	function startSso() {
@@ -434,6 +454,7 @@
 			const probe = await fetch('/api/auth/check');
 			if (probe.status !== 200) {
 				refreshSsoAvailability();
+				refreshWebauthnAvailability();
 				showLogin = true;
 				return;
 			}
@@ -462,6 +483,7 @@
 		} catch (e) {
 			resetClient();
 			refreshSsoAvailability();
+			refreshWebauthnAvailability();
 			showLogin = true;
 			if (e instanceof Error && e.message !== 'WebSocket connection failed') {
 				showError('Session expired, please sign in again');
@@ -761,14 +783,14 @@
 				</div>
 				<Button type="submit" class="w-full" disabled={webauthnPending}>Sign In</Button>
 			</form>
-			{#if webauthnLoginSupported || ssoEnabled}
+			{#if (webauthnLoginSupported && webauthnHasCredentials) || ssoEnabled}
 				<div class="my-4 flex items-center gap-3 text-xs text-muted-foreground">
 					<div class="h-px flex-1 bg-border"></div>
 					<span>or</span>
 					<div class="h-px flex-1 bg-border"></div>
 				</div>
 			{/if}
-			{#if webauthnLoginSupported}
+			{#if webauthnLoginSupported && webauthnHasCredentials}
 				<Button
 					type="button"
 					variant="outline"
