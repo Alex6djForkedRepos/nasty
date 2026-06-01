@@ -1781,12 +1781,21 @@ impl FilesystemService {
 
         let mut devices = Vec::new();
         if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
-            fn classify(name: &str, rota: bool) -> (bool, String) {
+            fn classify(name: &str, rota: bool, transport: Option<&str>) -> (bool, String) {
                 if name.starts_with("nvme") {
                     return (false, "nvme".to_string());
                 }
                 if name.starts_with("mmcblk") {
                     return (false, "mmc".to_string());
+                }
+                // SAS drives report `tran == "sas"` from lsblk. Both SAS HDDs
+                // and SAS SSDs get the `sas` class so the WebUI Devices tab
+                // can badge them as the enterprise drives they are rather
+                // than disguising them as SATA hdd/ssd (issue #365). The
+                // rotational bit is still set correctly so callers that care
+                // about spinning vs solid-state get the right answer.
+                if matches!(transport, Some("sas")) {
+                    return (rota, "sas".to_string());
                 }
                 if rota {
                     (true, "hdd".to_string())
@@ -1839,8 +1848,6 @@ impl FilesystemService {
                                 .or_else(|| v.as_u64().map(|n| n == 1))
                         })
                         .unwrap_or(false);
-                    let (rotational, device_class) = classify(name, rota);
-
                     // lsblk surfaces these only on whole disks; on partitions
                     // they're empty/null. Treat empty-after-trim as None so
                     // the WebUI can hide the field entirely instead of
@@ -1855,6 +1862,10 @@ impl FilesystemService {
                     let serial = pick("serial");
                     let vendor = pick("vendor");
                     let transport = pick("tran");
+
+                    // Transport needs to be resolved before classify so the
+                    // SAS path can use it.
+                    let (rotational, device_class) = classify(name, rota, transport.as_deref());
 
                     if dev_type == "disk" || dev_type == "part" {
                         let path = format!("/dev/{name}");
