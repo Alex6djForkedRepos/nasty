@@ -637,6 +637,12 @@ export interface DiskHealth {
 export interface AtaHealth {
 	interface_speed_current?: string;
 	interface_speed_max?: string;
+	/** Endurance consumed as percentage (0 = new, 100 = nominal end of
+	 * life). Mirrors `NvmeHealth.percentage_used`. Sourced from
+	 * smartctl 7.5+'s top-level `endurance_used.current_percent`.
+	 * `undefined` on spinners, very old SSDs without
+	 * Media_Wearout_Indicator, and pre-7.5 smartctl. */
+	endurance_used_percent?: number;
 }
 
 export interface SmartAttribute {
