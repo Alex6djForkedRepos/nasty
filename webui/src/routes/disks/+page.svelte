@@ -101,6 +101,9 @@
 			case 'ssd': return 'bg-blue-950 text-blue-400';
 			case 'mmc': return 'bg-amber-950 text-amber-400';
 			case 'hdd': return 'bg-emerald-950 text-emerald-400';
+			// SAS = enterprise transport, distinct colour so it doesn't get
+			// visually conflated with consumer SATA hdd/ssd (#365).
+			case 'sas': return 'bg-rose-950 text-rose-400';
 			default: return 'bg-secondary text-muted-foreground';
 		}
 	}
@@ -313,7 +316,7 @@
 								</table>
 							</div>
 						{:else if expandedDisk === disk.device}
-							<p class="mt-4 text-sm text-muted-foreground">No SMART attributes available (NVMe drives use a different format).</p>
+							<p class="mt-4 text-sm text-muted-foreground">No SMART attributes available (NVMe and SAS drives use a different format).</p>
 						{/if}
 					</CardContent>
 				</Card>
