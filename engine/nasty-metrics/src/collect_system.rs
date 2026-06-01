@@ -326,11 +326,19 @@ struct SmartctlJson {
     #[serde(default)]
     scsi_error_counter_log: Option<SmartctlScsiErrorCounterLog>,
 
-    // ATA — currently just interface_speed. The SMART attribute table
+    // ATA — interface link speed + endurance. The SMART attribute table
     // already covers everything else ATA reports; this block exists for
     // fields outside the attributes payload.
     #[serde(default)]
     interface_speed: Option<SmartctlInterfaceSpeed>,
+    /// smartctl 7.5+ exposes `endurance_used.current_percent` at the
+    /// top level for ATA drives — computed from each drive's
+    /// Media_Wearout_Indicator-equivalent attribute (id varies per
+    /// vendor). Saves us from hunting through the attributes table for
+    /// vendor-specific encodings. Absent on drives without wear
+    /// reporting (spinners, pre-MWI SSDs) and on smartctl < 7.5.
+    #[serde(default)]
+    endurance_used: Option<SmartctlEnduranceUsed>,
 
     // SCSI self-test entries are emitted as numbered top-level keys
     // (`scsi_self_test_0`, `scsi_self_test_1`, …) rather than an
@@ -356,6 +364,12 @@ struct SmartctlInterfaceSpeedRate {
     /// the string already matches what operators see in `smartctl -a`.
     #[serde(default)]
     string: String,
+}
+
+#[derive(Deserialize)]
+struct SmartctlEnduranceUsed {
+    #[serde(default)]
+    current_percent: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1048,27 +1062,33 @@ async fn query_smartctl(device: &str, transport: Option<&str>) -> Option<SmartRe
 /// Build the ATA / SATA summary block. Returns `None` for non-ATA
 /// drives so DiskHealth.ata stays absent in the JSON for NVMe / SAS.
 fn build_ata_health(json: &SmartctlJson) -> Option<AtaHealth> {
-    // Trigger: smartctl returned an interface_speed object. ATA dumps
-    // emit this; NVMe and SAS dumps don't. We don't gate on the
-    // protocol field because megaraid-tunneled ATA still produces ATA
-    // SMART payloads and the wrapper transport is the bit that knows.
-    let speed = json.interface_speed.as_ref()?;
-    let cur = speed
-        .current
+    // Trigger: smartctl returned an interface_speed OR endurance_used
+    // object. ATA dumps emit one or both; NVMe and SAS dumps don't
+    // emit interface_speed (NVMe uses PCIe link, SAS uses scsi_transport_
+    // protocol; neither is a smartctl interface_speed). Endurance is
+    // present only on smartctl 7.5+ ATA dumps for drives that report
+    // wear, so it's a weaker signal — interface_speed remains the
+    // primary detector.
+    let cur = json
+        .interface_speed
         .as_ref()
+        .and_then(|s| s.current.as_ref())
         .map(|r| r.string.trim().to_string())
         .filter(|s| !s.is_empty());
-    let max = speed
-        .max
+    let max = json
+        .interface_speed
         .as_ref()
+        .and_then(|s| s.max.as_ref())
         .map(|r| r.string.trim().to_string())
         .filter(|s| !s.is_empty());
-    if cur.is_none() && max.is_none() {
+    let endurance = json.endurance_used.as_ref().and_then(|e| e.current_percent);
+    if cur.is_none() && max.is_none() && endurance.is_none() {
         return None;
     }
     Some(AtaHealth {
         interface_speed_current: cur,
         interface_speed_max: max,
+        endurance_used_percent: endurance,
     })
 }
 
@@ -1633,6 +1653,35 @@ mod tests {
         // dumps don't carry interface_speed either.
         let j = parse(include_str!("../fixtures/nvme_samsung_980_pro.json"));
         assert!(build_ata_health(&j).is_none());
+    }
+
+    #[test]
+    fn ata_ssd_parses_endurance_used_from_smartctl_7_5() {
+        // KIOXIA EXCERIA SATA SSD — smartctl 7.5 emits a top-level
+        // endurance_used.current_percent for ATA SSDs, computed from
+        // each drive's Media_Wearout_Indicator attribute (the encoding
+        // varies per vendor; smartctl normalizes it for us). Saves the
+        // operator from having to know that for KIOXIA the wear lives
+        // in attribute 173 with a vendor-specific raw encoding.
+        let j = parse(include_str!("../fixtures/ata_kioxia_ssd.json"));
+        let ata = build_ata_health(&j).expect("ATA block present");
+        // Fresh drive — 0% endurance consumed.
+        assert_eq!(ata.endurance_used_percent, Some(0));
+        // Interface fields still populate alongside endurance.
+        assert_eq!(ata.interface_speed_current.as_deref(), Some("6.0 Gb/s"));
+    }
+
+    #[test]
+    fn ata_spinner_without_endurance_still_builds() {
+        // HGST He10 is a spinner — no Media_Wearout_Indicator, no
+        // endurance_used in the dump. The ATA block must still build
+        // (driven by interface_speed) with endurance_used_percent=None.
+        // Skip-serialize means the field disappears from the JSON for
+        // these drives; the UI just hides the tile.
+        let j = parse(include_str!("../fixtures/ata_hgst_he10.json"));
+        let ata = build_ata_health(&j).expect("ATA block present");
+        assert_eq!(ata.endurance_used_percent, None);
+        assert!(ata.interface_speed_current.is_some());
     }
 
     #[test]

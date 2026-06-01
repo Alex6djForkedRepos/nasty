@@ -148,7 +148,7 @@ pub struct DiskHealth {
 /// ATA / SATA summary fields complementing the generic SMART attribute
 /// table. The attribute table is the source of truth for everything
 /// SMART measures; this struct just carries the few non-attribute fields
-/// (interface link speed today, room to grow) that don't fit there.
+/// (interface link speed, endurance) that don't fit there.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AtaHealth {
     /// Currently-negotiated SATA link speed string as smartctl reports
@@ -160,6 +160,18 @@ pub struct AtaHealth {
     /// Maximum link speed the drive can negotiate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface_speed_max: Option<String>,
+    /// Endurance consumed as a percentage: 0 = new, 100 = nominal end
+    /// of life. Mirrors `NvmeHealth::percentage_used` so the ATA panel
+    /// can show wear next to the link-speed tile in the same way the
+    /// NVMe panel does. Sourced from smartctl 7.5+'s top-level
+    /// `endurance_used.current_percent`, which smartctl computes from
+    /// each drive's Media Wearout Indicator attribute (id varies per
+    /// vendor; smartctl knows the encoding so we don't have to).
+    /// `None` on drives that don't report wear: spinners, very old
+    /// SSDs without Media_Wearout_Indicator, and any drive seen
+    /// through a smartctl earlier than 7.5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endurance_used_percent: Option<u32>,
 }
 
 /// NVMe SMART health information, parsed from smartctl's

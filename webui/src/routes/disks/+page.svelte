@@ -357,6 +357,14 @@
 											</span>
 										</div>
 									{/if}
+									{#if disk.ata?.endurance_used_percent != null}
+										<div class="flex flex-col">
+											<span class="text-[0.7rem] uppercase text-muted-foreground">Endurance Used</span>
+											<span class="text-sm font-semibold {disk.ata.endurance_used_percent >= 100 ? 'text-red-400' : disk.ata.endurance_used_percent >= 80 ? 'text-amber-500' : ''}" title="0 = new, 100 = nominal end of life. Computed by smartctl from the drive's wear-leveling attribute.">
+												{disk.ata.endurance_used_percent}%
+											</span>
+										</div>
+									{/if}
 									{#if reallocated}
 										<div class="flex flex-col">
 											<span class="text-[0.7rem] uppercase text-muted-foreground">Reallocated Sectors</span>
