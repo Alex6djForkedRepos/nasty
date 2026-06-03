@@ -744,8 +744,22 @@
 										<label class="flex items-center gap-1.5 text-sm cursor-pointer rounded border px-2 py-1 transition-colors {isMember ? 'border-blue-500/40 bg-blue-500/10' : 'border-border hover:bg-muted/30'}">
 											<input type="checkbox" class="rounded border-input"
 												checked={isMember}
-												onchange={async () => {
+												onchange={async (e) => {
 													if (isMember) {
+														// Removing membership via a checkbox toggle is
+														// easy to misclick. Confirm before yanking the
+														// user out of an SMB group — depending on the
+														// share's valid_users list, this can sever
+														// their access entirely.
+														if (!await confirm(
+															`Remove ${user.username} from ${group.name}?`,
+															`Any SMB shares that restrict access to the ${group.name} group will become unreachable for this user until they're re-added.`,
+														)) {
+															// Operator canceled — revert the checkbox
+															// (Svelte's onchange already flipped it).
+															(e.currentTarget as HTMLInputElement).checked = true;
+															return;
+														}
 														await withToast(() => client.call('smb.group.remove_member', { group: group.name, user: user.username }), `Removed from ${group.name}`);
 													} else {
 														await withToast(() => client.call('smb.group.add_member', { group: group.name, user: user.username }), `Added to ${group.name}`);

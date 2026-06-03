@@ -3,6 +3,7 @@
 	import { page } from '$app/stores';
 	import { getClient } from '$lib/client';
 	import { withToast } from '$lib/toast.svelte';
+	import { confirm } from '$lib/confirm.svelte';
 	import type { ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -123,6 +124,14 @@
 	}
 
 	async function removeSshKey(key: string) {
+		// Removing an SSH key is destructive AND potentially self-locking
+		// (operator's current SSH session may be holding the only other
+		// path back into the box). Confirm before yanking it.
+		const fingerprint = key.split(/\s+/).slice(0, 2).join(' ');
+		if (!await confirm(
+			'Remove this SSH key?',
+			`The key (${fingerprint}…) will no longer be able to log in. If this is the key you used to SSH into this box, you'll lose your shell access.`,
+		)) return;
 		await withToast(() => client.call('system.ssh.remove_key', { key }), 'SSH key removed');
 		sshLoaded = false;
 		await loadSsh();
