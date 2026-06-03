@@ -70,6 +70,14 @@ NASty can serve as a storage backend for Kubernetes — provisioning persistent 
 - **[nasty-chart](https://github.com/nasty-project/nasty-chart)** — Helm chart for one-command install
 - **[nasty-plugin](https://github.com/nasty-project/nasty-plugin)** — `kubectl-nasty` for inspecting volumes, snapshots, clones, and health from the CLI
 
+## Community
+
+Integrations built by the community on top of NASty's JSON-RPC API:
+
+- **[nastyplugin](https://github.com/WarlockSyno/nastyplugin)** by [@WarlockSyno](https://github.com/WarlockSyno) — Proxmox storage plugin for using NASty as a backing store for VM and container disks
+
+Building something with NASty? Open an issue or PR and we'll add it here.
+
 ## Screenshots
 
 <p align="center">
