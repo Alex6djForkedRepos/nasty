@@ -25,7 +25,8 @@ pub(crate) async fn host_has_global_ipv6() -> bool {
         return false;
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| line.trim_start().starts_with("inet6 "))
+    text.lines()
+        .any(|line| line.trim_start().starts_with("inet6 "))
 }
 
 /// Best-effort detect a routable IPv6 source address. Used by NVMe-oF
