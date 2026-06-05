@@ -1160,6 +1160,11 @@ export interface BackupProfile {
 	snapshot_before: boolean;
 	repo_initialized: boolean;
 	last_run: BackupRunResult | null;
+	/** PEM-encoded CA certificate the operator wants trusted for this
+	 * profile's target (typically a self-signed CA fronting their
+	 * rest-server / MinIO). Engine writes it to disk and passes the
+	 * path through to rustic_backend's `cacert` option. */
+	trusted_cacert?: string;
 }
 
 export type BackupTarget =

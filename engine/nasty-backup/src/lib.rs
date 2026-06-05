@@ -56,6 +56,20 @@ pub struct BackupProfile {
     pub repo_initialized: bool,
     #[serde(default)]
     pub last_run: Option<BackupRunResult>,
+    /// PEM-encoded CA certificate(s) to trust as an additional root
+    /// for this profile's TLS-using target (REST today; S3/B2 with
+    /// custom self-signed endpoints come along when we extend opendal
+    /// option plumbing). Set when the destination box serves HTTPS
+    /// with a Caddy-internal-CA cert (or any self-signed cert) that
+    /// isn't in the source box's system trust store — without this,
+    /// the connection fails with `unable to get local issuer
+    /// certificate`. Validates against the destination's specific
+    /// cert (strictly safer than "skip verify": a leaked-but-valid
+    /// cert on a different host still gets rejected). Public info,
+    /// not encrypted on disk; written into a per-profile cacert file
+    /// at runtime that rustic_backend reads via its `cacert` option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_cacert: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -110,14 +124,22 @@ pub enum BackupTarget {
 }
 
 /// Plaintext secrets resolved out of a `BackupTarget`'s encrypted /
-/// legacy fields, ready to be combined with the target shape to build
-/// rustic-compatible backend options. Decryption is async, target
+/// legacy fields, plus any runtime-only path data (e.g. the cacert
+/// file we materialize from `profile.trusted_cacert`). Ready to be
+/// combined with the target shape to build rustic-compatible backend
+/// options. Decryption + cacert file writes are async; target
 /// construction must run sync inside `spawn_blocking`, so we resolve
 /// once outside and pass this struct in.
 #[derive(Debug, Default)]
 struct ResolvedTargetSecrets {
     s3_secret_key: Option<String>,
     b2_account_key: Option<String>,
+    /// Absolute path of a PEM file containing the operator-supplied
+    /// trusted CA cert (`profile.trusted_cacert`). Materialized by
+    /// [`BackupProfile::resolve_runtime`] before the spawn_blocking
+    /// boundary so the sync `to_backend_options` only needs to pass
+    /// the path through to rustic_backend's `cacert` option.
+    cacert_path: Option<String>,
 }
 
 impl BackupTarget {
@@ -202,7 +224,23 @@ impl BackupTarget {
                     .options(opts)
             }
             BackupTarget::Rest { url } => {
-                BackendOptions::default().repository(format!("rest:{url}"))
+                let mut opts = BackendOptions::default().repository(format!("rest:{url}"));
+                // rustic_backend's REST client uses the system trust
+                // store by default and doesn't expose a "skip TLS
+                // verify" knob (`rest.rs:189-206` only accepts
+                // retry/timeout/cacert/tls-client-cert). Operators
+                // serving HTTPS with a self-signed cert (or a Caddy
+                // internal-CA cert, which is what NASty boxes get out
+                // of the box without a public domain) must paste the
+                // server's CA cert into profile.trusted_cacert; we
+                // materialize it to a file at resolve time and hand
+                // the path to rustic via the `cacert` option here.
+                if let Some(path) = &resolved.cacert_path {
+                    let mut o = BTreeMap::new();
+                    o.insert("cacert".into(), path.clone());
+                    opts = opts.options(o);
+                }
+                opts
             }
             BackupTarget::B2 {
                 bucket, account_id, ..
@@ -408,6 +446,92 @@ fn carry_forward_existing_secrets(update: &mut BackupProfile, existing: &BackupP
         }
         _ => {}
     }
+}
+
+/// Directory holding per-profile cacert PEM files. Files inside are
+/// 0644 (public material); the directory is created on demand by
+/// [`materialize_cacert`].
+const CACERT_DIR: &str = "/var/lib/nasty/cacerts";
+
+impl BackupProfile {
+    /// Resolve secrets AND materialize the runtime cacert file (if
+    /// the profile has one). Single async entry point that the
+    /// init/run/check/snapshots/prune paths call before the
+    /// `spawn_blocking` boundary.
+    async fn resolve_runtime(&self) -> Result<ResolvedTargetSecrets, BackupError> {
+        let mut resolved = self.target.resolve_secrets(&self.id).await?;
+        if let Some(pem) = self
+            .trusted_cacert
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            resolved.cacert_path = Some(materialize_cacert(&self.id, pem).await?);
+        }
+        Ok(resolved)
+    }
+}
+
+/// Write the operator-supplied PEM to `/var/lib/nasty/cacerts/<id>.pem`
+/// (atomic via tmp+rename). Returns the path so the caller can pass
+/// it as `cacert` to rustic_backend. Idempotent: re-writing the same
+/// content is a no-op from rustic's POV.
+async fn materialize_cacert(profile_id: &str, pem: &str) -> Result<String, BackupError> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::create_dir_all(CACERT_DIR)
+        .await
+        .map_err(BackupError::Io)?;
+    let path = format!("{CACERT_DIR}/{profile_id}.pem");
+    let tmp = format!("{path}.tmp");
+    tokio::fs::write(&tmp, pem.as_bytes())
+        .await
+        .map_err(BackupError::Io)?;
+    // CA certs are public material; 0644 is fine. Stricter perms
+    // would just risk a future "rest-server can't read my cacert"
+    // bug if we ever drop the engine off root.
+    tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+        .await
+        .map_err(BackupError::Io)?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(BackupError::Io)?;
+    Ok(path)
+}
+
+/// Delete the per-profile cacert file. Called on profile delete so
+/// the cacerts directory doesn't accumulate dead files; idempotent
+/// (the file may not exist).
+async fn drop_cacert(profile_id: &str) {
+    let path = format!("{CACERT_DIR}/{profile_id}.pem");
+    if let Err(e) = tokio::fs::remove_file(&path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!("backup: failed to remove cacert file {path}: {e}");
+    }
+}
+
+/// Quick shape check on operator-supplied PEM input. Doesn't fully
+/// parse the cert (rustic_backend does that at use time and will
+/// fail loudly there); just refuses input that obviously isn't a
+/// PEM cert so the operator gets feedback on save rather than at
+/// the next backup attempt.
+fn validate_pem_cert(pem: &str) -> Result<(), BackupError> {
+    let trimmed = pem.trim();
+    if trimmed.is_empty() {
+        return Err(BackupError::Failed(
+            "trusted_cacert: empty input — leave the field unset to remove".to_string(),
+        ));
+    }
+    if !trimmed.contains("-----BEGIN CERTIFICATE-----")
+        || !trimmed.contains("-----END CERTIFICATE-----")
+    {
+        return Err(BackupError::Failed(
+            "trusted_cacert: not a PEM certificate — paste the contents of a .pem / .crt file \
+             starting with -----BEGIN CERTIFICATE-----"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve a single secret field, preferring the encrypted blob over
@@ -660,6 +784,13 @@ impl BackupService {
         if profile.id.is_empty() {
             profile.id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         }
+        // Validate the trusted CA cert shape before we save. Catches
+        // typos / wrong file pastes (e.g. operator pasted the private
+        // key by mistake) at create time rather than at the next
+        // backup attempt.
+        if let Some(pem) = &profile.trusted_cacert {
+            validate_pem_cert(pem)?;
+        }
         encrypt_profile_secrets_in_place(&mut profile).await;
 
         let mut profiles = self.profiles.lock().await;
@@ -685,6 +816,9 @@ impl BackupService {
         // existing); we carry the existing encrypted value forward
         // when the update doesn't supply a new one.
         carry_forward_existing_secrets(&mut update, &self.get_profile_internal(id).await?);
+        if let Some(pem) = &update.trusted_cacert {
+            validate_pem_cert(pem)?;
+        }
         encrypt_profile_secrets_in_place(&mut update).await;
 
         let mut profiles = self.profiles.lock().await;
@@ -694,6 +828,16 @@ impl BackupService {
             .ok_or_else(|| BackupError::NotFound(id.into()))?;
         profiles[idx] = update.clone();
         save_profiles(&profiles).await;
+        drop(profiles);
+        // Operator cleared the textarea ⇒ trusted_cacert is now None
+        // ⇒ the materialized PEM at /var/lib/nasty/cacerts/<id>.pem
+        // is no longer referenced. Drop it so the cacerts dir stays
+        // clean and a stale file can't surprise a future audit. If a
+        // new cert is set on a subsequent call, materialize_cacert
+        // recreates the file.
+        if update.trusted_cacert.is_none() {
+            drop_cacert(id).await;
+        }
         Ok(update.redacted())
     }
 
@@ -705,6 +849,10 @@ impl BackupService {
             return Err(BackupError::NotFound(id.into()));
         }
         save_profiles(&profiles).await;
+        // Drop the per-profile cacert file (if any) so the cacerts
+        // directory doesn't accumulate dead files across profile
+        // churn. Idempotent — missing file is fine.
+        drop_cacert(id).await;
         info!("Deleted backup profile '{id}'");
         Ok(())
     }
@@ -804,7 +952,7 @@ impl BackupService {
     pub async fn init_repo(&self, id: &str) -> Result<String, BackupError> {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
-        let resolved = profile.target.resolve_secrets(&profile.id).await?;
+        let resolved = profile.resolve_runtime().await?;
         tokio::task::spawn_blocking(move || {
             let repo = make_repo(&profile, &resolved)?;
             repo.init(
@@ -841,7 +989,7 @@ impl BackupService {
 
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
-        let resolved = profile.target.resolve_secrets(&profile.id).await?;
+        let resolved = profile.resolve_runtime().await?;
         let start = std::time::Instant::now();
         *self.running.lock().await = Some(id.to_string());
 
@@ -919,7 +1067,7 @@ impl BackupService {
     pub async fn list_snapshots(&self, id: &str) -> Result<Vec<BackupSnapshot>, BackupError> {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
-        let resolved = profile.target.resolve_secrets(&profile.id).await?;
+        let resolved = profile.resolve_runtime().await?;
         tokio::task::spawn_blocking(move || {
             let repo = make_repo(&profile, &resolved)?;
             let repo = repo
@@ -947,7 +1095,7 @@ impl BackupService {
     async fn prune(&self, id: &str) -> Result<(), BackupError> {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
-        let resolved = profile.target.resolve_secrets(&profile.id).await?;
+        let resolved = profile.resolve_runtime().await?;
         let r = profile.retention.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -999,7 +1147,7 @@ impl BackupService {
     pub async fn check_repo(&self, id: &str) -> Result<String, BackupError> {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
-        let resolved = profile.target.resolve_secrets(&profile.id).await?;
+        let resolved = profile.resolve_runtime().await?;
         tokio::task::spawn_blocking(move || {
             let repo = make_repo(&profile, &resolved)?;
             let repo = repo
@@ -1073,6 +1221,7 @@ mod tests {
             snapshot_before: true,
             repo_initialized: false,
             last_run: None,
+            trusted_cacert: None,
         }
     }
 
@@ -1504,5 +1653,37 @@ mod tests {
              (otherwise internal callers can accidentally backup with '***'); got {:?}",
             result
         );
+    }
+
+    #[test]
+    fn validate_pem_cert_accepts_minimal_pem_shape() {
+        // The validator is shape-only — we trust rustic_backend +
+        // rustls to do real X.509 parsing at use time. This test
+        // pins that a bare-minimum well-formed PEM passes; if a
+        // future refactor tightens the check, real operator certs
+        // shouldn't start getting rejected.
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+w\n-----END CERTIFICATE-----\n";
+        assert!(validate_pem_cert(pem).is_ok());
+    }
+
+    #[test]
+    fn validate_pem_cert_rejects_obvious_mistakes() {
+        // Empty / whitespace-only input. The skip_serializing_if=Option::is_none
+        // serde attribute means the field comes off the wire as Some("")
+        // when the WebUI sends an empty textarea, so we have to handle
+        // that distinctly from None.
+        assert!(validate_pem_cert("").is_err());
+        assert!(validate_pem_cert("   \n   ").is_err());
+
+        // Operator pastes the private key by mistake — common
+        // mis-paste when the cert + key live in the same file.
+        let key_pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\n-----END RSA PRIVATE KEY-----\n";
+        assert!(validate_pem_cert(key_pem).is_err());
+
+        // Operator pastes the URL of the cert instead of its contents.
+        assert!(validate_pem_cert("https://example.com/ca.crt").is_err());
+
+        // Partial paste — only the BEGIN line.
+        assert!(validate_pem_cert("-----BEGIN CERTIFICATE-----\nMIIBkTCB+w").is_err());
     }
 }

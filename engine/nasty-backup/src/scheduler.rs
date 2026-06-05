@@ -236,6 +236,7 @@ mod tests {
             snapshot_before: true,
             repo_initialized: false,
             last_run: None,
+            trusted_cacert: None,
         }
     }
 
