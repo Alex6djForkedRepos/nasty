@@ -38,6 +38,10 @@
 	let newSftpHost = $state(''); let newSftpUser = $state(''); let newSftpPath = $state(''); let newSftpPort = $state('');
 	let newRestUrl = $state('');
 	let newB2Bucket = $state(''); let newB2Id = $state(''); let newB2Key = $state('');
+	/** PEM CA cert text the operator wants this profile to trust on top
+	 * of the system roots. Shown only for network targets — the local
+	 * backend doesn't speak TLS, so the field is irrelevant there. */
+	let newTrustedCacert = $state('');
 	let newPassword = $state('');
 	let newSchedule = $state('');
 	let newKeepLast = $state('7');
@@ -82,6 +86,7 @@
 		newB2Bucket = '';
 		newB2Id = '';
 		newB2Key = '';
+		newTrustedCacert = '';
 		newPassword = '';
 		newSchedule = '';
 		newKeepLast = '7';
@@ -160,6 +165,7 @@
 	let editSftpHost = $state(''); let editSftpUser = $state(''); let editSftpPath = $state(''); let editSftpPort = $state('');
 	let editRestUrl = $state('');
 	let editB2Bucket = $state(''); let editB2Id = $state(''); let editB2Key = $state('');
+	let editTrustedCacert = $state('');
 	/** Snapshot of the target shape at startEdit time, used to detect
 	 * "operator changed the destination" so we can warn + reset
 	 * repo_initialized. Compared as JSON strings — order-insensitive
@@ -188,6 +194,9 @@
 		editSftpHost = ''; editSftpUser = ''; editSftpPath = ''; editSftpPort = '';
 		editRestUrl = '';
 		editB2Bucket = ''; editB2Id = ''; editB2Key = '';
+		// Round-trip the existing CA cert PEM (engine sends it back
+		// in cleartext — it's a public certificate, not a secret).
+		editTrustedCacert = p.trusted_cacert ?? '';
 		switch (p.target.type) {
 			case 'local':
 				editLocalPath = p.target.path;
@@ -302,6 +311,10 @@
 		if (editPassword) {
 			updated.password = editPassword;
 		}
+		// Trusted CA is not a secret, so we always re-send the current
+		// textarea value: empty ⇒ undefined ⇒ engine drops the cert
+		// file on disk; non-empty ⇒ engine re-validates + re-writes it.
+		updated.trusted_cacert = editTrustedCacert.trim() || undefined;
 
 		// When the target changed, force a fresh init on the new
 		// destination. Operator clicks Init Repo (or first scheduled
@@ -508,6 +521,7 @@
 			snapshot_before: true,
 			repo_initialized: false,
 			last_run: null,
+			trusted_cacert: newTrustedCacert.trim() || undefined,
 		};
 
 		await withToast(
@@ -760,6 +774,17 @@
 					</div>
 				{/if}
 
+				{#if newTargetType === 'rest' || newTargetType === 's3' || newTargetType === 'b2'}
+					<div>
+						<Label for="bk-cacert">Trusted CA Certificate <span class="text-xs font-normal text-muted-foreground">(optional)</span></Label>
+						<textarea id="bk-cacert" bind:value={newTrustedCacert}
+							placeholder={'-----BEGIN CERTIFICATE-----\nMIID…\n-----END CERTIFICATE-----'}
+							rows="5"
+							class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea>
+						<p class="mt-1 text-xs text-muted-foreground">Paste a PEM-encoded CA certificate to trust this destination's self-signed (or private-CA) TLS chain. Leave empty when the destination uses a publicly-trusted certificate.</p>
+					</div>
+				{/if}
+
 				<div>
 					<Label for="bk-pass">Encryption Password {#if !newPassword && createTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</Label>
 					<Input id="bk-pass" type="password" bind:value={newPassword} placeholder="strong-password" class="mt-1 {requiredFieldCls(!newPassword, createTried)}" />
@@ -940,6 +965,17 @@
 											<Label for="ed-b2-key">Account Key</Label>
 											<Input id="ed-b2-key" type="password" bind:value={editB2Key} placeholder="Leave blank to keep existing" class="mt-1 font-mono" />
 										</div>
+									</div>
+								{/if}
+
+								{#if editTargetType === 'rest' || editTargetType === 's3' || editTargetType === 'b2'}
+									<div>
+										<Label for="ed-cacert">Trusted CA Certificate <span class="text-xs font-normal text-muted-foreground">(optional)</span></Label>
+										<textarea id="ed-cacert" bind:value={editTrustedCacert}
+											placeholder={'-----BEGIN CERTIFICATE-----\nMIID…\n-----END CERTIFICATE-----'}
+											rows="5"
+											class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"></textarea>
+										<p class="mt-1 text-xs text-muted-foreground">PEM-encoded CA certificate to trust for this destination's TLS chain. Empty = use system roots only.</p>
 									</div>
 								{/if}
 
