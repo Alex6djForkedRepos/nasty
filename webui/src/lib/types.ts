@@ -1151,7 +1151,12 @@ export interface BackupProfile {
 	target: BackupTarget;
 	schedule: string | null;
 	retention: RetentionPolicy;
-	password: string;
+	/** Repository password. Optional on the wire: the engine accepts it
+	 * on input (operator creating / rotating) and redacts it to "***"
+	 * (or omits entirely once an encrypted blob exists) on output.
+	 * Treat any value other than what the operator just typed as
+	 * informational — only send back when actually rotating. */
+	password?: string;
 	snapshot_before: boolean;
 	repo_initialized: boolean;
 	last_run: BackupRunResult | null;
@@ -1159,10 +1164,27 @@ export interface BackupProfile {
 
 export type BackupTarget =
 	| { type: 'local'; path: string }
-	| { type: 's3'; endpoint: string; bucket: string; access_key: string; secret_key: string; region?: string }
-	| { type: 'sftp'; host: string; user: string; path: string; port?: number }
+	| {
+		type: 's3';
+		endpoint: string;
+		bucket: string;
+		access_key: string;
+		/** Optional on the wire — the engine accepts plaintext on
+		 * input, redacts to "***" or omits on output (the encrypted
+		 * blob is held server-side). Omit from the update payload to
+		 * carry the existing secret forward. */
+		secret_key?: string;
+		region?: string | null;
+	  }
+	| { type: 'sftp'; host: string; user: string; path: string; port?: number | null }
 	| { type: 'rest'; url: string }
-	| { type: 'b2'; bucket: string; account_id: string; account_key: string };
+	| {
+		type: 'b2';
+		bucket: string;
+		account_id: string;
+		/** Optional on the wire — same carry-forward story as S3.secret_key. */
+		account_key?: string;
+	  };
 
 export interface RetentionPolicy {
 	keep_last: number | null;
