@@ -136,7 +136,9 @@
 		}
 	}
 
-	// Edit
+	// Edit — target type + per-variant fields are siblings to the
+	// create-form state. Distinct prefix so a wholesale rename to
+	// shared helpers stays possible later if create + edit converge.
 	let editId: string | null = $state(null);
 	let editName = $state('');
 	let editSources = $state('');
@@ -147,30 +149,142 @@
 	let editKeepWeekly = $state('');
 	let editKeepMonthly = $state('');
 	let editKeepYearly = $state('');
+	let editTargetType: 'local' | 's3' | 'sftp' | 'rest' | 'b2' = $state('local');
+	let editLocalPath = $state('');
+	let editS3Endpoint = $state(''); let editS3Region = $state(''); let editS3Bucket = $state(''); let editS3Key = $state(''); let editS3Secret = $state('');
+	let editSftpHost = $state(''); let editSftpUser = $state(''); let editSftpPath = $state(''); let editSftpPort = $state('');
+	let editRestUrl = $state('');
+	let editB2Bucket = $state(''); let editB2Id = $state(''); let editB2Key = $state('');
+	/** Snapshot of the target shape at startEdit time, used to detect
+	 * "operator changed the destination" so we can warn + reset
+	 * repo_initialized. Compared as JSON strings — order-insensitive
+	 * field changes are rare enough to ignore. */
+	let editOriginalTargetJson = '';
 
 	function startEdit(p: BackupProfile) {
 		editId = p.id;
 		editName = p.name;
 		editSources = p.sources.join(', ');
 		editSchedule = p.schedule ?? '';
-		editPassword = p.password;
+		// p.password comes back redacted as "***" or null; leave the
+		// field empty and treat "operator typed nothing" as "keep
+		// existing" at save time. Same applies to S3 / B2 secrets.
+		editPassword = '';
 		editKeepLast = (p.retention.keep_last ?? '').toString();
 		editKeepDaily = (p.retention.keep_daily ?? '').toString();
 		editKeepWeekly = (p.retention.keep_weekly ?? '').toString();
 		editKeepMonthly = (p.retention.keep_monthly ?? '').toString();
 		editKeepYearly = (p.retention.keep_yearly ?? '').toString();
+		// Populate target-type fields from the existing target. Anything
+		// secret comes back as "***" or null; leave it blank.
+		editTargetType = p.target.type;
+		editLocalPath = '';
+		editS3Endpoint = ''; editS3Region = ''; editS3Bucket = ''; editS3Key = ''; editS3Secret = '';
+		editSftpHost = ''; editSftpUser = ''; editSftpPath = ''; editSftpPort = '';
+		editRestUrl = '';
+		editB2Bucket = ''; editB2Id = ''; editB2Key = '';
+		switch (p.target.type) {
+			case 'local':
+				editLocalPath = p.target.path;
+				break;
+			case 's3':
+				editS3Endpoint = p.target.endpoint;
+				editS3Region = p.target.region ?? '';
+				editS3Bucket = p.target.bucket;
+				editS3Key = p.target.access_key;
+				break;
+			case 'sftp':
+				editSftpHost = p.target.host;
+				editSftpUser = p.target.user;
+				editSftpPath = p.target.path;
+				editSftpPort = (p.target.port ?? '').toString();
+				break;
+			case 'rest':
+				editRestUrl = p.target.url;
+				break;
+			case 'b2':
+				editB2Bucket = p.target.bucket;
+				editB2Id = p.target.account_id;
+				break;
+		}
+		editOriginalTargetJson = JSON.stringify(p.target);
+	}
+
+	/** Reconstruct the BackupTarget JSON from the edit-form fields,
+	 * carrying forward redacted secret fields by omitting them — the
+	 * backend's carry_forward_existing_secrets re-attaches the existing
+	 * encrypted blob when the update body has neither plaintext nor
+	 * encrypted set. */
+	function buildEditedTarget(): BackupProfile['target'] {
+		switch (editTargetType) {
+			case 'local':
+				return { type: 'local', path: editLocalPath };
+			case 's3': {
+				const t: BackupProfile['target'] = {
+					type: 's3',
+					endpoint: editS3Endpoint,
+					bucket: editS3Bucket,
+					access_key: editS3Key,
+					region: editS3Region || null,
+				} as BackupProfile['target'];
+				if (editS3Secret) (t as { secret_key: string }).secret_key = editS3Secret;
+				return t;
+			}
+			case 'sftp':
+				return {
+					type: 'sftp',
+					host: editSftpHost,
+					user: editSftpUser,
+					path: editSftpPath,
+					port: editSftpPort ? parseInt(editSftpPort) : null,
+				} as BackupProfile['target'];
+			case 'rest':
+				return { type: 'rest', url: editRestUrl };
+			case 'b2': {
+				const t: BackupProfile['target'] = {
+					type: 'b2',
+					bucket: editB2Bucket,
+					account_id: editB2Id,
+				} as BackupProfile['target'];
+				if (editB2Key) (t as { account_key: string }).account_key = editB2Key;
+				return t;
+			}
+		}
 	}
 
 	async function saveEdit() {
 		if (!editId) return;
 		const profile = profiles.find(p => p.id === editId);
 		if (!profile) return;
-		const updated = {
-			...profile,
+
+		const newTarget = buildEditedTarget();
+		const targetChanged = JSON.stringify(newTarget) !== editOriginalTargetJson;
+
+		// Pointing the profile at a different destination means the
+		// previously-initialized rustic repo is on the old target;
+		// the new target is empty. Warn the operator and reset
+		// repo_initialized so the WebUI shows "Init Repo" + the
+		// scheduler / Run Now path auto-inits on next use.
+		if (targetChanged && profile.repo_initialized) {
+			const ok = await confirm(
+				'Change backup target?',
+				'The repository at the OLD target stays where it is — this engine no longer knows about it. The NEW target will need to be initialized before the next backup runs (the Init Repo button will appear after save).',
+			);
+			if (!ok) return;
+		}
+
+		// Build the update payload without the (potentially redacted
+		// "***") password from the existing profile — only re-include
+		// password if the operator typed a new value. Same logic the
+		// backend carry_forward_existing_secrets relies on: payload
+		// omitting both `password` and `password_encrypted` ⇒ keep
+		// what's already on disk.
+		const { password: _drop, ...profileWithoutPassword } = profile;
+		const updated: BackupProfile = {
+			...profileWithoutPassword,
 			name: editName,
 			sources: editSources.split(',').map(s => s.trim()).filter(Boolean),
 			schedule: editSchedule || null,
-			password: editPassword,
 			retention: {
 				keep_last: parseInt(editKeepLast) || null,
 				keep_daily: parseInt(editKeepDaily) || null,
@@ -178,7 +292,19 @@
 				keep_monthly: parseInt(editKeepMonthly) || null,
 				keep_yearly: parseInt(editKeepYearly) || null,
 			},
+			target: newTarget,
 		};
+		if (editPassword) {
+			updated.password = editPassword;
+		}
+
+		// When the target changed, force a fresh init on the new
+		// destination. Operator clicks Init Repo (or first scheduled
+		// run auto-inits) to set up the rustic repo there.
+		if (targetChanged) {
+			updated.repo_initialized = false;
+		}
+
 		await withToast(
 			() => client.call('backup.profile.update', updated),
 			'Profile updated'
@@ -689,6 +815,57 @@
 										</div>
 									</div>
 								</div>
+
+								<div>
+									<Label>Target</Label>
+									<div class="mt-1 flex w-fit rounded-md border border-border text-xs">
+										{#each ['local', 's3', 'sftp', 'rest', 'b2'] as t}
+											<button onclick={() => editTargetType = t as typeof editTargetType}
+												class="px-3 py-1.5 font-medium transition-colors first:rounded-l-md last:rounded-r-md {editTargetType === t ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'}"
+											>{t.toUpperCase()}</button>
+										{/each}
+									</div>
+									{#if profile.repo_initialized}
+										<p class="mt-1 text-xs text-muted-foreground">Repository is already initialized at the current target. Changing the destination here will require a fresh Init Repo on the new target.</p>
+									{/if}
+								</div>
+
+								{#if editTargetType === 'local'}
+									<div>
+										<Label for="ed-local-path">Path</Label>
+										<Input id="ed-local-path" bind:value={editLocalPath} placeholder="/fs/first/backups" class="mt-1 font-mono" />
+									</div>
+								{:else if editTargetType === 's3'}
+									<div class="grid grid-cols-2 gap-3">
+										<div><Label for="ed-s3-ep">Endpoint</Label><Input id="ed-s3-ep" bind:value={editS3Endpoint} placeholder="s3.amazonaws.com" class="mt-1 font-mono" /></div>
+										<div><Label for="ed-s3-rg">Region</Label><Input id="ed-s3-rg" bind:value={editS3Region} placeholder="us-east-1" class="mt-1 font-mono" /></div>
+										<div><Label for="ed-s3-bk">Bucket</Label><Input id="ed-s3-bk" bind:value={editS3Bucket} placeholder="my-backups" class="mt-1 font-mono" /></div>
+										<div><Label for="ed-s3-key">Access Key</Label><Input id="ed-s3-key" bind:value={editS3Key} class="mt-1 font-mono" /></div>
+										<div class="col-span-2">
+											<Label for="ed-s3-sec">Secret Key</Label>
+											<Input id="ed-s3-sec" type="password" bind:value={editS3Secret} placeholder="Leave blank to keep existing" class="mt-1 font-mono" />
+										</div>
+									</div>
+								{:else if editTargetType === 'sftp'}
+									<div class="grid grid-cols-4 gap-3">
+										<div><Label for="ed-sftp-h">Host</Label><Input id="ed-sftp-h" bind:value={editSftpHost} placeholder="backup.example.com" class="mt-1 font-mono" /></div>
+										<div><Label for="ed-sftp-port">Port</Label><Input id="ed-sftp-port" type="number" bind:value={editSftpPort} placeholder="22" class="mt-1 font-mono" /></div>
+										<div><Label for="ed-sftp-u">User</Label><Input id="ed-sftp-u" bind:value={editSftpUser} placeholder="backup" class="mt-1 font-mono" /></div>
+										<div><Label for="ed-sftp-p">Path</Label><Input id="ed-sftp-p" bind:value={editSftpPath} placeholder="/backups/nasty" class="mt-1 font-mono" /></div>
+									</div>
+								{:else if editTargetType === 'rest'}
+									<div><Label for="ed-rest">REST URL</Label><Input id="ed-rest" bind:value={editRestUrl} placeholder="https://rest-server:8000/nasty" class="mt-1 font-mono" /></div>
+								{:else if editTargetType === 'b2'}
+									<div class="grid grid-cols-3 gap-3">
+										<div><Label for="ed-b2-bk">Bucket</Label><Input id="ed-b2-bk" bind:value={editB2Bucket} class="mt-1 font-mono" /></div>
+										<div><Label for="ed-b2-id">Account ID</Label><Input id="ed-b2-id" bind:value={editB2Id} class="mt-1 font-mono" /></div>
+										<div>
+											<Label for="ed-b2-key">Account Key</Label>
+											<Input id="ed-b2-key" type="password" bind:value={editB2Key} placeholder="Leave blank to keep existing" class="mt-1 font-mono" />
+										</div>
+									</div>
+								{/if}
+
 								<div class="grid grid-cols-2 gap-3">
 									<div>
 										<Label>Schedule (cron)</Label>
@@ -696,7 +873,7 @@
 									</div>
 									<div>
 										<Label>Encryption Password</Label>
-										<Input type="password" bind:value={editPassword} class="mt-1" />
+										<Input type="password" bind:value={editPassword} placeholder="Leave blank to keep existing" class="mt-1" />
 									</div>
 								</div>
 								<div>
