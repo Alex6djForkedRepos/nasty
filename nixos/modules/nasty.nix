@@ -640,6 +640,22 @@ in {
     systemd.services.docker.wantedBy = lib.mkForce [];
     systemd.sockets.docker.wantedBy = lib.mkForce [];
 
+    # Refuse to start dockerd while its data-root symlink doesn't resolve
+    # (#424). The engine symlinks /var/lib/docker onto the apps bcachefs
+    # filesystem; when that FS isn't mounted/unlocked at boot the symlink
+    # dangles, and dockerd's startup mkdir fails with "mkdir
+    # /var/lib/docker: file exists", crash-loops into start-limit-hit, and
+    # wedges the apps UI. The engine's restore() already guards the path
+    # *it* drives, but docker.service is TriggeredBy=docker.socket — so a
+    # client connecting to the still-listening socket socket-activates
+    # dockerd behind the engine's back. A `Condition` (skip, not assert)
+    # covers every trigger path: a dangling symlink makes the unit skip
+    # cleanly with no restart counter, while a resolving symlink (the
+    # normal case, where the engine created it before starting docker)
+    # passes. ConditionPathIsDirectory follows the symlink, so it's false
+    # exactly when the target is missing.
+    systemd.services.docker.unitConfig.ConditionPathIsDirectory = "/var/lib/docker";
+
     # ── System packages ────────────────────────────────────────
 
     environment.systemPackages = with pkgs; [

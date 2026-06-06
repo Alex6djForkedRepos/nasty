@@ -3513,6 +3513,14 @@ impl AppsService {
         // enable path runs configure_docker_data_root first; this boot path
         // did not — so guard it here and surface the cause instead of
         // looping into start-limit-hit.
+        //
+        // This guard only covers the start *we* drive. docker.service is
+        // TriggeredBy=docker.socket, so a client connecting to the socket
+        // can socket-activate dockerd behind our back — that path is
+        // backstopped by `ConditionPathIsDirectory=/var/lib/docker` on
+        // docker.service (nixos/modules/nasty.nix), which skips the unit
+        // cleanly when the symlink dangles. This log line is the operator-
+        // facing half: it explains *why* (filesystem not mounted/unlocked).
         if let Err(target) = docker_data_root_status(Path::new("/var/lib/docker")) {
             error!(
                 "Apps enabled but Docker data-root /var/lib/docker -> {target} does not resolve \
