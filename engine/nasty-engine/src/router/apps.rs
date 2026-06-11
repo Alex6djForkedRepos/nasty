@@ -84,6 +84,10 @@ pub(super) async fn try_route(
             Ok(p) => ok(req, state.apps.check_volumes(p).await),
             Err(e) => invalid(req, e),
         },
+        "apps.check_compose" => match parse_params(req) {
+            Ok(p) => ok(req, state.apps.check_compose(p).await),
+            Err(e) => invalid(req, e),
+        },
         "apps.fix_volume_perms" => match parse_params(req) {
             Ok(p) => match state.apps.fix_volume_perms(p).await {
                 Ok(()) => ok(req, serde_json::json!({"ok": true})),

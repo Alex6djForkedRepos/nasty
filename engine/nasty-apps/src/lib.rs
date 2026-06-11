@@ -562,6 +562,44 @@ pub fn extract_compose_binds(yaml: &str) -> Vec<ComposeBind> {
     binds
 }
 
+/// Parse `docker compose config` stderr into per-line diagnostics
+/// (#439). Strips the temp-file path (meaningless to the user) and
+/// extracts `line N` references where the YAML layer names one.
+/// Warning noise from the compose CLI is dropped — only the failure
+/// text survives. Pure; unit-tested.
+fn parse_compose_diagnostics(stderr: &str, tmp_path: &str) -> Vec<ComposeDiagnostic> {
+    let mut out = Vec::new();
+    for raw in stderr.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Progress/warning chatter ("WARN[0000] the attribute `version`
+        // is obsolete", `level=warning msg=…`), not validation findings.
+        if line.starts_with("WARN") || line.contains("level=warning") {
+            continue;
+        }
+        let message = line.replace(tmp_path, "docker-compose.yml");
+        out.push(ComposeDiagnostic {
+            line: extract_line_number(&message),
+            message,
+        });
+    }
+    out
+}
+
+/// Find a 1-based `line <N>` reference in a yaml error message
+/// ("yaml: line 9: did not find expected key", "  line 4: cannot
+/// unmarshal …"). go-yaml and serde_yaml both report 1-based lines.
+fn extract_line_number(msg: &str) -> Option<u32> {
+    let pos = msg.find("line ")?;
+    let digits: String = msg[pos + 5..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 /// Best-effort 1-based line number of the first occurrence of `needle`
 /// in `haystack`. Used to underline the offending volume entry in the
 /// compose editor.
@@ -1621,6 +1659,38 @@ pub struct CheckVolumesRequest {
     /// server can correlate sources with their owning service's `user:`
     /// field — that's the comparison we make.
     pub compose: String,
+}
+
+// ── Compose lint types (#439) ─────────────────────────────────
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckComposeRequest {
+    /// Full docker-compose YAML text, as it sits in the editor.
+    pub compose: String,
+}
+
+/// One validation finding from `apps.check_compose`.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ComposeDiagnostic {
+    /// 1-based line in the compose text, when the validator names one.
+    /// Schema-level findings (e.g. an unknown property) often don't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub message: String,
+}
+
+/// Result of `apps.check_compose` — the same validation deploy runs,
+/// surfaced live so the editor can underline problems before the user
+/// commits to a deploy.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CheckComposeResult {
+    /// False when schema validation couldn't run (docker compose not
+    /// on PATH — apps disabled, or a stripped-down box). YAML syntax is
+    /// still checked in-process; the UI shouldn't claim "fully valid"
+    /// when this is false.
+    pub schema_checked: bool,
+    pub valid: bool,
+    pub diagnostics: Vec<ComposeDiagnostic>,
 }
 
 /// One bind-mount whose host owner doesn't match what the container
@@ -4546,6 +4616,101 @@ impl AppsService {
 
     // ── Compose validation ──────────────────────────────────
 
+    /// Live-lint a compose file for the editor (#439). Two stages:
+    ///
+    /// 1. In-process YAML parse (`serde_yaml_ng`) — catches the
+    ///    syntax/indentation class of error with a precise line number,
+    ///    without spawning anything. Most keystrokes that break a file
+    ///    break it here.
+    /// 2. `docker compose config --quiet` against a temp copy — the
+    ///    exact validator [`Self::validate_compose`] runs at deploy
+    ///    time, so the live lint can't drift from what deploy enforces.
+    ///    Skipped (with `schema_checked: false`) when the YAML doesn't
+    ///    parse or the docker CLI isn't available.
+    pub async fn check_compose(&self, req: CheckComposeRequest) -> CheckComposeResult {
+        if req.compose.trim().is_empty() {
+            return CheckComposeResult {
+                schema_checked: false,
+                valid: true,
+                diagnostics: Vec::new(),
+            };
+        }
+
+        // Stage 1: YAML syntax.
+        if let Err(e) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&req.compose) {
+            return CheckComposeResult {
+                schema_checked: false,
+                valid: false,
+                diagnostics: vec![ComposeDiagnostic {
+                    line: e.location().map(|l| l.line() as u32),
+                    message: format!("YAML syntax: {e}"),
+                }],
+            };
+        }
+
+        // Stage 2: compose schema, via the deploy-time validator. An
+        // isolated temp dir keeps `docker compose` from picking up a
+        // stray `.env` and keeps concurrent checks from colliding.
+        let tmp = match tempfile::tempdir() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("check_compose: tempdir failed: {e} — skipping schema check");
+                return CheckComposeResult {
+                    schema_checked: false,
+                    valid: true,
+                    diagnostics: Vec::new(),
+                };
+            }
+        };
+        let file_path = tmp.path().join("docker-compose.yml");
+        if let Err(e) = tokio::fs::write(&file_path, &req.compose).await {
+            warn!("check_compose: temp write failed: {e} — skipping schema check");
+            return CheckComposeResult {
+                schema_checked: false,
+                valid: true,
+                diagnostics: Vec::new(),
+            };
+        }
+
+        let output = Command::new("docker")
+            .args([
+                "compose",
+                "-f",
+                &file_path.to_string_lossy(),
+                "config",
+                "--quiet",
+            ])
+            .output()
+            .await;
+        match output {
+            Ok(out) if out.status.success() => CheckComposeResult {
+                schema_checked: true,
+                valid: true,
+                diagnostics: Vec::new(),
+            },
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let diagnostics = parse_compose_diagnostics(&stderr, &file_path.to_string_lossy());
+                CheckComposeResult {
+                    schema_checked: true,
+                    // A non-zero exit with all-noise stderr still means invalid.
+                    valid: false,
+                    diagnostics,
+                }
+            }
+            Err(e) => {
+                // docker CLI not present (apps disabled) — YAML stage
+                // already passed, report that much honestly.
+                info!("check_compose: docker unavailable ({e}) — YAML-only check");
+                CheckComposeResult {
+                    schema_checked: false,
+                    valid: true,
+                    diagnostics: Vec::new(),
+                }
+            }
+        }
+    }
+
     async fn validate_compose(compose_file_path: &str) -> Result<(), AppsError> {
         let output = Command::new("docker")
             .args(["compose", "-f", compose_file_path, "config", "--quiet"])
@@ -5502,7 +5667,8 @@ mod tests {
     }
 
     use super::{
-        AppsService, CheckDevicesRequest, CheckVolumesRequest, extract_compose_binds,
+        AppsService, CheckComposeRequest, CheckDevicesRequest, CheckVolumesRequest,
+        extract_compose_binds, extract_line_number, parse_compose_diagnostics,
         validate_chown_target,
     };
 
@@ -5741,6 +5907,83 @@ services:
             e.contains("this-filesystem-does-not-exist-nasty-test"),
             "error should name the missing fs: {e}",
         );
+    }
+
+    // ── compose lint (#439) ────────────────────────────────────
+
+    #[test]
+    fn parse_compose_diagnostics_extracts_yaml_line() {
+        let d = parse_compose_diagnostics("yaml: line 9: did not find expected key\n", "/tmp/x");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].line, Some(9));
+        assert!(d[0].message.contains("did not find expected key"));
+    }
+
+    #[test]
+    fn parse_compose_diagnostics_strips_temp_path() {
+        let stderr = "validating /tmp/.tmpAb12/docker-compose.yml: services.web Additional property foo is not allowed\n";
+        let d = parse_compose_diagnostics(stderr, "/tmp/.tmpAb12/docker-compose.yml");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].line, None);
+        assert!(
+            d[0].message.starts_with("validating docker-compose.yml:"),
+            "temp path should be replaced: {}",
+            d[0].message
+        );
+    }
+
+    #[test]
+    fn parse_compose_diagnostics_drops_warning_noise() {
+        let stderr = "WARN[0000] the attribute `version` is obsolete\n\
+                      time=\"x\" level=warning msg=\"foo\"\n\
+                      yaml: line 3: mapping values are not allowed in this context\n";
+        let d = parse_compose_diagnostics(stderr, "/tmp/x");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].line, Some(3));
+    }
+
+    #[test]
+    fn parse_compose_diagnostics_handles_unmarshal_block() {
+        let stderr = "yaml: unmarshal errors:\n  line 4: cannot unmarshal !!str `80` into int\n";
+        let d = parse_compose_diagnostics(stderr, "/tmp/x");
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].line, None);
+        assert_eq!(d[1].line, Some(4));
+    }
+
+    #[test]
+    fn extract_line_number_ignores_non_numeric() {
+        assert_eq!(extract_line_number("a line of text"), None);
+        assert_eq!(extract_line_number("no reference at all"), None);
+    }
+
+    /// Broken indentation is caught by the in-process YAML stage with a
+    /// line number — no docker spawn involved, so this is CI-safe.
+    #[tokio::test]
+    async fn check_compose_flags_yaml_syntax_with_line() {
+        let svc = AppsService::new();
+        let r = svc
+            .check_compose(CheckComposeRequest {
+                compose: "services:\n  app:\n   image: foo\n  bad indent: [\n".to_string(),
+            })
+            .await;
+        assert!(!r.valid);
+        assert!(!r.schema_checked);
+        assert_eq!(r.diagnostics.len(), 1);
+        assert!(r.diagnostics[0].line.is_some(), "got {:?}", r.diagnostics);
+        assert!(r.diagnostics[0].message.starts_with("YAML syntax:"));
+    }
+
+    #[tokio::test]
+    async fn check_compose_empty_input_is_quietly_valid() {
+        let svc = AppsService::new();
+        let r = svc
+            .check_compose(CheckComposeRequest {
+                compose: "   \n".to_string(),
+            })
+            .await;
+        assert!(r.valid);
+        assert!(r.diagnostics.is_empty());
     }
 
     #[tokio::test]

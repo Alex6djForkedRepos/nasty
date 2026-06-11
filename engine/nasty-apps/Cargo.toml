@@ -16,5 +16,6 @@ schemars.workspace = true
 reqwest.workspace = true
 bollard = "0.21"
 serde_yaml_ng = "0.10"
+tempfile = "3"
 futures-util.workspace = true
 libc.workspace = true

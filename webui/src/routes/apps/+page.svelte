@@ -539,8 +539,25 @@
 		return out;
 	}
 
-	// Editor underlines port-conflict, missing-device, and existing-but-wrong-owner lines.
+	// ── Live compose lint (#439): YAML syntax + compose schema, checked
+	// server-side with the same `docker compose config` deploy runs, so
+	// the editor can't approve something deploy would reject. ──
+	type ComposeDiagnostic = { line?: number | null; message: string };
+	type CheckComposeResult = {
+		schema_checked: boolean;
+		valid: boolean;
+		diagnostics: ComposeDiagnostic[];
+	};
+	let composeLint = $state<CheckComposeResult | null>(null);
+	let composeLintTimer: ReturnType<typeof setTimeout> | null = null;
+	let composeLintErrorLines = $derived(
+		(composeLint?.diagnostics ?? []).filter(d => d.line != null).map(d => d.line as number)
+	);
+
+	// Editor underlines syntax/schema, port-conflict, missing-device,
+	// and existing-but-wrong-owner lines.
 	const composeErrorLines = $derived([
+		...composeLintErrorLines,
 		...composePortErrorLines,
 		...composeDeviceErrorLines,
 		...composeVolumeErrorLines,
@@ -670,6 +687,18 @@
 		checkComposePortConflicts();
 		checkComposeDeviceConflicts();
 		checkComposeVolumePerms();
+		scheduleComposeLint();
+	}
+
+	function scheduleComposeLint() {
+		// Schema validation spawns `docker compose config` server-side —
+		// debounce so we lint typing pauses, not every keystroke.
+		if (composeLintTimer) clearTimeout(composeLintTimer);
+		composeLintTimer = setTimeout(() => {
+			client.call<CheckComposeResult>('apps.check_compose', { compose: composeContent })
+				.then(r => { composeLint = r; })
+				.catch(() => { composeLint = null; });
+		}, 500);
 	}
 
 	function checkComposeVolumePerms() {
@@ -1384,6 +1413,8 @@
 		composeDeviceErrorLines = [];
 		composeDeviceLineMap = new Map();
 		volumeMismatches = [];
+		composeLint = null;
+		if (composeLintTimer) { clearTimeout(composeLintTimer); composeLintTimer = null; }
 		composeTcpPorts = [];
 		newIngressPort = null;
 		composeName = ''; composeContent = ''; composeTried = false;
@@ -1985,6 +2016,19 @@
 								oninput={checkComposeConflicts}
 								class="mt-1 h-96 {composeContentMissing ? 'ring-1 ring-amber-500/50 rounded-md' : ''}"
 							/>
+							{#if composeLint && !composeLint.valid}
+								<div class="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-400">
+									<p class="mb-1 font-medium">Compose file is not valid — deploy will fail with this content.</p>
+									{#each composeLint.diagnostics as d}
+										<div class="font-mono">
+											{#if d.line != null}<span class="font-semibold">Line {d.line}:</span>{/if}
+											{d.message}
+										</div>
+									{/each}
+								</div>
+							{:else if composeLint?.valid && composeLint.schema_checked && composeContent.trim()}
+								<p class="mt-1 text-xs text-green-600">✓ Valid compose file</p>
+							{/if}
 						</div>
 						<!-- Allow unsafe — opt out of strict compose sandbox -->
 						<div class="mb-4 rounded-md border border-border p-3">
