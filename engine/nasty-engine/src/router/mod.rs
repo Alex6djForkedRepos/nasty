@@ -248,6 +248,7 @@ fn is_read_only(method: &str) -> bool {
                 | "apps.check_ports"
                 | "apps.check_devices"
                 | "apps.check_volumes"
+                | "apps.check_compose"
                 | "apps.status"
                 // Live CPU / mem / network stats per container.
                 // Pure read; the WebUI polls it from the Apps page

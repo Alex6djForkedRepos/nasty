@@ -10,10 +10,11 @@ use crate::auth::{ApiToken, ApiTokenInfo, Role, Session, UserInfo};
 use crate::fs_dependents::FsDependents;
 use crate::subvolume_dependents::SubvolumeDependents;
 use nasty_apps::{
-    App, AppConfig, AppIngress, AppStats, AppsStatus, CaddyRouteSummary, CheckDevicesRequest,
-    CheckPortsRequest, CheckVolumesRequest, DeviceMissing, EnableAppsRequest,
-    FixVolumePermsRequest, ImageInspectResult, InstallAppRequest, InstallComposeRequest,
-    ManagedNetwork, NetworkSummary, PortConflict, PruneResult, SetIngressRequest, VolumeMismatch,
+    App, AppConfig, AppIngress, AppStats, AppsStatus, CaddyRouteSummary, CheckComposeRequest,
+    CheckComposeResult, CheckDevicesRequest, CheckPortsRequest, CheckVolumesRequest, DeviceMissing,
+    EnableAppsRequest, FixVolumePermsRequest, ImageInspectResult, InstallAppRequest,
+    InstallComposeRequest, ManagedNetwork, NetworkSummary, PortConflict, PruneResult,
+    SetIngressRequest, VolumeMismatch,
 };
 use nasty_backup::{BackupProfile, BackupSnapshot, BackupStatus};
 use nasty_sharing::iscsi::{
@@ -2462,6 +2463,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Any,
                     params: MethodParams::Schema(gen_schema::<CheckVolumesRequest>(generator)),
                     result: Some(gen_schema::<Vec<VolumeMismatch>>(generator)),
+                },
+                Method {
+                    name: "apps.check_compose",
+                    desc: "Validate a docker-compose YAML the way deploy will: in-process YAML syntax check, then `docker compose config` schema validation, returning per-line diagnostics for the editor to underline.",
+                    role: MethodRole::Any,
+                    params: MethodParams::Schema(gen_schema::<CheckComposeRequest>(generator)),
+                    result: Some(gen_schema::<CheckComposeResult>(generator)),
                 },
                 Method {
                     name: "apps.enable",
