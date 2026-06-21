@@ -11,7 +11,7 @@
 	import ReconnectSpinner from '$lib/components/ReconnectSpinner.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type { AuthResult } from '$lib/rpc';
-	import type { BootStatus, BootPhase } from '$lib/types';
+	import type { BootStatus, BootPhase, SystemStatus } from '$lib/types';
 	import favicon from '$lib/assets/favicon.svg';
 	import logoLight from '$lib/assets/nasty.svg';
 	import logoDark from '$lib/assets/nasty-white.svg';
@@ -365,8 +365,39 @@
 		}
 	}
 
+	// Persistent sidebar status band (#528): poll the aggregated system status
+	// (level + headline + in-progress array operations). Null = hide the band
+	// (e.g. older engine without the RPC), so it degrades gracefully.
+	let systemStatus = $state<SystemStatus | null>(null);
+	let statusExpanded = $state(false);
+	// Literal Tailwind classes (purge-safe) chosen by level — green Healthy /
+	// amber Activity / red Critical, per #528.
+	const statusDot = $derived(
+		systemStatus?.level === 'critical' ? 'bg-red-500'
+		: systemStatus?.level === 'activity' ? 'bg-amber-500'
+		: 'bg-green-500'
+	);
+	const statusText = $derived(
+		systemStatus?.level === 'critical' ? 'text-red-400'
+		: systemStatus?.level === 'activity' ? 'text-amber-400'
+		: 'text-green-400'
+	);
+	const statusHasDetail = $derived(
+		!!systemStatus && (systemStatus.operations.length > 0
+			|| systemStatus.critical_count + systemStatus.warning_count > 0)
+	);
+	function refreshSystemStatus() {
+		if (!connected || document.hidden) return;
+		getClient().call<SystemStatus>('system.status')
+			.then((s) => { systemStatus = s; })
+			.catch(() => {});
+	}
+
 	$effect(() => {
 		if (connected) checkRebootRequired();
+	});
+	$effect(() => {
+		if (connected) refreshSystemStatus();
 	});
 
 	// Recover any pending rollback the server is tracking — covers the
@@ -447,6 +478,7 @@
 		getClient().onDisconnect(onDisconnect);
 		const tick = setInterval(() => { now = new Date(); }, 1000);
 		const rebootPoll = setInterval(checkRebootRequired, 30_000);
+		const statusPoll = setInterval(refreshSystemStatus, 20_000);
 		const authPoll = setInterval(checkAuth, 60_000);
 		const sshPoll = setInterval(checkSshStatus, 30_000);
 		const backupPoll = setInterval(checkConfigBackup, 30_000);
@@ -459,6 +491,7 @@
 			clearInterval(backupPoll);
 			clearInterval(tick);
 			clearInterval(rebootPoll);
+			clearInterval(statusPoll);
 			clearInterval(authPoll);
 		};
 	});
@@ -909,6 +942,40 @@
 						<PanelLeftClose size={15} />
 					</button>
 				</div>
+			{/if}
+
+			<!-- System status band (#528): always-visible health / activity / critical -->
+			{#if systemStatus}
+				{#if sidebarCollapsed}
+					<div class="shrink-0 border-b border-border flex items-center justify-center py-2.5" title={systemStatus.headline}>
+						<span class="h-2.5 w-2.5 rounded-full {statusDot}"></span>
+					</div>
+				{:else}
+					<div class="shrink-0 border-b border-border px-2 py-1.5">
+						<button
+							class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors {statusHasDetail ? 'cursor-pointer hover:bg-accent/50' : 'cursor-default'}"
+							onclick={() => { if (statusHasDetail) statusExpanded = !statusExpanded; }}
+						>
+							<span class="h-2 w-2 shrink-0 rounded-full {statusDot}"></span>
+							<span class="min-w-0 flex-1 truncate font-medium {statusText}">{systemStatus.headline}</span>
+							{#if statusHasDetail}
+								<span class="shrink-0 text-muted-foreground/60">{statusExpanded ? '−' : '+'}</span>
+							{/if}
+						</button>
+						{#if statusExpanded && statusHasDetail}
+							<div class="mt-1 space-y-1 px-2 pb-1 text-[0.7rem] text-muted-foreground">
+								{#each systemStatus.operations as op}
+									<a href="/filesystems" class="block truncate hover:text-foreground">• {op.detail}</a>
+								{/each}
+								{#if systemStatus.critical_count + systemStatus.warning_count > 0}
+									<a href="/alerts" class="block hover:text-foreground">
+										{systemStatus.critical_count} critical · {systemStatus.warning_count} warning
+									</a>
+								{/if}
+							</div>
+						{/if}
+					</div>
+				{/if}
 			{/if}
 
 			<!-- Search bar -->

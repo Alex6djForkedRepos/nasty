@@ -87,6 +87,10 @@ pub struct AppState {
     /// Cached alerts result (timestamp, json value). Avoids re-evaluating
     /// all alert checks on every WebUI poll (called every few seconds).
     pub alerts_cache: tokio::sync::Mutex<Option<(std::time::Instant, serde_json::Value)>>,
+    /// Short-TTL cache for the aggregated `system.status` band (#528) — the
+    /// sidebar polls it frequently and each miss re-scans per-fs scrub /
+    /// reconcile / device state.
+    pub status_cache: tokio::sync::Mutex<Option<(std::time::Instant, nasty_system::SystemStatus)>>,
     /// Boot-time per-phase status. Populated by main()'s restoration
     /// sequence; read by `/api/boot_status` so the WebUI can render
     /// a TrueNAS-style "starting up" overlay on the login screen
@@ -224,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         backups: nasty_backup::BackupService::new(),
         firmware: nasty_system::firmware::FirmwareService::new(),
         alerts_cache: tokio::sync::Mutex::new(None),
+        status_cache: tokio::sync::Mutex::new(None),
         // Pre-register every phase name we'll feed into `run_phase`
         // below. Pre-registering makes the WebUI's checklist fully
         // visible from the moment the engine starts answering

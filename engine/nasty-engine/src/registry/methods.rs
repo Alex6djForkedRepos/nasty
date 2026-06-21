@@ -64,7 +64,7 @@ use nasty_system::update::{
     Generation, ReleaseChannel, UpdateBuildDirConfig, UpdateInfo, UpdateStatus, VersionInfo,
     VersionSwitchRequest, VersionTaggedReleaseStatus,
 };
-use nasty_system::{DiskHealth, SystemHealth, SystemInfo, SystemStats};
+use nasty_system::{DiskHealth, SystemHealth, SystemInfo, SystemStats, SystemStatus};
 use nasty_vm::{
     CloneVmRequest, CreateVmRequest, SnapshotVmRequest, UpdateVmRequest, VmCapabilities, VmConfig,
     VmDiskSubvolume, VmStatus,
@@ -212,6 +212,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<SystemHealth>(generator)),
+                },
+                Method {
+                    name: "system.status",
+                    desc: "Aggregated system status for the sidebar band (#528): one level (healthy / activity / critical), a headline, the in-progress array operations (device evacuation, scrub, reconcile), and active alert counts. Cached ~10s.",
+                    role: MethodRole::Any,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<SystemStatus>(generator)),
                 },
                 Method {
                     name: "system.stats",

@@ -129,6 +129,81 @@ pub struct ServiceStatus {
     pub pid: Option<u32>,
 }
 
+/// A long-running array operation currently in progress (#528). Surfaced in
+/// the WebUI's persistent status band so an evacuation / scrub / reconcile is
+/// always visible while it runs.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ActiveOperation {
+    /// "evacuate" | "scrub" | "reconcile".
+    pub kind: String,
+    /// Filesystem the operation is running on.
+    pub fs: String,
+    /// Device path for an evacuation; `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Progress 0–100 when known (scrub); `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_percent: Option<f32>,
+    /// Short operator-facing line, e.g. "Evacuating sdc" or "Scrub 42%".
+    pub detail: String,
+}
+
+/// Aggregated system status for the sidebar band (#528): one colored level
+/// plus a headline and the in-progress operations and alert counts behind it.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct SystemStatus {
+    /// "healthy" (green) | "activity" (amber) | "critical" (red).
+    pub level: String,
+    /// One-line summary shown in the band.
+    pub headline: String,
+    /// Array operations currently running.
+    pub operations: Vec<ActiveOperation>,
+    /// Number of active critical alerts.
+    pub critical_count: u32,
+    /// Number of active warning alerts.
+    pub warning_count: u32,
+}
+
+impl SystemStatus {
+    /// Build the band state from the gathered inputs. Pure (no I/O) so the
+    /// level/headline precedence is unit-testable:
+    /// critical alert → reconcile/scrub/evacuate activity → warning → healthy.
+    pub fn from_parts(
+        critical_count: u32,
+        warning_count: u32,
+        top_critical: Option<String>,
+        top_warning: Option<String>,
+        operations: Vec<ActiveOperation>,
+    ) -> Self {
+        let (level, headline) = if critical_count > 0 {
+            (
+                "critical",
+                top_critical.unwrap_or_else(|| "Attention needed".to_string()),
+            )
+        } else if !operations.is_empty() {
+            let mut h = operations[0].detail.clone();
+            if operations.len() > 1 {
+                h.push_str(&format!(" (+{} more)", operations.len() - 1));
+            }
+            ("activity", h)
+        } else if warning_count > 0 {
+            (
+                "activity",
+                top_warning.unwrap_or_else(|| "Warning".to_string()),
+            )
+        } else {
+            ("healthy", "Healthy".to_string())
+        };
+        Self {
+            level: level.to_string(),
+            headline,
+            operations,
+            critical_count,
+            warning_count,
+        }
+    }
+}
+
 // SystemStats, CpuStats, MemoryStats, NetIfStats, DiskIoStats,
 // DiskHealth, SmartAttribute — now defined in nasty_common::metrics_types
 // and re-exported via `pub use` at the top of this file.
@@ -483,4 +558,60 @@ async fn read_proc_stats(pid: u32) -> (u64, f64, u64) {
     };
 
     (memory_bytes, cpu_seconds, uptime_secs)
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{ActiveOperation, SystemStatus};
+
+    fn op(detail: &str) -> ActiveOperation {
+        ActiveOperation {
+            kind: "scrub".into(),
+            fs: "tank".into(),
+            target: None,
+            progress_percent: None,
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn healthy_when_nothing_is_happening() {
+        let s = SystemStatus::from_parts(0, 0, None, None, vec![]);
+        assert_eq!(s.level, "healthy");
+        assert_eq!(s.headline, "Healthy");
+    }
+
+    #[test]
+    fn critical_alert_wins_over_activity_and_warning() {
+        let s = SystemStatus::from_parts(
+            1,
+            2,
+            Some("Filesystem degraded".into()),
+            Some("Disk 85% full".into()),
+            vec![op("Scrubbing tank")],
+        );
+        assert_eq!(s.level, "critical");
+        assert_eq!(s.headline, "Filesystem degraded");
+    }
+
+    #[test]
+    fn activity_wins_over_warning_when_no_critical() {
+        let s = SystemStatus::from_parts(
+            0,
+            1,
+            None,
+            Some("Disk 85% full".into()),
+            vec![op("Evacuating sdc"), op("Scrubbing tank")],
+        );
+        assert_eq!(s.level, "activity");
+        // First op leads, with a "+N more" suffix.
+        assert_eq!(s.headline, "Evacuating sdc (+1 more)");
+    }
+
+    #[test]
+    fn warning_shows_as_activity_when_nothing_running() {
+        let s = SystemStatus::from_parts(0, 1, None, Some("Disk 85% full".into()), vec![]);
+        assert_eq!(s.level, "activity");
+        assert_eq!(s.headline, "Disk 85% full");
+    }
 }
