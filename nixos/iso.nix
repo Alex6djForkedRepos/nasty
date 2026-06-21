@@ -119,6 +119,16 @@ in
   isoImage.makeUsbBootable = true;
   isoImage.grubTheme = nasty-grub-theme;
 
+  # Compress the squashfs with xz instead of the nixpkgs default
+  # (`zstd -Xcompression-level 19`). The store closure grew past ~2 GiB
+  # at v0.0.12 and the resulting .iso crossed GitHub's hard 2 GiB
+  # per-release-asset limit, so `gh release upload` 422'd ("size must be
+  # less than 2147483648"). xz buys ~8-12% over zstd-19 on a Nix store
+  # image — well over 100 MB of headroom — at the cost of a slightly
+  # slower installer live-boot. The *installed* appliance runs from
+  # bcachefs, not this squashfs, so runtime performance is unaffected.
+  isoImage.squashfsCompression = lib.mkForce "xz -Xdict-size 100%";
+
   environment.systemPackages = with pkgs; [
     bcachefs-tools
     parted
