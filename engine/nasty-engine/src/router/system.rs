@@ -19,6 +19,21 @@ pub(super) async fn try_route(
     Some(match req.method.as_str() {
         "system.info" => ok(req, state.system.info().await),
         "system.health" => ok(req, state.system.health().await),
+        "system.status" => {
+            // Cheap path for the sidebar band, which polls frequently: serve a
+            // cached result when it's <10s old, else rebuild and cache.
+            {
+                let cache = state.status_cache.lock().await;
+                if let Some((ts, ref cached)) = *cache
+                    && ts.elapsed() < std::time::Duration::from_secs(10)
+                {
+                    return Some(ok(req, cached.clone()));
+                }
+            }
+            let status = build_system_status(state).await;
+            *state.status_cache.lock().await = Some((std::time::Instant::now(), status.clone()));
+            ok(req, status)
+        }
         "system.hardware.iommu" => ok(req, nasty_system::hardware::iommu_groups().await),
         "system.hardware.summary" => ok(req, nasty_system::hardware::system_summary().await),
         "system.secure_boot.readiness" => ok(req, nasty_system::secure_boot::readiness().await),
@@ -717,4 +732,87 @@ pub(super) async fn try_route(
         }
         _ => return None,
     })
+}
+
+/// Aggregate the sidebar status band (#528): current alert counts (reusing the
+/// shared alert evaluation) plus a scan of every filesystem for in-progress
+/// array operations (device evacuation, running scrub, active reconcile).
+async fn build_system_status(state: &AppState) -> nasty_system::SystemStatus {
+    use nasty_system::alerts::AlertSeverity;
+
+    // Alert side: reuse the canonical evaluation, then split by severity.
+    let alerts = super::evaluate_active_alerts(state).await;
+    let mut critical_count = 0u32;
+    let mut warning_count = 0u32;
+    let mut top_critical: Option<String> = None;
+    let mut top_warning: Option<String> = None;
+    for a in &alerts {
+        match a.severity {
+            AlertSeverity::Critical => {
+                critical_count += 1;
+                top_critical.get_or_insert_with(|| a.message.clone());
+            }
+            AlertSeverity::Warning => {
+                warning_count += 1;
+                top_warning.get_or_insert_with(|| a.message.clone());
+            }
+        }
+    }
+
+    // Operation side: scan filesystems for what's actively running.
+    let mut operations: Vec<nasty_system::ActiveOperation> = Vec::new();
+    if let Ok(filesystems) = state.filesystems.list().await {
+        for fs in &filesystems {
+            // Device evacuation — bcachefs sets the member state to
+            // "evacuating" while data drains off it.
+            for dev in &fs.devices {
+                if dev.state.as_deref() == Some("evacuating") {
+                    let short = dev.path.rsplit('/').next().unwrap_or(&dev.path);
+                    operations.push(nasty_system::ActiveOperation {
+                        kind: "evacuate".to_string(),
+                        fs: fs.name.clone(),
+                        target: Some(dev.path.clone()),
+                        progress_percent: None,
+                        detail: format!("Evacuating {short}"),
+                    });
+                }
+            }
+            // Running scrub.
+            if let Ok(scrub) = state.filesystems.scrub_status(&fs.name).await
+                && scrub.running
+            {
+                let detail = match scrub.progress_percent {
+                    Some(p) => format!("Scrubbing {} ({:.0}%)", fs.name, p),
+                    None => format!("Scrubbing {}", fs.name),
+                };
+                operations.push(nasty_system::ActiveOperation {
+                    kind: "scrub".to_string(),
+                    fs: fs.name.clone(),
+                    target: None,
+                    progress_percent: scrub.progress_percent,
+                    detail,
+                });
+            }
+            // Reconcile actively working (vs idle/waiting).
+            if let Ok(rec) = state.filesystems.reconcile_status(&fs.name).await
+                && nasty_system::alerts::parse_reconcile_sample(&rec.raw).active
+            {
+                operations.push(nasty_system::ActiveOperation {
+                    kind: "reconcile".to_string(),
+                    fs: fs.name.clone(),
+                    target: None,
+                    progress_percent: None,
+                    detail: format!("Reconcile running on {}", fs.name),
+                });
+            }
+        }
+    }
+
+    nasty_system::SystemStatus::from_parts(
+        critical_count,
+        warning_count,
+        top_critical,
+        top_warning,
+        operations,
+    )
 }

@@ -66,6 +66,24 @@ export interface SystemHealth {
 	services: ServiceStatus[];
 }
 
+/** A long-running array operation in progress (#528). */
+export interface ActiveOperation {
+	kind: string; // "evacuate" | "scrub" | "reconcile"
+	fs: string;
+	target?: string | null;
+	progress_percent?: number | null;
+	detail: string;
+}
+
+/** Aggregated system status for the sidebar band (#528). */
+export interface SystemStatus {
+	level: string; // "healthy" | "activity" | "critical"
+	headline: string;
+	operations: ActiveOperation[];
+	critical_count: number;
+	warning_count: number;
+}
+
 /** One IOMMU group with its constituent PCI devices, returned by
  * `system.hardware.iommu`. The id is the kernel's group number;
  * devices are sorted by BDF. Empty list = IOMMU is off in BIOS. */
