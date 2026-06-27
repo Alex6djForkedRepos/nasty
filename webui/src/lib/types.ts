@@ -1255,11 +1255,21 @@ export interface FirewallRule {
 	active: boolean;
 }
 
+export interface PublishedAppPort {
+	app: string;
+	host_port: number;
+	container_port: number;
+	transport: string;
+}
+
 export interface FirewallStatus {
 	active: boolean;
 	rules: FirewallRule[];
 	restrictions: Record<string, string[]>;
 	interface_restrictions: Record<string, string[]>;
+	/** Host ports Docker apps publish. NOT governed by this firewall (Docker
+	 * DNATs them past the input chain) — shown read-only for visibility. */
+	published_app_ports?: PublishedAppPort[];
 }
 
 export interface AlertRule {

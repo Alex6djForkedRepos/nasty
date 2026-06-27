@@ -110,6 +110,31 @@ pub struct FirewallStatus {
     pub restrictions: HashMap<String, Vec<String>>,
     /// Per-service interface restrictions.
     pub interface_restrictions: HashMap<String, Vec<String>>,
+    /// Ports that Docker-managed apps publish on the host. These are NOT
+    /// governed by this firewall — Docker DNATs published ports in
+    /// `prerouting` straight to the container, so they bypass the `inet
+    /// nasty` input chain entirely. Listed here for visibility only, so an
+    /// operator sees the full "what's open on this box" picture in one
+    /// place; their only real gate is the upstream/cloud firewall. The
+    /// engine layer fills this from `apps.list`; the firewall module
+    /// itself has no knowledge of Docker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_app_ports: Vec<PublishedAppPort>,
+}
+
+/// One host port published by a Docker-managed app. Read-only; surfaced
+/// on the firewall page alongside the service rules. See
+/// [`FirewallStatus::published_app_ports`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PublishedAppPort {
+    /// App that published the port.
+    pub app: String,
+    /// Host-side port (bound on 0.0.0.0).
+    pub host_port: u16,
+    /// Container-side port the host port maps to.
+    pub container_port: u16,
+    /// Transport ("tcp" / "udp").
+    pub transport: String,
 }
 
 // ── Port mapping ───────────────────────────────────────────────
@@ -283,6 +308,9 @@ impl FirewallService {
             rules: state.rules.clone(),
             restrictions: restrictions.services.clone(),
             interface_restrictions: restrictions.interfaces.clone(),
+            // Populated by the engine layer (router) which has the apps
+            // handle; the firewall module has no Docker knowledge.
+            published_app_ports: Vec::new(),
         }
     }
 

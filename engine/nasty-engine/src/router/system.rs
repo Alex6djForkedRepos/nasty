@@ -714,7 +714,36 @@ pub(super) async fn try_route(
             Ok(()) => ok(req, "ok"),
             Err(e) => err(req, e),
         },
-        "system.firewall.status" => ok(req, state.firewall.status().await),
+        "system.firewall.status" => {
+            // Enrich the service-rule view with the host ports Docker apps
+            // publish. These bypass the nftables firewall (DNAT in
+            // prerouting), so the firewall module can't see them — but
+            // surfacing them here gives the operator a complete
+            // "what's listening on this box" picture in one place.
+            let mut status = state.firewall.status().await;
+            if let Ok(apps) = state.apps.list().await {
+                let mut published: Vec<nasty_system::firewall::PublishedAppPort> = apps
+                    .iter()
+                    .flat_map(|app| {
+                        app.ports
+                            .iter()
+                            .map(move |p| nasty_system::firewall::PublishedAppPort {
+                                app: app.name.clone(),
+                                host_port: p.host_port,
+                                container_port: p.container_port,
+                                transport: p.protocol.clone(),
+                            })
+                    })
+                    .collect();
+                published.sort_by(|a, b| {
+                    a.host_port
+                        .cmp(&b.host_port)
+                        .then_with(|| a.app.cmp(&b.app))
+                });
+                status.published_app_ports = published;
+            }
+            ok(req, status)
+        }
         "system.firewall.restrict" => {
             let service = match require_str(req, "service") {
                 Ok(s) => s.to_string(),

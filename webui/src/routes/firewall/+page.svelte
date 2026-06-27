@@ -135,5 +135,30 @@
 				Ports open/close automatically with services. Click a service to restrict access by source IP or interface.
 			</p>
 		</section>
+
+		{#if firewallStatus.published_app_ports?.length}
+			<section class="mt-6 rounded-lg border border-border p-5">
+				<h2 class="text-sm font-semibold">App ports (published by Docker)</h2>
+				<p class="mt-1 text-xs text-muted-foreground">
+					These host ports are opened directly by Docker for your apps and bypass this firewall —
+					Docker forwards them straight to the container, so the rules above don't apply.
+					Their only gate is your upstream/cloud firewall. Shown here so you can see everything
+					that's reachable on this box in one place.
+				</p>
+				<div class="mt-3 space-y-1">
+					{#each firewallStatus.published_app_ports as p}
+						<div class="flex items-center gap-3 rounded px-3 py-2 text-sm">
+							<span class="h-2 w-2 rounded-full shrink-0 bg-sky-400"></span>
+							<span class="font-mono text-xs w-28">{p.host_port}/{p.transport}</span>
+							<a href="/apps" class="font-medium text-primary hover:underline">{p.app}</a>
+							{#if p.container_port !== p.host_port}
+								<span class="text-xs text-muted-foreground">→ container {p.container_port}</span>
+							{/if}
+							<span class="ml-auto text-xs text-sky-400">Open (Docker)</span>
+						</div>
+					{/each}
+				</div>
+			</section>
+		{/if}
 	{/if}
 </div>
