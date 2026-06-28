@@ -2700,7 +2700,18 @@ impl AppsService {
         // network gives the container its own LAN IP, which is incompatible
         // with published host ports + reverse-proxy ingress (it has no
         // presence at 127.0.0.1:<port>) — reject early and skip ingress.
-        let net_spec = match req.network.as_deref().filter(|s| !s.is_empty()) {
+        // `"host"` is a sentinel for sharing the host network namespace
+        // (--net=host), not a managed Docker network — handle it without a
+        // net_spec lookup. Like LAN-IP, it has no presence at
+        // 127.0.0.1:<port> for a per-app published mapping, so published
+        // ports and reverse-proxy ingress don't apply; the container binds
+        // host ports directly.
+        let host_network = req.network.as_deref() == Some("host");
+        let net_spec = match req
+            .network
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "host")
+        {
             Some(name) => Some(self.resolve_managed_network(name).await?),
             None => None,
         };
@@ -2751,23 +2762,28 @@ impl AppsService {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let mut exposed_ports: Vec<String> = Vec::new();
 
-        for p in &req.ports {
-            let host_port = p.host_port.unwrap_or(p.container_port);
-            if used_ports.contains(&host_port) {
-                return Err(AppsError::DockerFailed(format!(
-                    "host port {} is already in use by another app",
-                    host_port
-                )));
+        // Host networking publishes nothing — the container shares the
+        // host namespace and binds host ports directly, so `-p` mappings
+        // don't apply (Docker rejects them with --net=host).
+        if !host_network {
+            for p in &req.ports {
+                let host_port = p.host_port.unwrap_or(p.container_port);
+                if used_ports.contains(&host_port) {
+                    return Err(AppsError::DockerFailed(format!(
+                        "host port {} is already in use by another app",
+                        host_port
+                    )));
+                }
+                let key = format!("{}/{}", p.container_port, p.protocol.to_lowercase());
+                exposed_ports.push(key.clone());
+                port_bindings.insert(
+                    key,
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(host_port.to_string()),
+                    }]),
+                );
             }
-            let key = format!("{}/{}", p.container_port, p.protocol.to_lowercase());
-            exposed_ports.push(key.clone());
-            port_bindings.insert(
-                key,
-                Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(host_port.to_string()),
-                }]),
-            );
         }
 
         // Build mounts
@@ -2838,6 +2854,9 @@ impl AppsService {
             if let Some(ip) = req.static_ip.as_deref().filter(|s| !s.is_empty()) {
                 labels.insert(LABEL_APP_NETWORK_IP.to_string(), ip.to_string());
             }
+        } else if host_network {
+            // Round-trip the host-network choice so Edit/Pull re-apply it.
+            labels.insert(LABEL_APP_NETWORK.to_string(), "host".to_string());
         }
 
         // Attach to the chosen managed network (with an optional static
@@ -2871,6 +2890,7 @@ impl AppsService {
             } else {
                 Some(port_bindings)
             },
+            network_mode: host_network.then(|| "host".to_string()),
             binds: if binds.is_empty() { None } else { Some(binds) },
             nano_cpus,
             memory,
@@ -2969,7 +2989,7 @@ impl AppsService {
         // can still reach the container directly on the LAN.
         // ...but never for a LAN-IP (macvlan/ipvlan) app: it has its own
         // address and no presence at 127.0.0.1:<port> for Caddy to proxy.
-        if let Some(first_port) = (!lan_ip_network)
+        if let Some(first_port) = (!lan_ip_network && !host_network)
             .then(|| {
                 req.ports
                     .iter()
