@@ -3615,31 +3615,43 @@ impl AppsService {
         } else {
             host_config.port_bindings.as_ref().unwrap_or(&network_ports)
         };
-        for (idx, (key, bindings)) in port_source.iter().enumerate() {
+        for (key, bindings) in port_source.iter() {
             let parts: Vec<&str> = key.split('/').collect();
             let container_port: u16 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
             let protocol = parts
                 .get(1)
                 .map(|p| p.to_uppercase())
                 .unwrap_or_else(|| "TCP".to_string());
-            let host_port = bindings
+            // Surface only PUBLISHED ports — those with a host binding. A
+            // container that EXPOSEs a wide range (e.g. a game image's
+            // 2300-2399) lists every one of those in NetworkSettings.Ports
+            // with a null binding; including them floods the Edit form with
+            // one row per exposed-but-unpublished port, and saving would
+            // publish the whole range 1:1. EXPOSE ≠ publish.
+            let Some(host_port) = bindings
                 .as_ref()
                 .and_then(|b| b.first())
                 .and_then(|b| b.host_port.as_ref())
-                .and_then(|p| p.parse::<u16>().ok());
-            let port_name = if idx == 0 {
-                "http".to_string()
-            } else {
-                format!("port-{idx}")
+                .and_then(|p| p.parse::<u16>().ok())
+            else {
+                continue;
             };
             ports.push(AppPort {
-                name: port_name,
+                name: String::new(),
                 container_port,
-                host_port,
+                host_port: Some(host_port),
                 protocol,
             });
         }
         ports.sort_by_key(|p| p.container_port);
+        // Name after sorting so the lowest published port is the "http" row.
+        for (idx, p) in ports.iter_mut().enumerate() {
+            p.name = if idx == 0 {
+                "http".to_string()
+            } else {
+                format!("port-{idx}")
+            };
+        }
 
         // Parse env. The container's `Config.Env` is `image defaults
         // + values we passed at create_container` with no marker for
