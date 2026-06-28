@@ -379,6 +379,10 @@
 			(n) => n.name === newNetwork && (n.driver === 'macvlan' || n.driver === 'ipvlan'),
 		),
 	);
+	/** True when the app shares the NAS's network namespace (--net=host).
+	 * Like LAN-IP, published host ports + reverse-proxy ingress don't apply
+	 * (the app binds host ports directly), so those sections are hidden. */
+	let installHostNet = $derived(newNetwork === 'host');
 	// Create-network dialog state.
 	let showNetCreate = $state(false);
 	let ncName = $state('');
@@ -1186,7 +1190,7 @@
 		};
 		// A LAN-IP (macvlan/ipvlan) app gets its own address — published host
 		// ports and reverse-proxy ingress don't apply (engine rejects them).
-		if (newPorts.length > 0 && !installLanIp) {
+		if (newPorts.length > 0 && !installLanIp && !installHostNet) {
 			// Expand any range rows into individual port mappings for the API.
 			params.ports = expandPortRows(newPorts);
 		}
@@ -1213,7 +1217,7 @@
 		// operator typed a hostname that became taken between the live
 		// conflict check and Save, install fails with a clear error.
 		const subdomainTrimmed = newSubdomain.trim();
-		if (subdomainTrimmed && !installLanIp) params.subdomain = subdomainTrimmed;
+		if (subdomainTrimmed && !installLanIp && !installHostNet) params.subdomain = subdomainTrimmed;
 		// Managed-network attachment (+ optional static IP).
 		if (newNetwork) params.network = newNetwork;
 		if (newStaticIp.trim()) params.static_ip = newStaticIp.trim();
@@ -1273,7 +1277,7 @@
 			name: editingApp,
 			image: newImage,
 		};
-		if (newPorts.length > 0 && !installLanIp) {
+		if (newPorts.length > 0 && !installLanIp && !installHostNet) {
 			// Expand any range rows into individual port mappings for the API.
 			params.ports = expandPortRows(newPorts);
 		}
@@ -1302,7 +1306,7 @@
 		// Round-trip (or change) the subdomain ingress. A blank field is left
 		// to the engine, which preserves the existing subdomain rather than
 		// dropping it; clear a subdomain via the dedicated Subdomain dialog.
-		if (newSubdomain.trim() && !installLanIp) params.subdomain = newSubdomain.trim();
+		if (newSubdomain.trim() && !installLanIp && !installHostNet) params.subdomain = newSubdomain.trim();
 
 		const result = await withToast(
 			() => client.call('apps.update', params, 300_000),
@@ -1972,6 +1976,7 @@
 						{#each appNetworks as n}
 							<option value={n.name}>{n.name} ({n.driver}{n.parent ? ` on ${n.parent}` : ''})</option>
 						{/each}
+						<option value="host">Host network (share the NAS's network)</option>
 					</select>
 					{#if installLanIp}
 						<p class="mt-1 text-xs text-amber-500">This app gets its own LAN IP — host ports and reverse-proxy ingress don't apply and are hidden below.</p>
@@ -1980,9 +1985,12 @@
 							<Input id="app-static-ip" bind:value={newStaticIp} placeholder="e.g. 192.168.1.50" class="mt-1" />
 						</div>
 					{/if}
+					{#if installHostNet}
+						<p class="mt-1 text-xs text-amber-500">The app shares the NAS's network namespace — every port it binds is reachable directly on the NAS's IP, with no per-port mapping. It can bind any host port (including ones NASty's own services use), so only enable this for trusted apps. Published ports and reverse-proxy ingress don't apply and are hidden below.</p>
+					{/if}
 				</div>
 
-				{#if !installLanIp}
+				{#if !installLanIp && !installHostNet}
 				<!-- Ports -->
 				<div class="mb-4">
 					<div class="flex items-center justify-between mb-1">
@@ -2108,7 +2116,7 @@
 					</div>
 				</div>
 
-				{#if !installLanIp}
+				{#if !installLanIp && !installHostNet}
 				<!-- Subdomain (optional) — opt into subdomain-mode ingress from
 				     day one. Empty = path-prefix mode + post-install probe (the
 				     historical default). Non-empty = host-match Caddy route +
