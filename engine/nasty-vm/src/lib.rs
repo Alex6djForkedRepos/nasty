@@ -963,10 +963,7 @@ impl VmService {
         // fail here with the actual reason instead of launching QEMU.
         for dev in &config.passthrough_devices {
             bind_vfio(&dev.address).await.map_err(|e| {
-                VmError::Passthrough(format!(
-                    "VM '{}': device {}: {e}",
-                    config.name, dev.address
-                ))
+                VmError::Passthrough(format!("VM '{}': device {}: {e}", config.name, dev.address))
             })?;
         }
 
