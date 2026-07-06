@@ -752,10 +752,7 @@ mod tests {
     fn replace_rule_ports_applies_service_restrictions_to_new_ports() {
         let mut state = state_with_rule("iscsi", vec![tcp(3260)], true);
         let restrictions = FirewallRestrictions {
-            services: HashMap::from([(
-                "iscsi".to_string(),
-                vec!["192.168.1.0/24".to_string()],
-            )]),
+            services: HashMap::from([("iscsi".to_string(), vec!["192.168.1.0/24".to_string()])]),
             interfaces: HashMap::new(),
         };
         replace_rule_ports(&mut state, &restrictions, "iscsi", vec![tcp(3261)]);
@@ -774,8 +771,7 @@ mod tests {
         // rule must exist (so a later `open` keeps the right ports)
         // but stay closed.
         let mut state = FirewallState::default();
-        let changed =
-            replace_rule_ports(&mut state, &no_restrictions(), "nvmeof", vec![tcp(4421)]);
+        let changed = replace_rule_ports(&mut state, &no_restrictions(), "nvmeof", vec![tcp(4421)]);
         assert!(changed);
         assert_eq!(state.rules.len(), 1);
         assert_eq!(state.rules[0].service, "nvmeof");

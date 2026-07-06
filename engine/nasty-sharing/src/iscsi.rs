@@ -1581,11 +1581,9 @@ mod tests {
         // The create path relies on 0.0.0.0:3260 and [::]:3260
         // coexisting — a v6 wildcard must not be deferred behind a v4
         // wildcard removal that isn't happening.
-        let steps = plan_portal_transition(
-            &[p("0.0.0.0", 3260)],
-            &[p("0.0.0.0", 3260), p("::", 3260)],
-        )
-        .unwrap();
+        let steps =
+            plan_portal_transition(&[p("0.0.0.0", 3260)], &[p("0.0.0.0", 3260), p("::", 3260)])
+                .unwrap();
         assert_eq!(steps, vec![PortalStep::Add(p("::", 3260))]);
     }
 
@@ -1625,9 +1623,11 @@ mod tests {
 
     #[test]
     fn planner_normalizes_bracketed_v6_addresses() {
-        let steps =
-            plan_portal_transition(&[p("0.0.0.0", 3260)], &[p("0.0.0.0", 3260), p("[fd00::1]", 3261)])
-                .unwrap();
+        let steps = plan_portal_transition(
+            &[p("0.0.0.0", 3260)],
+            &[p("0.0.0.0", 3260), p("[fd00::1]", 3261)],
+        )
+        .unwrap();
         assert_eq!(steps, vec![PortalStep::Add(p("fd00::1", 3261))]);
     }
 

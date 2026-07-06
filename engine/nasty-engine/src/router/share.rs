@@ -60,7 +60,11 @@ pub(crate) async fn sync_portal_firewall_ports(state: &AppState) {
 
     let mut iscsi_ports: BTreeSet<u16> = BTreeSet::new();
     if let Ok(targets) = state.iscsi.list().await {
-        iscsi_ports.extend(targets.iter().flat_map(|t| t.portals.iter().map(|p| p.port)));
+        iscsi_ports.extend(
+            targets
+                .iter()
+                .flat_map(|t| t.portals.iter().map(|p| p.port)),
+        );
     }
     if iscsi_ports.is_empty() {
         iscsi_ports.insert(3260);
