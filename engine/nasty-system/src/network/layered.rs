@@ -55,6 +55,10 @@ pub struct Link {
     /// set) on virtual link kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sriov_num_vfs: Option<u32>,
+    /// SR-IOV per-VF properties (VLAN/MAC/trust/spoof-check). Like the
+    /// VF count, physical-function-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vfs: Vec<super::VfConfig>,
     #[serde(flatten)]
     pub kind: LinkKind,
 }
@@ -182,6 +186,7 @@ pub fn to_layered(legacy: &NetworkConfig) -> LayeredConfig {
             mtu: iface.mtu,
             mac: None,
             sriov_num_vfs: iface.sriov_num_vfs,
+            vfs: iface.vfs.clone(),
             kind: LinkKind::Physical,
         });
         push_addresses(&mut addresses, &iface.name, &iface.ipv4, &iface.ipv6);
@@ -193,6 +198,7 @@ pub fn to_layered(legacy: &NetworkConfig) -> LayeredConfig {
             mtu: bond.mtu,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Bond {
                 members: bond.members.clone(),
                 mode: bond.mode.clone(),
@@ -208,6 +214,7 @@ pub fn to_layered(legacy: &NetworkConfig) -> LayeredConfig {
             mtu: bridge.mtu,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Bridge {
                 members: bridge.members.clone(),
                 stp: bridge.stp,
@@ -225,6 +232,7 @@ pub fn to_layered(legacy: &NetworkConfig) -> LayeredConfig {
             mtu: vlan.mtu,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Vlan {
                 parent: vlan.parent.clone(),
                 id: vlan.vlan_id,
@@ -239,6 +247,7 @@ pub fn to_layered(legacy: &NetworkConfig) -> LayeredConfig {
             mtu: mv.mtu,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Macvlan {
                 parent: mv.parent.clone(),
                 mode: mv.mode.clone(),
@@ -295,6 +304,7 @@ pub fn to_layered(legacy: &NetworkConfig) -> LayeredConfig {
                 mtu: None,
                 mac: None,
                 sriov_num_vfs: None,
+                vfs: Vec::new(),
                 kind: LinkKind::Physical,
             });
         }
@@ -373,6 +383,7 @@ pub fn from_layered(layered: &LayeredConfig) -> NetworkConfig {
                 ipv6,
                 mtu: link.mtu,
                 sriov_num_vfs: link.sriov_num_vfs,
+                vfs: link.vfs.clone(),
             }),
             LinkKind::Bond {
                 members,
@@ -602,6 +613,7 @@ mod tests {
             ipv4: IpConfig::default(),
             ipv6: IpConfig::default(),
             mtu: None,
+            vfs: Vec::new(),
             sriov_num_vfs: None,
         }
     }
@@ -726,6 +738,30 @@ mod tests {
     }
 
     // ── Layered shape spot-checks ──────────────────────────────
+
+    #[test]
+    fn vf_properties_survive_layered_round_trip() {
+        // The per-VF config rides the same legacy↔layered path as the
+        // VF count; a dropped clone in either converter would silently
+        // wipe operator VF settings on the next apply.
+        use crate::network::VfConfig;
+        let mut iface = legacy_iface("enp6s0f0");
+        iface.sriov_num_vfs = Some(4);
+        iface.vfs = vec![VfConfig {
+            index: 1,
+            vlan: Some(7),
+            mac: None,
+            trust: Some(true),
+            spoof_check: None,
+        }];
+        let expected = iface.vfs.clone();
+        let cfg = NetworkConfig {
+            interfaces: vec![iface],
+            ..Default::default()
+        };
+        let back = from_layered(&to_layered(&cfg));
+        assert_eq!(back.interfaces[0].vfs, expected);
+    }
 
     #[test]
     fn to_layered_emits_no_address_for_default_disabled_iface() {
@@ -866,6 +902,7 @@ mod tests {
             mtu: None,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Physical,
         }
     }
@@ -877,6 +914,7 @@ mod tests {
             mtu: None,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Bridge {
                 members: members.iter().map(|s| (*s).to_string()).collect(),
                 stp: false,
@@ -893,6 +931,7 @@ mod tests {
             mtu: None,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Bond {
                 members: members.iter().map(|s| (*s).to_string()).collect(),
                 mode: BondMode::Lacp,
@@ -908,6 +947,7 @@ mod tests {
             mtu: None,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Vlan {
                 parent: parent.into(),
                 id,
@@ -1002,6 +1042,7 @@ mod tests {
             mtu: None,
             mac: None,
             sriov_num_vfs: None,
+            vfs: Vec::new(),
             kind: LinkKind::Macvlan {
                 parent: parent.into(),
                 mode: "bridge".into(),

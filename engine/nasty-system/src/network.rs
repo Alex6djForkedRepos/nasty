@@ -72,6 +72,37 @@ pub struct InterfaceConfig {
     /// devices — `update()` validates against live `sriov_totalvfs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sriov_num_vfs: Option<u32>,
+    /// SR-IOV: per-VF properties (VLAN, MAC, trust, spoof checking),
+    /// applied by NM via `sriov.vfs` when the PF profile activates —
+    /// the declarative form of `ip link set <pf> vf <n> ...` (#614
+    /// follow-up). Only meaningful alongside `sriov_num_vfs`; indices
+    /// are validated against it. Empty = no per-VF configuration
+    /// (default; also what every pre-existing config deserializes to).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vfs: Vec<VfConfig>,
+}
+
+/// Properties for one SR-IOV virtual function on a PF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct VfConfig {
+    /// VF index (0-based; must be below the configured VF count).
+    pub index: u32,
+    /// 802.1Q VLAN (1–4094) the VF's traffic is tagged with on the
+    /// PF, like `ip link set <pf> vf <n> vlan <id>`. Absent = untagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlan: Option<u16>,
+    /// Administrative MAC. Fixed by the PF driver; a guest consuming
+    /// the VF can't change it unless the VF is trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// VF trust — required by some guests for promiscuous mode or
+    /// MAC changes. Off unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<bool>,
+    /// Spoof checking — the NIC drops frames whose source MAC doesn't
+    /// match the VF's. Driver default unless set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoof_check: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -448,6 +479,7 @@ fn validate_sriov(
     live_caps: &std::collections::HashMap<String, Option<u32>>,
 ) -> Result<(), String> {
     for iface in &cfg.interfaces {
+        validate_vf_properties(iface)?;
         let Some(n) = iface.sriov_num_vfs else {
             continue;
         };
@@ -469,6 +501,68 @@ fn validate_sriov(
         }
     }
     Ok(())
+}
+
+/// Validate per-VF properties against the interface's own VF count.
+/// Purely config-internal (no live state needed): NM only applies
+/// `sriov.vfs` on a profile that also creates the VFs, so dangling or
+/// out-of-range entries would silently do nothing — refuse them with
+/// a real error instead.
+fn validate_vf_properties(iface: &InterfaceConfig) -> Result<(), String> {
+    if iface.vfs.is_empty() {
+        return Ok(());
+    }
+    let Some(count) = iface.sriov_num_vfs else {
+        return Err(format!(
+            "'{}' has per-VF properties but no VF count — set the VF count on the \
+             interface first",
+            iface.name
+        ));
+    };
+    let mut seen = std::collections::HashSet::new();
+    for vf in &iface.vfs {
+        if vf.index >= count {
+            return Err(format!(
+                "'{}' creates {count} VFs — VF index {} is out of range (0–{})",
+                iface.name,
+                vf.index,
+                count.saturating_sub(1)
+            ));
+        }
+        if !seen.insert(vf.index) {
+            return Err(format!(
+                "'{}' has duplicate configuration for VF index {}",
+                iface.name, vf.index
+            ));
+        }
+        if let Some(vlan) = vf.vlan
+            && !(1..=4094).contains(&vlan)
+        {
+            return Err(format!(
+                "VF {} on '{}': VLAN {vlan} is not a valid 802.1Q id (1–4094)",
+                vf.index, iface.name
+            ));
+        }
+        if let Some(mac) = &vf.mac
+            && !is_valid_mac(mac)
+        {
+            return Err(format!(
+                "VF {} on '{}': '{mac}' is not a valid MAC address \
+                 (expected six colon-separated hex octets)",
+                vf.index, iface.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Six colon-separated hex octets, e.g. `00:11:22:aa:bb:cc`.
+fn is_valid_mac(mac: &str) -> bool {
+    let parts: Vec<&str> = mac.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Path of the NM conf.d drop-in that scopes NM's ownership of
@@ -2163,6 +2257,7 @@ mod tests {
             enabled: true,
             ipv4: IpConfig::default(),
             ipv6: IpConfig::default(),
+            vfs: Vec::new(),
             mtu: None,
             sriov_num_vfs: None,
         }
@@ -3146,6 +3241,110 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_sriov(&cfg, &caps).is_ok(), "zero VFs");
+    }
+
+    #[test]
+    fn sriov_vf_property_validation_rules() {
+        let caps: std::collections::HashMap<String, Option<u32>> =
+            [("enp6s0f0".to_string(), Some(8u32))].into_iter().collect();
+        let vf = |index: u32| VfConfig {
+            index,
+            vlan: None,
+            mac: None,
+            trust: None,
+            spoof_check: None,
+        };
+        let cfg_with = |i: InterfaceConfig| NetworkConfig {
+            interfaces: vec![i],
+            ..Default::default()
+        };
+
+        // Full property set on VFs within the configured count: fine.
+        let mut pf = iface("enp6s0f0");
+        pf.sriov_num_vfs = Some(4);
+        pf.vfs = vec![
+            VfConfig {
+                index: 0,
+                vlan: Some(100),
+                mac: Some("00:11:22:33:44:55".into()),
+                trust: Some(true),
+                spoof_check: Some(false),
+            },
+            vf(3),
+        ];
+        assert!(validate_sriov(&cfg_with(pf), &caps).is_ok(), "valid vfs");
+
+        // Per-VF properties without a VF count are dangling config —
+        // NM only applies sriov.vfs on a profile that creates VFs.
+        let mut no_count = iface("enp6s0f0");
+        no_count.vfs = vec![vf(0)];
+        assert!(
+            validate_sriov(&cfg_with(no_count), &caps)
+                .unwrap_err()
+                .contains("VF count"),
+            "vfs without count"
+        );
+
+        // Index must stay below the configured count.
+        let mut oob = iface("enp6s0f0");
+        oob.sriov_num_vfs = Some(4);
+        oob.vfs = vec![vf(4)];
+        assert!(
+            validate_sriov(&cfg_with(oob), &caps)
+                .unwrap_err()
+                .contains("index"),
+            "index beyond count"
+        );
+
+        // One entry per VF.
+        let mut dup = iface("enp6s0f0");
+        dup.sriov_num_vfs = Some(4);
+        dup.vfs = vec![vf(1), vf(1)];
+        assert!(
+            validate_sriov(&cfg_with(dup), &caps)
+                .unwrap_err()
+                .contains("duplicate"),
+            "duplicate index"
+        );
+
+        // VLAN must be a valid 802.1Q id (1–4094).
+        for bad_vlan in [0u16, 4095] {
+            let mut v = iface("enp6s0f0");
+            v.sriov_num_vfs = Some(4);
+            v.vfs = vec![VfConfig {
+                vlan: Some(bad_vlan),
+                ..vf(0)
+            }];
+            assert!(
+                validate_sriov(&cfg_with(v), &caps)
+                    .unwrap_err()
+                    .contains("VLAN"),
+                "vlan {bad_vlan} rejected"
+            );
+        }
+
+        // MAC must be six colon-separated hex octets.
+        let mut bad_mac = iface("enp6s0f0");
+        bad_mac.sriov_num_vfs = Some(4);
+        bad_mac.vfs = vec![VfConfig {
+            mac: Some("00:11:22:33:44".into()),
+            ..vf(0)
+        }];
+        assert!(
+            validate_sriov(&cfg_with(bad_mac), &caps)
+                .unwrap_err()
+                .contains("MAC"),
+            "malformed mac"
+        );
+
+        // Absent device: intent kept, same as the VF-count rule.
+        let mut ghost = iface("enp99s0");
+        ghost.sriov_num_vfs = Some(4);
+        ghost.vfs = vec![vf(0)];
+        assert!(
+            validate_sriov(&cfg_with(ghost), &caps).is_ok(),
+            "absent device with vfs"
+        );
     }
 
     #[test]

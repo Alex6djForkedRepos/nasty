@@ -1177,6 +1177,21 @@ export interface InterfaceConfig {
 	mtu: number | null;
 	/** SR-IOV: VFs to create on this PF (absent = leave alone). */
 	sriov_num_vfs?: number | null;
+	/** SR-IOV: per-VF properties, applied alongside the VF count. */
+	vfs?: VfConfig[];
+}
+
+/** Per-VF properties on an SR-IOV PF (`ip link set <pf> vf <n> ...`). */
+export interface VfConfig {
+	index: number;
+	/** 802.1Q VLAN (1–4094); absent = untagged. */
+	vlan?: number | null;
+	/** Administrative MAC. */
+	mac?: string | null;
+	/** VF trust (promiscuous mode / MAC changes from the guest). */
+	trust?: boolean | null;
+	/** Spoof checking. */
+	spoof_check?: boolean | null;
 }
 
 export type BondMode = 'lacp' | 'active_backup' | 'balance_rr' | 'balance_xor';

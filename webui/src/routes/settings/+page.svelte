@@ -15,7 +15,7 @@
 	} from '$lib/network';
 	import { confirm } from '$lib/confirm.svelte';
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
-	import type { Settings, SystemInfo, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig } from '$lib/types';
+	import type { Settings, SystemInfo, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig, VfConfig } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import BridgeCreator from '$lib/components/BridgeCreator.svelte';
@@ -54,6 +54,10 @@
 	// MTU on inline interface form (string so an empty value means "unset")
 	let netMtu = $state('');
 	let netSriovVfs = $state('');
+	// Per-VF property rows (VLAN/MAC as strings so empty means "unset";
+	// trust/spoof-check tri-state: '' = driver default, 'true'/'false' explicit)
+	type VfRow = { index: number; vlan: string; mac: string; trust: '' | 'true' | 'false'; spoofCheck: '' | 'true' | 'false' };
+	let netVfRows: VfRow[] = $state([]);
 	// Bond form
 	let showBondForm = $state(false);
 	let bondName = $state('bond0');
@@ -410,11 +414,19 @@
 			netIpv6Gateway = cfg.ipv6.gateway ?? '';
 			netMtu = cfg.mtu != null ? String(cfg.mtu) : '';
 			netSriovVfs = (cfg as InterfaceConfig).sriov_num_vfs != null ? String((cfg as InterfaceConfig).sriov_num_vfs) : '';
+			netVfRows = ((cfg as InterfaceConfig).vfs ?? []).map(v => ({
+				index: v.index,
+				vlan: v.vlan != null ? String(v.vlan) : '',
+				mac: v.mac ?? '',
+				trust: v.trust == null ? '' as const : v.trust ? 'true' as const : 'false' as const,
+				spoofCheck: v.spoof_check == null ? '' as const : v.spoof_check ? 'true' as const : 'false' as const,
+			}));
 		} else {
 			netDhcp = true; netIpv4Addrs = ['']; netGateway = '';
 			netIpv6Method = 'slaac'; netIpv6Addrs = ['']; netIpv6Gateway = '';
 			netMtu = '';
 			netSriovVfs = '';
+			netVfRows = [];
 		}
 		netChanged = false;
 	}
@@ -469,6 +481,21 @@
 			// parseMtu treats 0 as null, so read the raw field for zero.
 			if (netSriovVfs !== '' && netSriovVfs != null) {
 				entry.sriov_num_vfs = sriovNum ?? 0;
+			}
+			// Per-VF properties ride along only when VFs are managed;
+			// rows with nothing set are dropped rather than sent empty.
+			if (entry.sriov_num_vfs != null && entry.sriov_num_vfs > 0 && netVfRows.length > 0) {
+				const vfs: VfConfig[] = [];
+				for (const r of netVfRows) {
+					const vf: VfConfig = { index: r.index };
+					const vlan = parseMtu(r.vlan);
+					if (vlan != null) vf.vlan = vlan;
+					if (r.mac.trim()) vf.mac = r.mac.trim();
+					if (r.trust !== '') vf.trust = r.trust === 'true';
+					if (r.spoofCheck !== '') vf.spoof_check = r.spoofCheck === 'true';
+					if (vf.vlan != null || vf.mac != null || vf.trust != null || vf.spoof_check != null) vfs.push(vf);
+				}
+				if (vfs.length > 0) entry.vfs = vfs;
 			}
 			if (idx >= 0) payload.interfaces[idx] = entry; else payload.interfaces.push(entry);
 		}
@@ -1053,6 +1080,48 @@
 												Each VF shows up as its own interface below — usable for host networking or VM passthrough (Hardware page).
 												Empty = NASty doesn't touch the VF count; 0 = remove all VFs.
 											</p>
+
+											<!-- Per-VF properties (#614 follow-up): VLAN / MAC / trust / spoof checking -->
+											{#if parseMtu(netSriovVfs) != null && parseMtu(netSriovVfs)! > 0}
+												{@const vfCount = parseMtu(netSriovVfs)!}
+												<div class="mt-3">
+													<span class="text-xs text-muted-foreground">Per-VF properties</span>
+													{#each netVfRows as row, ri}
+														<div class="mt-1 flex flex-wrap items-center gap-2 rounded bg-secondary/40 px-2 py-1.5 text-xs">
+															<span class="font-mono">VF</span>
+															<input type="number" min="0" max={vfCount - 1} bind:value={row.index} oninput={() => netChanged = true} class="w-14 rounded-md border border-input bg-background px-1 py-0.5 font-mono" />
+															<input type="number" min="1" max="4094" bind:value={row.vlan} placeholder="VLAN" oninput={() => netChanged = true} class="w-20 rounded-md border border-input bg-background px-1 py-0.5 font-mono" />
+															<input bind:value={row.mac} placeholder="MAC (optional)" oninput={() => netChanged = true} class="w-40 rounded-md border border-input bg-background px-1 py-0.5 font-mono" />
+															<label class="flex items-center gap-1">trust
+																<select bind:value={row.trust} onchange={() => netChanged = true} class="rounded-md border border-input bg-background px-1 py-0.5">
+																	<option value="">default</option>
+																	<option value="true">on</option>
+																	<option value="false">off</option>
+																</select>
+															</label>
+															<label class="flex items-center gap-1">spoof check
+																<select bind:value={row.spoofCheck} onchange={() => netChanged = true} class="rounded-md border border-input bg-background px-1 py-0.5">
+																	<option value="">default</option>
+																	<option value="true">on</option>
+																	<option value="false">off</option>
+																</select>
+															</label>
+															<Button variant="ghost" size="xs" onclick={() => { netVfRows.splice(ri, 1); netChanged = true; }}>✕</Button>
+														</div>
+													{/each}
+													<Button variant="outline" size="xs" class="mt-2" onclick={() => {
+														const used = new Set(netVfRows.map(r => r.index));
+														let next = 0;
+														while (used.has(next) && next < vfCount) next++;
+														netVfRows.push({ index: next, vlan: '', mac: '', trust: '', spoofCheck: '' });
+														netChanged = true;
+													}} disabled={netVfRows.length >= vfCount}>+ VF settings</Button>
+													<p class="mt-1 text-[0.65rem] text-muted-foreground">
+														Like <code>ip link set {selectedIface} vf N vlan/mac/trust/spoofchk</code>, but persistent — applied by NetworkManager with the profile.
+														VFs without a row keep driver defaults.
+													</p>
+												</div>
+											{/if}
 										</div>
 									{/if}
 
