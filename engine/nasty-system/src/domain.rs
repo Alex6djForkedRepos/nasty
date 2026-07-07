@@ -507,18 +507,12 @@ impl DomainService {
     }
 
     /// Whether the system is currently joined to a domain.
-    ///
-    /// Consumed by the engine's boot restore (router task).
-    #[allow(dead_code)]
     pub async fn is_joined(&self) -> bool {
         Self::load_config().await.is_some()
     }
 
     /// Start winbindd if it isn't running (boot restore; join already
     /// restarted it explicitly).
-    ///
-    /// Consumed by the engine's boot restore (router task).
-    #[allow(dead_code)]
     pub async fn ensure_winbindd(&self) {
         if let Err(e) = systemctl("start", "samba-winbindd.service").await {
             tracing::error!("winbindd start failed on domain restore: {e}");
@@ -732,7 +726,6 @@ impl DomainService {
     /// Runs `wbinfo -u`, filters results to match the prefix (case-insensitive),
     /// and returns up to 50 results. The prefix must be at least 2 characters
     /// to prevent bulk enumeration.
-    #[allow(dead_code)]
     pub async fn search_users(&self, prefix: &str) -> Result<Vec<DomainPrincipal>, DomainError> {
         self.search(prefix, "-u").await
     }
@@ -742,7 +735,6 @@ impl DomainService {
     /// Runs `wbinfo -g`, filters results to match the prefix (case-insensitive),
     /// and returns up to 50 results. The prefix must be at least 2 characters
     /// to prevent bulk enumeration.
-    #[allow(dead_code)]
     pub async fn search_groups(&self, prefix: &str) -> Result<Vec<DomainPrincipal>, DomainError> {
         self.search(prefix, "-g").await
     }

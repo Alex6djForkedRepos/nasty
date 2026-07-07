@@ -7,6 +7,7 @@ mod audit;
 mod auth;
 mod backup;
 mod bcachefs;
+mod domain;
 mod fs;
 mod guestshare;
 mod notifications;
@@ -468,6 +469,7 @@ async fn route(req: &Request, state: &AppState, session: &Session) -> Response {
         "share" => share::try_route(req, state, session).await,
         "guestshare" => guestshare::try_route(req, state, session).await,
         "smb" => smb::try_route(req, state, session).await,
+        "domain" => domain::try_route(req, state, session).await,
         "service" => service::try_route(req, state, session).await,
         "system" => {
             // `system.alerts` lives in the alerts module; everything else
