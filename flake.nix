@@ -191,6 +191,11 @@
         # Nixpkgs' base derivation hasn't picked this up yet, so we add it
         # to buildInputs here so the override builds against the new release.
         buildInputs = (old.buildInputs or []) ++ [ pkgs.libunwind ];
+        # v1.38.8 drives the `bindgen` CLI from fs/build.rs (codegen.rs
+        # execs $BINDGEN, default "bindgen") instead of using bindgen as
+        # a build-dependency library. rust-bindgen is the wrapped binary
+        # with its libclang plumbing included.
+        nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.rust-bindgen ];
       });
     in base.overrideAttrs (old: {
       passthru = old.passthru // {
