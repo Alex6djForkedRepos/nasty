@@ -165,6 +165,167 @@ pub fn render_krb5_conf(realm: &str) -> String {
     )
 }
 
+/// Path to the resolved(1) drop-in that routes AD-zone DNS queries to the
+/// domain controllers without replacing the box's own resolvers.
+pub const RESOLVED_DROPIN_PATH: &str = "/etc/systemd/resolved.conf.d/nasty-ad.conf";
+
+/// Extract domain controller hostnames from `resolvectl query --type=SRV
+/// _ldap._tcp.<realm>` output (e.g. lines like
+/// "_ldap._tcp.corp.example.com IN SRV 0 100 389 dc1.corp.example.com").
+fn parse_resolvectl_srv(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter(|l| l.contains(" SRV "))
+        .filter_map(|l| l.split_whitespace().last())
+        .map(|t| t.trim_end_matches('.').to_string())
+        .collect()
+}
+
+/// Extract IPs from `resolvectl query <host>` output (lines like
+/// "dc1.corp.example.com: 10.0.0.5").
+///
+/// Not yet called — feeds `render_resolved_dropin` from the join flow in a
+/// later task, once `preflight`'s discovered DC hostnames are resolved to
+/// IPs.
+#[allow(dead_code)]
+fn parse_resolvectl_addresses(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|l| l.split_once(": "))
+        .map(|(_, addr)| addr.trim().to_string())
+        .filter(|a| a.parse::<std::net::IpAddr>().is_ok())
+        .collect()
+}
+
+/// Render the systemd-resolved drop-in that routes AD-zone DNS queries to
+/// the domain controllers, per-domain (`Domains=~<realm>`) — the box's own
+/// resolvers are left untouched for everything else (spec join-flow step 6).
+pub fn render_resolved_dropin(realm: &str, dc_ips: &[String]) -> String {
+    format!(
+        "# Managed by NASty — routes AD-zone DNS queries to the domain\n\
+         # controllers without replacing the box's resolvers. Removed at leave.\n\
+         [Resolve]\n\
+         DNS={}\n\
+         Domains=~{}\n",
+        dc_ips.join(" "),
+        realm.to_ascii_lowercase(),
+    )
+}
+
+/// Parse `net ads info`'s "Server time:" line into unix seconds.
+/// Format observed: "Server time: Tue, 07 Jul 2026 12:34:56 UTC".
+/// Hand-rolled (days-since-epoch arithmetic) to avoid a chrono dep for
+/// one line of output; only UTC/GMT zones are accepted — anything else
+/// returns None and preflight skips the skew check rather than
+/// mis-judging it.
+fn parse_net_ads_server_time(output: &str) -> Option<i64> {
+    let line = output
+        .lines()
+        .find(|l| l.trim_start().starts_with("Server time:"))?;
+    let rest = line.split_once(':')?.1.trim(); // "Tue, 07 Jul 2026 12:34:56 UTC"
+    let rest = rest.split_once(',').map(|(_, r)| r.trim()).unwrap_or(rest);
+    let mut parts = rest.split_whitespace(); // 07 Jul 2026 12:34:56 UTC
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut hms = parts.next()?.split(':');
+    let (h, m, s): (i64, i64, i64) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    if !matches!(parts.next(), Some("UTC") | Some("GMT")) {
+        return None;
+    }
+    // Days since 1970-01-01 (civil-from-days, Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3_600 + m * 60 + s)
+}
+
+/// Run a command, capturing stdout+stderr. Returns stdout on success;
+/// on non-zero exit (or a spawn failure) returns `CommandFailed` carrying
+/// stderr (or the spawn error).
+async fn run_cmd(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String, DomainError> {
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .envs(envs.iter().copied())
+        .output()
+        .await
+        .map_err(|e| DomainError::CommandFailed(format!("failed to run {program}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DomainError::CommandFailed(stderr.trim().to_string()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Fail fast with actionable errors before Kerberos gets a chance to
+/// produce cryptic ones. Checks, in order: the realm's LDAP SRV records
+/// resolve; a DC answers `net ads info`; clock skew is within bounds.
+///
+/// Not yet called — wired up to the join flow in a later task; exercised
+/// by the VM integration test in the meantime.
+#[allow(dead_code)]
+async fn preflight(realm: &str) -> Result<Vec<String>, DomainError> {
+    let srv_name = format!("_ldap._tcp.{}", realm.to_ascii_lowercase());
+    let out = run_cmd("resolvectl", &["query", "--type=SRV", &srv_name], &[]).await?;
+    let dcs = parse_resolvectl_srv(&out);
+    if dcs.is_empty() {
+        return Err(DomainError::Preflight(format!(
+            "no domain controllers found: DNS SRV lookup for {srv_name} returned \
+             nothing. The box's DNS must be able to resolve the AD zone — point \
+             it at (or forward to) the domain's DNS server."
+        )));
+    }
+    let info = run_cmd(
+        "net",
+        &["ads", "info", "-S", &dcs[0], "--realm", realm],
+        &[("KRB5_CONFIG", KRB5_CONF_PATH)],
+    )
+    .await
+    .map_err(|e| {
+        DomainError::Preflight(format!("domain controller {} did not answer: {e}", dcs[0]))
+    })?;
+    if let Some(server_time) = parse_net_ads_server_time(&info) {
+        let local = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let skew = (server_time - local).abs();
+        if skew > 240 {
+            return Err(DomainError::Preflight(format!(
+                "clock skew vs domain controller is {skew}s — Kerberos tolerates \
+                 ~300s. Fix NTP before joining."
+            )));
+        }
+    }
+    Ok(dcs)
+}
+
 /// Service for managing domain join state.
 pub struct DomainService;
 
@@ -349,5 +510,51 @@ mod tests {
         // DCs are found via DNS SRV — no static kdc lines to go stale.
         assert!(conf.contains("dns_lookup_kdc = true"), "{conf}");
         assert!(conf.contains("rdns = false"), "{conf}");
+    }
+
+    #[test]
+    fn parse_resolvectl_srv_extracts_targets() {
+        // resolvectl output shape: "_ldap._tcp.corp.example.com IN SRV 0 100 389 dc1.corp.example.com"
+        let out = "\
+_ldap._tcp.corp.example.com IN SRV 0 100 389 dc1.corp.example.com\n\
+_ldap._tcp.corp.example.com IN SRV 0 100 389 dc2.corp.example.com\n\n\
+-- Information acquired via protocol DNS in 2.1ms.\n";
+        assert_eq!(
+            parse_resolvectl_srv(out),
+            vec![
+                "dc1.corp.example.com".to_string(),
+                "dc2.corp.example.com".to_string()
+            ]
+        );
+        assert!(parse_resolvectl_srv("-- no data --\n").is_empty());
+    }
+
+    #[test]
+    fn parse_resolvectl_addresses_extracts_ips() {
+        let out = "dc1.corp.example.com: 10.0.0.5\n\n-- Information acquired via protocol DNS in 1.2ms.\n";
+        assert_eq!(
+            parse_resolvectl_addresses(out),
+            vec!["10.0.0.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn render_resolved_dropin_routes_realm_to_dcs() {
+        let conf =
+            render_resolved_dropin("CORP.EXAMPLE.COM", &["10.0.0.5".into(), "10.0.0.6".into()]);
+        assert!(conf.contains("[Resolve]"), "{conf}");
+        assert!(conf.contains("DNS=10.0.0.5 10.0.0.6"), "{conf}");
+        // Routing domain (~) — only AD-zone queries go to the DCs.
+        assert!(conf.contains("Domains=~corp.example.com"), "{conf}");
+    }
+
+    #[test]
+    fn parse_net_ads_server_time_reads_rfc2822_style() {
+        // `net ads info` prints e.g. "Server time: Tue, 07 Jul 2026 12:34:56 UTC"
+        let out = "LDAP server: 10.0.0.5\nServer time: Tue, 07 Jul 2026 12:34:56 UTC\n";
+        // 2026-07-07T12:34:56Z — verified via:
+        // `date -u -j -f "%Y-%m-%d %H:%M:%S" "2026-07-07 12:34:56" +%s` => 1783427696
+        assert_eq!(parse_net_ads_server_time(out), Some(1783427696));
+        assert_eq!(parse_net_ads_server_time("no time here"), None);
     }
 }
