@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+use crate::protocol::systemctl;
+
 /// Errors returned by domain operations.
 #[derive(Debug, Error)]
 pub enum DomainError {
@@ -110,6 +112,12 @@ pub fn validate_idmap_base(base: u32) -> Result<(), DomainError> {
              UIDs can never collide with local accounts"
         )));
     }
+    if base > u32::MAX - IDMAP_RANGE_SPAN {
+        return Err(DomainError::Validation(format!(
+            "idmap base {base} is too high — base + range span ({IDMAP_RANGE_SPAN}) \
+             would overflow"
+        )));
+    }
     Ok(())
 }
 
@@ -183,11 +191,6 @@ fn parse_resolvectl_srv(output: &str) -> Vec<String> {
 
 /// Extract IPs from `resolvectl query <host>` output (lines like
 /// "dc1.corp.example.com: 10.0.0.5").
-///
-/// Not yet called — feeds `render_resolved_dropin` from the join flow in a
-/// later task, once `preflight`'s discovered DC hostnames are resolved to
-/// IPs.
-#[allow(dead_code)]
 fn parse_resolvectl_addresses(output: &str) -> Vec<String> {
     output
         .lines()
@@ -278,7 +281,53 @@ async fn run_cmd(
         .map_err(|e| DomainError::CommandFailed(format!("failed to run {program}: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DomainError::CommandFailed(stderr.trim().to_string()));
+        return Err(DomainError::CommandFailed(format!(
+            "{program} exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run a command, writing `stdin_input` (plus a trailing newline) to its
+/// stdin — used to hand credentials to `net ads join`/`net ads leave`
+/// without ever putting the password in argv (visible via `/proc/*/cmdline`).
+/// Captures stdout+stderr the same way `run_cmd` does.
+async fn run_cmd_stdin(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    stdin_input: &str,
+) -> Result<String, DomainError> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .envs(envs.iter().copied())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| DomainError::CommandFailed(format!("failed to run {program}: {e}")))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let input = format!("{stdin_input}\n");
+        let _ = stdin.write_all(input.as_bytes()).await;
+        // Drop closes stdin so the child sees EOF after the password line.
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| DomainError::CommandFailed(format!("failed to run {program}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DomainError::CommandFailed(format!(
+            "{program} exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -286,10 +335,6 @@ async fn run_cmd(
 /// Fail fast with actionable errors before Kerberos gets a chance to
 /// produce cryptic ones. Checks, in order: the realm's LDAP SRV records
 /// resolve; a DC answers `net ads info`; clock skew is within bounds.
-///
-/// Not yet called — wired up to the join flow in a later task; exercised
-/// by the VM integration test in the meantime.
-#[allow(dead_code)]
 async fn preflight(realm: &str) -> Result<Vec<String>, DomainError> {
     let srv_name = format!("_ldap._tcp.{}", realm.to_ascii_lowercase());
     let out = run_cmd("resolvectl", &["query", "--type=SRV", &srv_name], &[]).await?;
@@ -326,6 +371,55 @@ async fn preflight(realm: &str) -> Result<Vec<String>, DomainError> {
     Ok(dcs)
 }
 
+/// Request to join an Active Directory domain.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct JoinDomainRequest {
+    /// Active Directory realm to join (e.g. "CORP.EXAMPLE.COM").
+    pub realm: String,
+    /// AD account used to authorize the join (needs computer-object create rights).
+    pub username: String,
+    /// Password for `username`. Sent to `net ads join` via stdin only —
+    /// never persisted, never placed in argv.
+    pub password: String,
+    /// Optional AD organizational unit to create the computer object in
+    /// (`net ads join`'s `createcomputer=` option).
+    pub ou: Option<String>,
+    /// Optional base UID for domain user mappings; defaults to `DEFAULT_IDMAP_BASE`.
+    pub idmap_base: Option<u32>,
+}
+
+/// Request to leave the currently-joined Active Directory domain.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LeaveDomainRequest {
+    /// AD account used to authorize the leave (computer-object delete rights).
+    pub username: Option<String>,
+    /// Password for `username`. Sent to `net ads leave` via stdin only.
+    pub password: Option<String>,
+    /// Leave locally without contacting a DC, when credentials aren't
+    /// available. The computer account is left behind (stale) in AD.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Current Active Directory domain membership status.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DomainStatus {
+    /// Whether the system is currently joined to a domain.
+    pub joined: bool,
+    /// The joined realm, if any.
+    pub realm: Option<String>,
+    /// The derived NetBIOS workgroup, if joined.
+    pub workgroup: Option<String>,
+    /// The configured idmap base UID, if joined.
+    pub idmap_base: Option<u32>,
+    /// Whether `wbinfo -t` (the domain trust secret) currently checks out.
+    pub trust_ok: Option<bool>,
+    /// Whether a domain controller answered `net ads info` just now.
+    pub dc_reachable: Option<bool>,
+    /// Clock skew (seconds, DC minus local) observed via `net ads info`.
+    pub clock_skew_seconds: Option<i64>,
+}
+
 /// Service for managing domain join state.
 pub struct DomainService;
 
@@ -356,6 +450,237 @@ impl DomainService {
     /// Clear domain configuration (leave domain).
     pub async fn clear_config() -> Result<(), DomainError> {
         Self::clear_config_at(Path::new(CONFIG_PATH)).await
+    }
+
+    /// Whether the system is currently joined to a domain.
+    ///
+    /// Consumed by the engine's boot restore (router task).
+    #[allow(dead_code)]
+    pub async fn is_joined(&self) -> bool {
+        Self::load_config().await.is_some()
+    }
+
+    /// Start winbindd if it isn't running (boot restore; join already
+    /// restarted it explicitly).
+    ///
+    /// Consumed by the engine's boot restore (router task).
+    #[allow(dead_code)]
+    pub async fn ensure_winbindd(&self) {
+        if let Err(e) = systemctl("start", "samba-winbindd.service").await {
+            tracing::error!("winbindd start failed on domain restore: {e}");
+        }
+    }
+
+    /// Join an Active Directory domain.
+    ///
+    /// Sequence: preflight (DNS SRV + DC reachability + clock skew) →
+    /// render krb5/smb config → per-domain DNS routing to the discovered
+    /// DCs → restart winbindd → `net ads join` (credential via stdin,
+    /// used once, never persisted) → verify the trust with `wbinfo -t` →
+    /// best-effort AD DNS registration → persist state. Any failure prior
+    /// to persisting state rolls the rendered configs back and stops
+    /// winbindd, restoring the pre-join state.
+    pub async fn join(&self, req: JoinDomainRequest) -> Result<DomainStatus, DomainError> {
+        if Self::load_config().await.is_some() {
+            return Err(DomainError::AlreadyJoined);
+        }
+        let realm = validate_realm(&req.realm)?;
+        let idmap_base = req.idmap_base.unwrap_or(DEFAULT_IDMAP_BASE);
+        validate_idmap_base(idmap_base)?;
+        let cfg = DomainConfig {
+            workgroup: derive_workgroup(&realm),
+            realm,
+            idmap_base,
+        };
+
+        // Render krb5 first — preflight's `net ads info` reads it.
+        tokio::fs::write(KRB5_CONF_PATH, render_krb5_conf(&cfg.realm)).await?;
+        let dcs = match preflight(&cfg.realm).await {
+            Ok(dcs) => dcs,
+            Err(e) => {
+                let _ = tokio::fs::write(KRB5_CONF_PATH, "").await;
+                return Err(e);
+            }
+        };
+
+        // Per-domain DNS routing: AD-zone queries go to the DCs from here on
+        // (spec join-flow step 6). Resolve the discovered DC hostnames to IPs
+        // through the still-working current resolvers.
+        let mut dc_ips = Vec::new();
+        for dc in dcs.iter().take(3) {
+            if let Ok(out) = run_cmd("resolvectl", &["query", dc], &[]).await {
+                dc_ips.extend(parse_resolvectl_addresses(&out));
+            }
+        }
+        if !dc_ips.is_empty() {
+            tokio::fs::create_dir_all("/etc/systemd/resolved.conf.d").await?;
+            tokio::fs::write(
+                RESOLVED_DROPIN_PATH,
+                render_resolved_dropin(&cfg.realm, &dc_ips),
+            )
+            .await?;
+            let _ = systemctl("restart", "systemd-resolved.service").await;
+        }
+
+        tokio::fs::write(DOMAIN_SMB_CONF_PATH, render_domain_smb_conf(&cfg)).await?;
+        systemctl("restart", "samba-winbindd.service")
+            .await
+            .map_err(DomainError::CommandFailed)?;
+
+        // Credential via stdin (`net ads join -U user` prompts on stdin when
+        // no %password is attached). NEVER put the password in argv.
+        let mut join_args = vec![
+            "ads",
+            "join",
+            "-U",
+            req.username.as_str(),
+            "--no-dns-updates",
+        ];
+        let ou_arg;
+        if let Some(ou) = &req.ou {
+            ou_arg = format!("createcomputer={ou}");
+            join_args.push(&ou_arg);
+        }
+        let join_out = run_cmd_stdin(
+            "net",
+            &join_args,
+            &[("KRB5_CONFIG", KRB5_CONF_PATH)],
+            &req.password,
+        )
+        .await;
+
+        match join_out {
+            Ok(_) => {}
+            Err(e) => {
+                // Roll back: empty the rendered configs, drop the DNS routing,
+                // stop winbindd.
+                let _ = tokio::fs::write(DOMAIN_SMB_CONF_PATH, "").await;
+                let _ = tokio::fs::write(KRB5_CONF_PATH, "").await;
+                let _ = tokio::fs::remove_file(RESOLVED_DROPIN_PATH).await;
+                let _ = systemctl("restart", "systemd-resolved.service").await;
+                let _ = systemctl("stop", "samba-winbindd.service").await;
+                return Err(e);
+            }
+        }
+
+        // Verify the trust before declaring success.
+        if let Err(e) = run_cmd("wbinfo", &["-t"], &[]).await {
+            let _ = run_cmd_stdin(
+                "net",
+                &["ads", "leave", "-U", &req.username],
+                &[("KRB5_CONFIG", KRB5_CONF_PATH)],
+                &req.password,
+            )
+            .await;
+            let _ = tokio::fs::write(DOMAIN_SMB_CONF_PATH, "").await;
+            let _ = tokio::fs::write(KRB5_CONF_PATH, "").await;
+            let _ = systemctl("stop", "samba-winbindd.service").await;
+            return Err(DomainError::CommandFailed(format!(
+                "joined but the trust check failed (wbinfo -t): {e}"
+            )));
+        }
+
+        // Register our A record in AD DNS (best-effort — some sites restrict it).
+        if let Err(e) = run_cmd(
+            "net",
+            &["ads", "dns", "register"],
+            &[("KRB5_CONFIG", KRB5_CONF_PATH)],
+        )
+        .await
+        {
+            tracing::warn!("AD DNS register failed (non-fatal): {e}");
+        }
+
+        Self::save_config(&cfg).await?;
+        // smbd reloads pick up the ADS block via the include chain.
+        let _ = run_cmd("smbcontrol", &["all", "reload-config"], &[]).await;
+        tracing::info!(
+            "Joined AD domain {} (workgroup {})",
+            cfg.realm,
+            cfg.workgroup
+        );
+        Ok(self.status().await)
+    }
+
+    /// Leave the currently-joined Active Directory domain.
+    ///
+    /// With credentials, contacts a DC to remove the computer object via
+    /// `net ads leave`. With `force=true` and no credentials, leaves
+    /// locally only — the computer account goes stale in AD (matches
+    /// `net ads leave`'s own documented behavior for that case).
+    pub async fn leave(&self, req: LeaveDomainRequest) -> Result<(), DomainError> {
+        let Some(_cfg) = Self::load_config().await else {
+            return Err(DomainError::NotJoined);
+        };
+        match (&req.username, &req.password, req.force) {
+            (Some(user), Some(pass), _) => {
+                run_cmd_stdin(
+                    "net",
+                    &["ads", "leave", "-U", user],
+                    &[("KRB5_CONFIG", KRB5_CONF_PATH)],
+                    pass,
+                )
+                .await?;
+            }
+            (_, _, true) => {
+                // Forced local leave: no DC contact; the computer account
+                // goes stale in AD (documented, matches `net ads leave` docs).
+                tracing::warn!("forced local domain leave — computer account left behind in AD");
+            }
+            _ => {
+                return Err(DomainError::Validation(
+                    "leave needs AD credentials, or force=true for a local-only leave".into(),
+                ));
+            }
+        }
+        tokio::fs::write(DOMAIN_SMB_CONF_PATH, "").await?;
+        tokio::fs::write(KRB5_CONF_PATH, "").await?;
+        let _ = tokio::fs::remove_file(RESOLVED_DROPIN_PATH).await;
+        let _ = systemctl("restart", "systemd-resolved.service").await;
+        let _ = systemctl("stop", "samba-winbindd.service").await;
+        Self::clear_config().await?;
+        let _ = run_cmd("smbcontrol", &["all", "reload-config"], &[]).await;
+        tracing::info!("Left AD domain");
+        Ok(())
+    }
+
+    /// Report current Active Directory domain membership status.
+    pub async fn status(&self) -> DomainStatus {
+        let Some(cfg) = Self::load_config().await else {
+            return DomainStatus {
+                joined: false,
+                realm: None,
+                workgroup: None,
+                idmap_base: None,
+                trust_ok: None,
+                dc_reachable: None,
+                clock_skew_seconds: None,
+            };
+        };
+        let trust_ok = Some(run_cmd("wbinfo", &["-t"], &[]).await.is_ok());
+        let (dc_reachable, clock_skew_seconds) =
+            match run_cmd("net", &["ads", "info"], &[("KRB5_CONFIG", KRB5_CONF_PATH)]).await {
+                Ok(out) => {
+                    let skew = parse_net_ads_server_time(&out).map(|t| {
+                        let local = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        t - local
+                    });
+                    (Some(true), skew)
+                }
+                Err(_) => (Some(false), None),
+            };
+        DomainStatus {
+            joined: true,
+            realm: Some(cfg.realm),
+            workgroup: Some(cfg.workgroup),
+            idmap_base: Some(cfg.idmap_base),
+            trust_ok,
+            dc_reachable,
+            clock_skew_seconds,
+        }
     }
 
     /// Load domain configuration from an arbitrary path if it exists.
@@ -429,12 +754,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_idmap_base_rejects_low_ranges() {
+    fn validate_idmap_base_rejects_out_of_range() {
         // Must clear every local UID the engine can allocate.
         assert!(validate_idmap_base(3000).is_err());
         assert!(validate_idmap_base(65_535).is_err());
         assert!(validate_idmap_base(65_536).is_ok());
         assert!(validate_idmap_base(DEFAULT_IDMAP_BASE).is_ok());
+        // Must not let `base + IDMAP_RANGE_SPAN - 1` overflow u32 in the renderer.
+        assert!(validate_idmap_base(u32::MAX - 100).is_err());
     }
 
     #[tokio::test]
