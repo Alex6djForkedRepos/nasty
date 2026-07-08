@@ -743,10 +743,13 @@ impl DomainService {
             }
 
             // Register our A record in AD DNS (best-effort — some sites
-            // restrict it).
+            // restrict it). `-P` authenticates with the machine account
+            // from secrets.tdb (just created by the join); without it net
+            // falls back to the ambient user (`<WORKGROUP>\root`) and
+            // fails with "Invalid credentials".
             if let Err(e) = run_cmd(
                 "net",
-                &["ads", "dns", "register"],
+                &["ads", "dns", "register", "-P"],
                 &[("KRB5_CONFIG", KRB5_CONF_PATH)],
             )
             .await
