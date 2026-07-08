@@ -566,6 +566,19 @@ impl DomainService {
                 )
                 .await?;
                 let _ = systemctl("restart", "systemd-resolved.service").await;
+            } else {
+                // Resolving the DC hostnames to IPs failed, so we can't write
+                // the per-domain routing drop-in. The join can still succeed
+                // via the current resolvers, but AD-zone resolution afterwards
+                // (winbind, Kerberos referrals) depends entirely on those
+                // existing resolvers continuing to answer for the realm — if
+                // they don't, name lookups into the domain will fail.
+                tracing::warn!(
+                    realm = %cfg.realm,
+                    "Domain join proceeding without AD DNS routing: could not \
+                     resolve any DC address; AD-zone resolution now depends on \
+                     the box's existing resolvers"
+                );
             }
 
             tokio::fs::write(DOMAIN_SMB_CONF_PATH, render_domain_smb_conf(&cfg)).await?;
