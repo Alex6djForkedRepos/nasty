@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
+use crate::dc::write_resolved_dropin;
 use crate::protocol::systemctl;
 
 /// Errors returned by domain operations.
@@ -321,7 +322,7 @@ fn command_error(program: &str, output: &std::process::Output) -> DomainError {
 /// Run a command, capturing stdout+stderr. Returns stdout on success;
 /// on non-zero exit (or a spawn failure) returns `CommandFailed` carrying
 /// both stdout and stderr (or the spawn error).
-async fn run_cmd(
+pub(crate) async fn run_cmd(
     program: &str,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -342,7 +343,7 @@ async fn run_cmd(
 /// stdin — used to hand credentials to `net ads join`/`net ads leave`
 /// without ever putting the password in argv (visible via `/proc/*/cmdline`).
 /// Captures stdout+stderr the same way `run_cmd` does.
-async fn run_cmd_stdin(
+pub(crate) async fn run_cmd_stdin(
     program: &str,
     args: &[&str],
     envs: &[(&str, &str)],
@@ -595,6 +596,11 @@ impl DomainService {
         if Self::load_config().await.is_some() {
             return Err(DomainError::AlreadyJoined);
         }
+        if crate::dc::DcService::load_config().await.is_some() {
+            return Err(DomainError::Validation(
+                "this box hosts an Active Directory domain — demote it before joining another domain".into(),
+            ));
+        }
         let realm = validate_realm(&req.realm)?;
         let idmap_base = req.idmap_base.unwrap_or(DEFAULT_IDMAP_BASE);
         validate_idmap_base(idmap_base)?;
@@ -690,10 +696,9 @@ impl DomainService {
                 }
             }
             if !dc_ips.is_empty() {
-                tokio::fs::create_dir_all("/run/systemd/resolved.conf.d").await?;
-                tokio::fs::write(
+                write_resolved_dropin(
                     RESOLVED_DROPIN_PATH,
-                    render_resolved_dropin(&cfg.realm, &dc_ips),
+                    &render_resolved_dropin(&cfg.realm, &dc_ips),
                 )
                 .await?;
                 let _ = systemctl("restart", "systemd-resolved.service").await;
