@@ -14,7 +14,7 @@
 	import LauncherSidebarNav from '$lib/components/LauncherSidebarNav.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type { AuthResult } from '$lib/rpc';
-	import type { BootStatus, BootPhase, SystemStatus } from '$lib/types';
+	import type { BackupProfile, BootStatus, BootPhase, SecureBootReadinessReport, SystemStatus } from '$lib/types';
 	import favicon from '$lib/assets/favicon.svg';
 	import logoLight from '$lib/assets/nasty.svg';
 	import logoDark from '$lib/assets/nasty-white.svg';
@@ -65,6 +65,7 @@
 	import { theme } from '$lib/theme.svelte';
 	import { terminalStatus } from '$lib/terminalStatus.svelte';
 	import { isManagementRole, isStandardUser, redirectForRole } from '$lib/access';
+	import { CORE_RECOVERY_PATHS, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
 
 	let { children } = $props();
 	let connected = $state(false);
@@ -249,16 +250,28 @@
 	}
 
 	// Config backup warning
-	const BACKUP_DISMISSED_KEY = 'nasty:config_backup_dismissed';
+	const BACKUP_DISMISSED_KEY = 'nasty:system_recovery_backup_dismissed:v1';
 	let configBackupMissing = $state(false);
 	let configBackupDismissed = $state(
 		typeof localStorage !== 'undefined' && localStorage.getItem(BACKUP_DISMISSED_KEY) === '1'
 	);
 	async function checkConfigBackup() {
-		if (!connected || !isManagementRole(authInfo?.role) || configBackupDismissed) return;
+		if (!connected || authInfo?.role !== 'admin' || configBackupDismissed) return;
 		try {
-			const profiles = await getClient().call<{ sources: string[] }[]>('backup.profile.list');
-			configBackupMissing = !profiles.some(p => p.sources.some(s => s.includes('/var/lib/nasty')));
+			const requiredSources: string[] = [...CORE_RECOVERY_PATHS];
+			try {
+				const readiness = await getClient().call<SecureBootReadinessReport>('system.secure_boot.readiness');
+				if (readiness.sbctl_keys_already_generated) {
+					requiredSources.push(SECURE_BOOT_RECOVERY_SOURCE.path);
+				}
+			} catch { /* Secure Boot is optional. */ }
+			const profiles = await getClient().call<BackupProfile[]>('backup.profile.list');
+			configBackupMissing = !profiles.some(profile =>
+				profile.enabled
+				&& profile.repo_initialized
+				&& profile.last_run?.success === true
+				&& requiredSources.every(source => profile.sources.includes(source))
+			);
 		} catch { /* ignore */ }
 	}
 	function dismissConfigBackup() {
@@ -486,6 +499,7 @@
 	onMount(() => {
 		if (isPublicShare) return;
 		tryConnect();
+		window.addEventListener(RECOVERY_BACKUP_CHANGED_EVENT, checkConfigBackup);
 		const tick = setInterval(() => { now = new Date(); }, 1000);
 		const rebootPoll = setInterval(checkRebootRequired, 30_000);
 		const statusPoll = setInterval(refreshSystemStatus, 20_000);
@@ -504,6 +518,7 @@
 			clearInterval(rebootPoll);
 			clearInterval(statusPoll);
 			clearInterval(authPoll);
+			window.removeEventListener(RECOVERY_BACKUP_CHANGED_EVENT, checkConfigBackup);
 		};
 	});
 
@@ -1330,8 +1345,8 @@
 				{/if}
 				{#if configBackupMissing}
 					<div class="mb-4 flex items-center gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-sm text-amber-400">
-						<span class="flex-1">NASty configuration is not backed up.</span>
-						<Button size="sm" onclick={() => goto('/backups?create=config')}>Create Backup</Button>
+						<span class="flex-1">No successful system recovery backup covers NASty state, system configuration, TLS identity, and the host credential key.</span>
+						<Button size="sm" onclick={() => goto('/backups?create=config')}>Create Recovery Backup</Button>
 						<button onclick={dismissConfigBackup} class="text-xs text-amber-400/60 hover:text-amber-400 shrink-0">dismiss</button>
 					</div>
 				{/if}
