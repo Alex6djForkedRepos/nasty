@@ -528,13 +528,7 @@ impl IscsiService {
         // Create the IQN and TPG separately. Apart from allowing cleanup of a
         // half-created target, this keeps configfs errors tied to the component
         // that actually failed instead of create_dir_all reporting only the leaf.
-        let target_path = format!("{ISCSI_BASE}/{iqn}");
-        let tpg_path = format!("{ISCSI_BASE}/{iqn}/tpgt_1");
-        configfs_mkdir_new(&target_path).await?;
-        if let Err(error) = configfs_mkdir(&tpg_path).await {
-            let _ = configfs_rmdir(&target_path).await;
-            return Err(error);
-        }
+        let (target_path, tpg_path) = create_target_dirs(ISCSI_BASE, &iqn).await?;
 
         // Create mandatory portals first — any failure aborts the
         // whole create, but we've only created the TPG dir so far,
@@ -1317,6 +1311,21 @@ async fn cleanup_unpersisted_target(target_path: &str, tpg_path: &str, portals: 
     let _ = configfs_rmdir(target_path).await;
 }
 
+async fn create_target_dirs(base: &str, iqn: &str) -> Result<(String, String), IscsiError> {
+    // A loaded iSCSI fabric can still have no configfs base until its first
+    // target is created. Ensure only that shared parent before exclusively
+    // creating the request-owned IQN used by rollback.
+    configfs_mkdir(base).await?;
+    let target_path = format!("{base}/{iqn}");
+    let tpg_path = format!("{target_path}/tpgt_1");
+    configfs_mkdir_new(&target_path).await?;
+    if let Err(error) = configfs_mkdir(&tpg_path).await {
+        let _ = configfs_rmdir(&target_path).await;
+        return Err(error);
+    }
+    Ok((target_path, tpg_path))
+}
+
 async fn configfs_mkdir(path: &str) -> Result<(), IscsiError> {
     tokio::fs::create_dir_all(path)
         .await
@@ -1769,6 +1778,22 @@ mod tests {
             acls: vec![],
             enabled: true,
         }
+    }
+
+    #[tokio::test]
+    async fn target_creation_initializes_a_cold_fabric_base() {
+        let root = std::env::temp_dir().join(format!("nasty-iscsi-{}", Uuid::new_v4()));
+        let base = root.join("target/iscsi");
+        let base = base.to_str().unwrap();
+
+        let (target_path, tpg_path) = create_target_dirs(base, "iqn.test:cold").await.unwrap();
+
+        assert!(std::path::Path::new(base).is_dir());
+        assert!(std::path::Path::new(&target_path).is_dir());
+        assert!(std::path::Path::new(&tpg_path).is_dir());
+        assert!(create_target_dirs(base, "iqn.test:cold").await.is_err());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
     #[test]
