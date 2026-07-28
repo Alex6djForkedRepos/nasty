@@ -6,19 +6,29 @@
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
 	import { formatBytes } from '$lib/format';
-	import type { BackupProfile, BackupSnapshot, BackupStatus, BackupJob, SecretsStatus, Subvolume, Filesystem } from '$lib/types';
+	import type { BackupProfile, BackupSnapshot, BackupStatus, BackupJob, SecretsStatus, Subvolume, Filesystem, SecureBootReadinessReport } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { Badge } from '$lib/components/ui/badge';
 	import PathPicker from '$lib/components/PathPicker.svelte';
+	import { CORE_RECOVERY_SOURCES, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
 	import { FolderOpen } from '@lucide/svelte';
 
 	const client = getClient();
 	let profiles: BackupProfile[] = $state([]);
 	let loading = $state(true);
 	let showCreate = $state(false);
+	let isAdmin = $state(false);
+	let canOperateBackups = $state(false);
+	let secureBootKeysAvailable = $state(false);
+	const recoverySources = $derived([
+		...CORE_RECOVERY_SOURCES,
+		...(secureBootKeysAvailable
+			? [SECURE_BOOT_RECOVERY_SOURCE]
+			: []),
+	]);
 	let backupStatus: BackupStatus | null = $state(null);
 	/** Loaded once on mount from backup.secrets_status — drives the
 	 * small status pill near the page header. `null` means the
@@ -111,6 +121,23 @@
 		} catch { /* ignore */ }
 	}
 
+	async function loadRecoveryContext() {
+		try {
+			const identity = await client.call<{ role: string; scoped: boolean }>('auth.me');
+			isAdmin = identity.role === 'admin' && !identity.scoped;
+			canOperateBackups = !identity.scoped && (identity.role === 'admin' || identity.role === 'operator');
+		} catch {
+			isAdmin = false;
+			canOperateBackups = false;
+			return;
+		}
+		if (!isAdmin) return;
+		try {
+			const readiness = await client.call<SecureBootReadinessReport>('system.secure_boot.readiness');
+			secureBootKeysAvailable = readiness.sbctl_keys_already_generated;
+		} catch { /* Secure Boot is optional. */ }
+	}
+
 	function toggleSource(path: string) {
 		const s = new Set(selectedSources);
 		if (s.has(path)) s.delete(path); else s.add(path);
@@ -118,7 +145,7 @@
 		// Preserve any typed-in or browse-added paths that aren't part
 		// of a checkbox row, so toggling a checkbox doesn't wipe them.
 		const knownPaths = new Set<string>([
-			'/var/lib/nasty',
+			...recoverySources.map(source => source.path),
 			...filesystems.filter(f => f.mounted).map(f => `/fs/${f.name}`),
 			...subvolumes.map(sv => `/fs/${sv.filesystem}/${sv.name}`),
 		]);
@@ -520,7 +547,7 @@
 	}
 
 	onMount(async () => {
-		await refresh();
+		await Promise.all([refresh(), loadRecoveryContext()]);
 		loading = false;
 		// Load filesystems (and subvolumes) up front rather than only when
 		// the create form is opened — the restore dialog's destination
@@ -552,12 +579,12 @@
 		} catch { /* engine didn't expose jobs.list; ignore */ }
 
 		// Auto-open create form with config preset from ?create=config
-		if ($page.url.searchParams.get('create') === 'config') {
+		if ($page.url.searchParams.get('create') === 'config' && isAdmin) {
 			showCreate = true;
-			newName = 'NASty Config';
-			newSources = '/var/lib/nasty';
+			newName = 'NASty System Recovery';
+			newSources = recoverySources.map(source => source.path).join(', ');
 			newSchedule = '0 3 * * *';
-			selectedSources = new Set(['/var/lib/nasty']);
+			selectedSources = new Set(recoverySources.map(source => source.path));
 		}
 	});
 
@@ -580,6 +607,7 @@
 	async function refresh() {
 		try {
 			profiles = await client.call<BackupProfile[]>('backup.profile.list');
+			window.dispatchEvent(new Event(RECOVERY_BACKUP_CHANGED_EVENT));
 			backupStatus = await client.call<BackupStatus>('backup.status');
 			// Fetch snapshot counts for initialized repos
 			for (const p of profiles.filter(p => p.repo_initialized)) {
@@ -720,6 +748,21 @@
 		if (t.type === 'b2') return `b2:${t.bucket}`;
 		return '?';
 	}
+
+	function profileHasSystemSources(profile: BackupProfile): boolean {
+		return profile.sources.some(source => {
+			const components = source.split('/').filter(component => component && component !== '.');
+			return !source.startsWith('/')
+				|| components.length < 2
+				|| components[0] !== 'fs'
+				|| components.slice(1).some(component => component === '.' || component === '..');
+		});
+	}
+
+	function hasRecoverySource(rawSources: string): boolean {
+		const sources = new Set(rawSources.split(',').map(source => source.trim()).filter(Boolean));
+		return recoverySources.some(source => sources.has(source.path));
+	}
 </script>
 
 <div class="space-y-4">
@@ -728,9 +771,11 @@
 	</div>
 
 	<div class="mb-4 flex items-center gap-3">
+		{#if canOperateBackups}
 		<Button size="sm" onclick={() => { showCreate = !showCreate; if (showCreate) loadSourceData(); }}>
 			{showCreate ? 'Cancel' : 'Create Backup'}
 		</Button>
+		{/if}
 		{#if secretsStatus}
 			{#if secretsStatus.status === 'available' && secretsStatus.backend === 'tpm-and-host'}
 				<Badge variant="default" class="text-[0.65rem]"
@@ -772,12 +817,17 @@
 				<div>
 					<Label>Sources {#if !newSources && createTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</Label>
 					<div class="mt-1 space-y-1">
-						<!-- System config -->
-						<label class="flex items-center gap-2 text-sm cursor-pointer rounded px-2 py-1 hover:bg-muted/30 {selectedSources.has('/var/lib/nasty') ? 'bg-muted/20' : ''}">
-							<input type="checkbox" checked={selectedSources.has('/var/lib/nasty')} onchange={() => toggleSource('/var/lib/nasty')} class="rounded border-input" />
-							<span class="font-mono text-xs">/var/lib/nasty</span>
-							<span class="text-xs text-muted-foreground">NASty configuration</span>
-						</label>
+						{#if isAdmin}
+							<!-- Recovery-sensitive host state is Admin-only. The backend
+							     enforces the same boundary for direct RPC callers. -->
+							{#each recoverySources as source}
+								<label class="flex items-center gap-2 text-sm cursor-pointer rounded px-2 py-1 hover:bg-muted/30 {selectedSources.has(source.path) ? 'bg-muted/20' : ''}">
+									<input type="checkbox" checked={selectedSources.has(source.path)} onchange={() => toggleSource(source.path)} class="rounded border-input" />
+									<span class="font-mono text-xs">{source.path}</span>
+									<span class="text-xs text-muted-foreground">{source.label}</span>
+								</label>
+							{/each}
+						{/if}
 						<!-- Whole-filesystem sources. Useful when the user wants
 						     everything under a pool without picking subvolumes
 						     individually. -->
@@ -799,11 +849,16 @@
 						{/each}
 					</div>
 					<div class="mt-2 flex gap-2">
-						<Input bind:value={newSources} placeholder="Additional paths (comma-separated)" class="font-mono text-xs" />
+						<Input bind:value={newSources} placeholder={isAdmin ? 'Additional paths (comma-separated)' : 'Additional /fs paths (comma-separated)'} class="font-mono text-xs" />
 						<Button variant="outline" size="sm" onclick={() => { createPickerOpen = true; }} title="Browse for a folder under /fs">
 							<FolderOpen size={14} class="mr-1" /> Browse
 						</Button>
 					</div>
+					{#if hasRecoverySource(newSources)}
+						<div class="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+							This recovery snapshot contains appliance authentication state, filesystem recovery keys, TLS private keys, the host credential key, and possibly Secure Boot signing keys. Anyone with the repository password can recover this material. Use a strong, separately stored password. TPM-sealed credentials can still require the original TPM. Samba/AD databases are not included because they require a transaction-safe domain backup.
+						</div>
+					{/if}
 				</div>
 
 				<div>
@@ -940,6 +995,7 @@
 	{:else}
 		<div class="space-y-3">
 			{#each profiles as profile}
+				{@const canManageProfile = canOperateBackups && (isAdmin || !profileHasSystemSources(profile))}
 				<Card>
 					<CardContent class="pt-4 pb-4">
 						<div class="flex items-start justify-between">
@@ -990,6 +1046,7 @@
 								{/if}
 							</div>
 							<div class="flex gap-2">
+								{#if canManageProfile}
 								{#if !profile.repo_initialized}
 									<Button size="xs" onclick={() => initRepo(profile.id)} disabled={activeJobs[profile.id] !== undefined}>
 										{activeJobs[profile.id] ? 'Init Repo…' : 'Init Repo'}
@@ -1006,6 +1063,9 @@
 								{/if}
 								<Button size="xs" variant="secondary" onclick={() => startEdit(profile)}>Edit</Button>
 								<Button size="xs" variant="destructive" onclick={() => deleteProfile(profile.id)}>Delete</Button>
+								{:else if profileHasSystemSources(profile)}
+									<Badge variant="secondary" class="text-[0.6rem]">Admin required</Badge>
+								{/if}
 							</div>
 						</div>
 						{#if editId === profile.id}

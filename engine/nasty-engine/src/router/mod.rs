@@ -165,14 +165,12 @@ fn is_operator_allowed(method: &str) -> bool {
                 // fixing here because the guard test now enforces it.
                 | "apps.networks.create"
                 | "apps.networks.remove"
-                // Backup lifecycle is operator territory in a NAS
-                // appliance — same role that manages shares + apps
-                // typically manages where the data is copied. The
-                // read paths (`backup.profile.get`/`list`,
-                // `backup.status`, `backup.snapshots`) are already
-                // in `is_read_only`, so credentials in profiles are
-                // already visible to operators; admitting the write
-                // paths doesn't widen secrets exposure.
+                // Data backup lifecycle is operator territory in a NAS
+                // appliance — the same role manages shares and apps.
+                // `router::backup` adds a content-aware Admin gate when a
+                // profile reads system state outside `/fs`; otherwise an
+                // Operator could send arbitrary root-readable files to a
+                // repository they control.
                 | "backup.profile.create"
                 | "backup.profile.update"
                 | "backup.profile.delete"

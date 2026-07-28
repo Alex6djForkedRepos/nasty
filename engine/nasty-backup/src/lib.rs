@@ -772,6 +772,39 @@ impl BackupError {
     }
 }
 
+fn validate_sources(sources: &[String]) -> Result<(), BackupError> {
+    if sources.is_empty() || sources.iter().any(|source| source.trim().is_empty()) {
+        return Err(BackupError::Failed("backup sources cannot be empty".into()));
+    }
+    Ok(())
+}
+
+fn backup_definition_matches(left: &BackupProfile, right: &BackupProfile) -> bool {
+    left.sources == right.sources
+        && serde_json::to_value((
+            &left.target,
+            &left.password,
+            &left.password_encrypted,
+            &left.trusted_cacert,
+        ))
+        .ok()
+            == serde_json::to_value((
+                &right.target,
+                &right.password,
+                &right.password_encrypted,
+                &right.trusted_cacert,
+            ))
+            .ok()
+}
+
+fn invalidate_last_run_if_definition_changed(update: &mut BackupProfile, existing: &BackupProfile) {
+    if !backup_definition_matches(update, existing) {
+        // A successful run only proves the old source/repository definition.
+        // Do not let UI coverage checks treat an edited profile as backed up.
+        update.last_run = None;
+    }
+}
+
 // ── Repository helpers ────────────────────────────────────────
 
 /// Build a Repository from a profile's target. The caller is expected
@@ -933,6 +966,7 @@ impl BackupService {
         &self,
         mut profile: BackupProfile,
     ) -> Result<BackupProfile, BackupError> {
+        validate_sources(&profile.sources)?;
         // Encrypt plaintext secrets before persisting. If the secrets
         // backend is unavailable on this host (no systemd-creds, broken
         // TPM enrollment, etc.) we keep the legacy plaintext field
@@ -969,11 +1003,14 @@ impl BackupService {
         id: &str,
         mut update: BackupProfile,
     ) -> Result<BackupProfile, BackupError> {
+        validate_sources(&update.sources)?;
         // Same encryption-on-save invariant as create. The operator
         // can submit a plaintext password (rotate) or omit it (keep
         // existing); we carry the existing encrypted value forward
         // when the update doesn't supply a new one.
-        carry_forward_existing_secrets(&mut update, &self.get_profile_internal(id).await?);
+        let existing = self.get_profile_internal(id).await?;
+        carry_forward_existing_secrets(&mut update, &existing);
+        invalidate_last_run_if_definition_changed(&mut update, &existing);
         if let Some(pem) = &update.trusted_cacert {
             validate_pem_cert(pem)?;
         }
@@ -1202,6 +1239,7 @@ impl BackupService {
 
     pub async fn run_backup(&self, id: &str) -> Result<BackupRunResult, BackupError> {
         let profile = self.get_profile_internal(id).await?;
+        validate_sources(&profile.sources)?;
 
         // Auto-init repo if not yet initialized
         if !profile.repo_initialized {
@@ -1218,6 +1256,7 @@ impl BackupService {
         let start = std::time::Instant::now();
         *self.running.lock().await = Some(id.to_string());
 
+        let run_profile = profile.clone();
         let sources = profile.sources.clone();
         let backup_result = tokio::task::spawn_blocking(move || {
             let repo = make_repo(&profile, &resolved)?;
@@ -1270,17 +1309,27 @@ impl BackupService {
             },
         };
 
-        {
+        let result_recorded = {
             let mut profiles = self.profiles.lock().await;
-            if let Some(p) = profiles.iter_mut().find(|p| p.id == id) {
+            let unchanged = profiles
+                .iter_mut()
+                .find(|profile| profile.id == id)
+                .filter(|profile| backup_definition_matches(profile, &run_profile));
+            if let Some(p) = unchanged {
                 p.last_run = Some(result.clone());
+                save_profiles(&profiles).await;
+                true
+            } else {
+                warn!(
+                    "Backup profile '{id}' changed while its job was running; not recording the stale result"
+                );
+                false
             }
-            save_profiles(&profiles).await;
-        }
+        };
 
         if result.success {
             info!("Backup completed in {}s", duration);
-            if let Err(e) = self.prune(id).await {
+            if result_recorded && let Err(e) = self.prune(run_profile).await {
                 warn!("Auto-prune failed: {e}");
             }
         } else {
@@ -1388,8 +1437,7 @@ impl BackupService {
         .map_err(|e| BackupError::Failed(format!("spawn: {e}")))?
     }
 
-    async fn prune(&self, id: &str) -> Result<(), BackupError> {
-        let profile = self.get_profile_internal(id).await?;
+    async fn prune(&self, profile: BackupProfile) -> Result<(), BackupError> {
         let password = resolve_profile_password(&profile).await?;
         let resolved = profile.resolve_runtime().await?;
         let r = profile.retention.clone();
@@ -1493,6 +1541,15 @@ async fn save_profiles(profiles: &[BackupProfile]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn backup_sources_must_not_be_empty() {
+        assert!(validate_sources(&["/var/lib/nasty".into(), "/etc/nixos".into()]).is_ok());
+        assert!(validate_sources(&[]).is_err());
+        assert!(validate_sources(&["".into()]).is_err());
+        assert!(validate_sources(&["relative/path".into()]).is_ok());
+        assert!(validate_sources(&["/".into()]).is_ok());
+    }
+
     /// Construct an `EncryptedBlob` without going through systemd-creds.
     /// The blob isn't decryptable — that's fine for tests that just
     /// need to assert "an encrypted value is present" or that resolve
@@ -1519,6 +1576,38 @@ mod tests {
             last_run: None,
             trusted_cacert: None,
         }
+    }
+
+    #[test]
+    fn backup_definition_changes_invalidate_previous_success() {
+        let mut existing = baseline_profile(BackupTarget::Local {
+            path: "/backup".into(),
+        });
+        existing.last_run = Some(BackupRunResult {
+            timestamp: "2026-07-28T00:00:00Z".into(),
+            success: true,
+            message: "ok".into(),
+            duration_secs: 1,
+            bytes_added: Some(1),
+            files_new: Some(1),
+            files_changed: Some(0),
+        });
+
+        let mut unchanged = existing.clone();
+        invalidate_last_run_if_definition_changed(&mut unchanged, &existing);
+        assert!(unchanged.last_run.is_some());
+
+        let mut changed = existing.clone();
+        changed.sources.push("/etc/nixos".into());
+        invalidate_last_run_if_definition_changed(&mut changed, &existing);
+        assert!(changed.last_run.is_none());
+
+        let mut retargeted = existing.clone();
+        retargeted.target = BackupTarget::Local {
+            path: "/different-backup".into(),
+        };
+        invalidate_last_run_if_definition_changed(&mut retargeted, &existing);
+        assert!(retargeted.last_run.is_none());
     }
 
     fn s3_with_plaintext(secret: &str, region: Option<&str>) -> BackupTarget {

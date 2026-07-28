@@ -1,11 +1,9 @@
 # Backup Restore
 
-Design for restoring rustic (restic-compatible) backups through the NASty
-WebUI. Requested in [discussion #626](https://github.com/orgs/nasty-project/discussions/626)
-(es5445): the backup system can run backups, check a repo, and list its
-snapshots, but has **no restore operation** — so disaster recovery (a dead
-box, a fresh install, appdata pulled back from S3) isn't possible without
-shelling out to Backrest.
+NASty runs and restores encrypted rustic (restic-compatible) backups through
+the WebUI. Restore was requested in
+[discussion #626](https://github.com/orgs/nasty-project/discussions/626)
+and restores a whole snapshot into a staging destination on managed storage.
 
 ## Scope
 
@@ -21,6 +19,34 @@ shelling out to Backrest.
 - Browsing and restoring individual files/folders within a snapshot.
 - In-place restore back to a snapshot's original paths (v1 always restores
   to an operator-chosen destination).
+
+## System recovery profile
+
+The Admin-only **NASty System Recovery** preset includes:
+
+- `/var/lib/nasty` — engine settings and service definitions;
+- `/etc/nixos` — the installed system wrapper and hardware configuration;
+- `/var/lib/caddy` — TLS certificates and the local CA identity;
+- `/var/lib/systemd/credential.secret` — the host key needed to decrypt
+  host-only `systemd-creds` values;
+- `/var/lib/sbctl` when Secure Boot signing keys exist.
+
+These sources contain appliance authentication state, filesystem recovery
+keys, TLS private keys, the host credential key, and potentially Secure Boot
+signing keys. Anyone with the repository password can recover this material.
+The password must be strong, unique, and stored separately. TPM-sealed
+credentials can still require the original TPM even when the host credential
+key is present.
+
+The preset deliberately excludes live Samba/AD databases. A file-level copy
+of live TDB/LDB state can be inconsistent; hosted domains must use the
+Directory panel's transaction-safe domain backup and include its `/fs`
+destination in a normal backup profile.
+
+System recovery snapshots restore under `/fs/<filesystem>/<destination>` like
+every other snapshot. They do not overwrite a running appliance in place;
+the restored tree is staged for an administrator or future recovery wizard to
+validate and import.
 
 ## Principle: operations stay on `/fs`
 
