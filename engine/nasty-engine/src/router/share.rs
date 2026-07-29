@@ -272,7 +272,51 @@ fn session_is_scoped(session: &Session) -> bool {
     session.filesystem.is_some() || session.owner.is_some()
 }
 
+async fn quiesce_iscsi_after_failed_repair(state: &AppState) -> Option<String> {
+    let mut failures = Vec::new();
+    if let Err(error) = state
+        .protocols
+        .quiesce(nasty_system::protocol::Protocol::Iscsi)
+        .await
+    {
+        failures.push(error);
+    }
+    if let Err(error) = state
+        .firewall
+        .close(nasty_system::protocol::Protocol::Iscsi)
+        .await
+    {
+        failures.push(error);
+    }
+    (!failures.is_empty()).then(|| failures.join("; "))
+}
+
+async fn quiesce_nvmeof_after_failed_repair(state: &AppState) -> Option<String> {
+    let mut failures = Vec::new();
+    if let Err(error) = state.nvmeof.quiesce().await {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = state
+        .firewall
+        .close(nasty_system::protocol::Protocol::Nvmeof)
+        .await
+    {
+        failures.push(error);
+    }
+    (!failures.is_empty()).then(|| failures.join("; "))
+}
+
 async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Option<Response> {
+    let is_block_share_mutation = (req.method.starts_with("share.iscsi.")
+        || req.method.starts_with("share.nvmeof."))
+        && !req.method.ends_with(".list")
+        && !req.method.ends_with(".get");
+    let _block_share_guard = if is_block_share_mutation {
+        Some(state.block_share_mutation.lock().await)
+    } else {
+        None
+    };
+
     Some(match req.method.as_str() {
         "share.nfs.list" => match state.nfs.list().await {
             Ok(v) => ok(req, v),
@@ -530,6 +574,71 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                 Err(e) => invalid(req, e),
             }
         }
+        "share.iscsi.repair_lun" => {
+            if session.role != Role::Admin || session_is_scoped(session) {
+                return Some(err(req, "unscoped Admin session required"));
+            }
+            match parse_params::<nasty_sharing::iscsi::RepairLunRequest>(req) {
+                Ok(p) => {
+                    if let Some(conflict) =
+                        check_block_device_conflict(state, &p.device_path, "iscsi").await
+                    {
+                        return Some(err(req, conflict));
+                    }
+                    match state
+                        .subvolumes
+                        .block_volume_id_for_device(&p.device_path)
+                        .await
+                    {
+                        Ok(Some(identity)) => match state.iscsi.repair_lun(p, identity).await {
+                            Ok((repaired, previous)) => {
+                                let activation = match state
+                                    .protocols
+                                    .quiesce(nasty_system::protocol::Protocol::Iscsi)
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        super::fs::reconcile_block_shares_under_lock(state).await
+                                    }
+                                    Err(error) => Err(format!(
+                                        "failed to stop the existing iSCSI export: {error}"
+                                    )),
+                                };
+                                match activation {
+                                    Ok(()) => ok(req, repaired.redacted()),
+                                    Err(activation_error) => {
+                                        let rollback_error =
+                                            state.iscsi.restore_target_state(&previous).await.err();
+                                        let cleanup_error =
+                                            quiesce_iscsi_after_failed_repair(state).await;
+                                        let mut message = format!(
+                                            "LUN repair could not be activated: {activation_error}"
+                                        );
+                                        if let Some(error) = rollback_error {
+                                            message.push_str(&format!(
+                                                "; persisted-state rollback failed: {error}"
+                                            ));
+                                        } else {
+                                            message.push_str("; persisted state was rolled back");
+                                        }
+                                        if let Some(error) = cleanup_error {
+                                            message.push_str(&format!(
+                                                "; safe export cleanup failed: {error}"
+                                            ));
+                                        }
+                                        err(req, message)
+                                    }
+                                }
+                            }
+                            Err(e) => err(req, e),
+                        },
+                        Ok(None) => err(req, "selected device is not a managed block subvolume"),
+                        Err(e) => err(req, e),
+                    }
+                }
+                Err(e) => invalid(req, e),
+            }
+        }
         "share.iscsi.add_acl" => {
             if let Some(r) =
                 require_protocol(state, req, nasty_system::protocol::Protocol::Iscsi).await
@@ -753,6 +862,74 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                     Ok(v) => ok(req, v),
                     Err(e) => err(req, e),
                 },
+                Err(e) => invalid(req, e),
+            }
+        }
+        "share.nvmeof.repair_namespace" => {
+            if session.role != Role::Admin || session_is_scoped(session) {
+                return Some(err(req, "unscoped Admin session required"));
+            }
+            match parse_params::<nasty_sharing::nvmeof::RepairNamespaceRequest>(req) {
+                Ok(p) => {
+                    if let Some(conflict) =
+                        check_block_device_conflict(state, &p.device_path, "nvmeof").await
+                    {
+                        return Some(err(req, conflict));
+                    }
+                    match state
+                        .subvolumes
+                        .block_volume_id_for_device(&p.device_path)
+                        .await
+                    {
+                        Ok(Some(identity)) => {
+                            match state.nvmeof.repair_namespace(p, identity).await {
+                                Ok((repaired, previous)) => {
+                                    let activation = match state.nvmeof.quiesce().await {
+                                        Ok(()) => {
+                                            super::fs::reconcile_block_shares_under_lock(state)
+                                                .await
+                                        }
+                                        Err(error) => Err(format!(
+                                            "failed to stop the existing NVMe-oF export: {error}"
+                                        )),
+                                    };
+                                    match activation {
+                                        Ok(()) => ok(req, repaired),
+                                        Err(activation_error) => {
+                                            let rollback_error = state
+                                                .nvmeof
+                                                .restore_subsystem_state(&previous)
+                                                .await
+                                                .err();
+                                            let cleanup_error =
+                                                quiesce_nvmeof_after_failed_repair(state).await;
+                                            let mut message = format!(
+                                                "namespace repair could not be activated: {activation_error}"
+                                            );
+                                            if let Some(error) = rollback_error {
+                                                message.push_str(&format!(
+                                                    "; persisted-state rollback failed: {error}"
+                                                ));
+                                            } else {
+                                                message
+                                                    .push_str("; persisted state was rolled back");
+                                            }
+                                            if let Some(error) = cleanup_error {
+                                                message.push_str(&format!(
+                                                    "; safe export cleanup failed: {error}"
+                                                ));
+                                            }
+                                            err(req, message)
+                                        }
+                                    }
+                                }
+                                Err(e) => err(req, e),
+                            }
+                        }
+                        Ok(None) => err(req, "selected device is not a managed block subvolume"),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }

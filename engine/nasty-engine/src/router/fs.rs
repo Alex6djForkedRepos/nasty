@@ -76,10 +76,13 @@ pub(super) async fn try_route(
                     .mount_maybe_degraded(&p.name, p.degraded)
                     .await
                 {
-                    Ok(v) => {
-                        reconcile_block_shares(state).await;
-                        ok(req, v)
-                    }
+                    Ok(v) => match reconcile_block_shares(state).await {
+                        Ok(()) => ok(req, v),
+                        Err(error) => err(
+                            req,
+                            format!("filesystem mounted but block-share recovery failed: {error}"),
+                        ),
+                    },
                     Err(e) => err(req, e),
                 },
                 Err(e) => invalid(req, e),
@@ -97,10 +100,13 @@ pub(super) async fn try_route(
                 let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let passphrase = p.get("passphrase").and_then(|v| v.as_str()).unwrap_or("");
                 match state.filesystems.unlock(name, passphrase).await {
-                    Ok(fs) => {
-                        reconcile_block_shares(state).await;
-                        ok(req, fs)
-                    }
+                    Ok(fs) => match reconcile_block_shares(state).await {
+                        Ok(()) => ok(req, fs),
+                        Err(error) => err(
+                            req,
+                            format!("filesystem unlocked but block-share recovery failed: {error}"),
+                        ),
+                    },
                     Err(e) => err(req, e),
                 }
             }
@@ -369,7 +375,13 @@ pub(super) async fn try_route(
     })
 }
 
-async fn reconcile_block_shares(state: &AppState) {
+pub(crate) async fn reconcile_block_shares(state: &AppState) -> Result<(), String> {
+    let _guard = state.block_share_mutation.lock().await;
+    reconcile_block_shares_under_lock(state).await
+}
+
+pub(crate) async fn reconcile_block_shares_under_lock(state: &AppState) -> Result<(), String> {
+    let mut failures = Vec::new();
     let mappings = state.subvolumes.restore_block_devices().await;
     let nvmeof = state.nvmeof.remap_device_paths(&mappings).await;
     let iscsi = state.iscsi.remap_device_paths(&mappings).await;
@@ -380,6 +392,7 @@ async fn reconcile_block_shares(state: &AppState) {
             .await
         {
             tracing::error!("Failed to quiesce unsafe iSCSI state: {error}");
+            failures.push(format!("quiesce unsafe iSCSI state: {error}"));
         }
         let _ = state
             .firewall
@@ -412,6 +425,7 @@ async fn reconcile_block_shares(state: &AppState) {
         };
         if let Err(error) = result {
             tracing::warn!("Failed to reactivate iSCSI after mount: {error}");
+            failures.push(format!("reactivate iSCSI: {error}"));
             let _ = state
                 .firewall
                 .close(nasty_system::protocol::Protocol::Iscsi)
@@ -421,6 +435,7 @@ async fn reconcile_block_shares(state: &AppState) {
     if !nvmeof.safe_to_restore {
         if let Err(error) = state.nvmeof.quiesce().await {
             tracing::error!("Failed to quiesce unsafe NVMe-oF state: {error}");
+            failures.push(format!("quiesce unsafe NVMe-oF state: {error}"));
         }
         let _ = state
             .firewall
@@ -438,10 +453,13 @@ async fn reconcile_block_shares(state: &AppState) {
             .await
         {
             tracing::warn!("Failed to reopen NVMe-oF firewall after mount: {error}");
+            failures.push(format!("reopen NVMe-oF firewall: {error}"));
         } else if let Err(error) = state.protocols.enable("nvmeof").await {
             tracing::warn!("Failed to reactivate NVMe-oF after mount: {error}");
+            failures.push(format!("reactivate NVMe-oF: {error}"));
         } else if let Err(error) = state.nvmeof.restore().await {
             tracing::warn!("Failed to restore NVMe-oF after mount: {error}");
+            failures.push(format!("restore NVMe-oF: {error}"));
             if let Err(error) = state.nvmeof.quiesce().await {
                 tracing::error!("Failed to quiesce partial NVMe-oF restore: {error}");
             }
@@ -450,5 +468,10 @@ async fn reconcile_block_shares(state: &AppState) {
                 .close(nasty_system::protocol::Protocol::Nvmeof)
                 .await;
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }

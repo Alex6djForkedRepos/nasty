@@ -17,6 +17,7 @@
 		nvmeRemove,
 		nvmeAddNamespace,
 		nvmeRemoveNamespace,
+		nvmeRepairNamespace,
 		nvmeAddPort,
 		nvmeRemovePort,
 		nvmeAddHost,
@@ -24,7 +25,9 @@
 		nvmeLoadSubvolumes,
 	} from '$lib/sharing/nvmeof.svelte';
 
-	$effect(() => { if (nvme.showCreate || nvme.addNsSubsys) nvmeLoadSubvolumes(); });
+	let { isAdmin = false }: { isAdmin?: boolean } = $props();
+
+	$effect(() => { if (nvme.showCreate || nvme.addNsSubsys || nvme.repairNsSubsys) nvmeLoadSubvolumes(); });
 
 	// Per-form "tried" flags — defer amber required-field decoration
 	// until each submit button is clicked at least once.
@@ -41,6 +44,11 @@
 		if (!nvme.addNsDevice) { addNsTried = true; return; }
 		addNsTried = false;
 		await nvmeAddNamespace();
+	}
+	function startRepairNamespace(subsystemId: string, nsid: number) {
+		nvme.repairNsSubsys = subsystemId;
+		nvme.repairNsId = nsid;
+		nvme.repairNsDevice = '';
 	}
 	async function nvmeAddHostGuarded() {
 		if (!nvme.addHostNqn) { addHostTried = true; return; }
@@ -143,6 +151,7 @@
 						{subsys.namespaces.length} namespace{subsys.namespaces.length !== 1 ? 's' : ''}
 						&middot; {subsys.ports.length} port{subsys.ports.length !== 1 ? 's' : ''}
 						&middot; {subsys.allow_any_host ? 'any host' : `${subsys.allowed_hosts.length} allowed host${subsys.allowed_hosts.length !== 1 ? 's' : ''}`}
+						{#if subsys.namespaces.some(ns => ns.backing_volume_unresolved)}<Badge variant="secondary" class="ml-2 border-amber-500/50 text-amber-500">Repair required</Badge>{/if}
 					</td>
 					<td class="p-3" onclick={(e) => e.stopPropagation()}>
 						<div class="flex gap-2">
@@ -165,13 +174,31 @@
 									{:else}
 										<div class="space-y-1">
 											{#each subsys.namespaces as ns}
-												<div class="flex items-center gap-3 rounded bg-secondary/50 px-2 py-1.5">
+												<div class="rounded bg-secondary/50 px-2 py-1.5">
+													<div class="flex items-center gap-3">
 													<div class="text-sm">
 														<span class="font-mono text-xs font-semibold">NSID {ns.nsid}</span>
 														<span class="ml-2 text-muted-foreground">{ns.device_path}</span>
 														<Badge variant={ns.enabled ? 'default' : 'secondary'} class="ml-2 text-[0.6rem]">{ns.enabled ? 'Active' : 'Off'}</Badge>
 													</div>
+													{#if ns.backing_volume_unresolved}
+														<Badge variant="secondary" class="border-amber-500/50 text-amber-500">Backing unresolved</Badge>
+														{#if isAdmin}<Button variant="outline" size="xs" onclick={() => startRepairNamespace(subsys.id, ns.nsid)}>Reconnect</Button>{/if}
+													{/if}
 													<Button variant="destructive" size="xs" onclick={() => nvmeRemoveNamespace(subsys.id, ns.nsid)}>Remove</Button>
+													</div>
+													{#if ns.backing_volume_unresolved && !isAdmin}
+														<p class="mt-2 text-xs text-amber-500">An unscoped Admin must reconnect this namespace to its original block subvolume.</p>
+													{:else if nvme.repairNsSubsys === subsys.id && nvme.repairNsId === ns.nsid}
+														<div class="mt-2 flex items-center gap-2 border-t border-border pt-2">
+															<select bind:value={nvme.repairNsDevice} class="h-8 min-w-72 rounded-md border border-input bg-background px-2 text-xs">
+																<option value="">Select the original block subvolume...</option>
+																{#each nvme.blockSubvolumes as sv}<option value={sv.block_device}>{sv.filesystem}/{sv.name} ({sv.block_device})</option>{/each}
+															</select>
+															<Button size="xs" disabled={!nvme.repairNsDevice} onclick={nvmeRepairNamespace}>Reconnect</Button>
+															<Button size="xs" variant="ghost" onclick={() => { nvme.repairNsSubsys = ''; nvme.repairNsDevice = ''; }}>Cancel</Button>
+														</div>
+													{/if}
 												</div>
 											{/each}
 										</div>

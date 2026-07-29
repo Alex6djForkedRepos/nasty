@@ -640,8 +640,10 @@ pub(super) async fn try_route(
                     // port-sync isn't completely silent.
                     if let Some(ref ip) = v.ip {
                         let nvmeof = state.nvmeof.clone();
+                        let block_share_mutation = state.block_share_mutation.clone();
                         let ip = ip.clone();
                         let h = tokio::spawn(async move {
+                            let _guard = block_share_mutation.lock().await;
                             nvmeof.ensure_tailscale_ports(&ip).await;
                         });
                         tokio::spawn(async move {
@@ -663,7 +665,9 @@ pub(super) async fn try_route(
                 // Clean up NVMe-oF ports that were on the Tailscale IP
                 // (Tailscale IPs are in the 100.x.y.z range)
                 let nvmeof = state.nvmeof.clone();
+                let block_share_mutation = state.block_share_mutation.clone();
                 tokio::spawn(async move {
+                    let _guard = block_share_mutation.lock().await;
                     let subsystems = match nvmeof.list().await {
                         Ok(s) => s,
                         Err(e) => {

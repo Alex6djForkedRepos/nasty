@@ -16,6 +16,20 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    let mutates_block_attachment = matches!(
+        req.method.as_str(),
+        "subvolume.create"
+            | "subvolume.delete"
+            | "subvolume.attach"
+            | "subvolume.detach"
+            | "subvolume.clone"
+    );
+    let _block_share_guard = if mutates_block_attachment {
+        Some(state.block_share_mutation.lock().await)
+    } else {
+        None
+    };
+
     Some(match req.method.as_str() {
         "subvolume.list_all" => {
             let fs_filter = session.filesystem.as_deref();

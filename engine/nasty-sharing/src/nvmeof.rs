@@ -19,6 +19,8 @@ pub enum NvmeofError {
     AlreadyExists(String),
     #[error("device not found: {0}")]
     DeviceNotFound(String),
+    #[error("namespace backing volume cannot be repaired: {0}")]
+    InvalidBackingVolume(String),
     #[error("namespace not found: nsid {0}")]
     NamespaceNotFound(u32),
     #[error("port not found: {0}")]
@@ -138,6 +140,16 @@ pub struct RemoveNamespaceRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct RepairNamespaceRequest {
+    /// ID of the subsystem containing the unresolved namespace.
+    pub subsystem_id: String,
+    /// Namespace whose managed backing identity should be repaired.
+    pub nsid: u32,
+    /// Currently attached managed block-subvolume device.
+    pub device_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddPortRequest {
     /// ID of the subsystem to add the port to.
     pub subsystem_id: String,
@@ -214,6 +226,29 @@ impl Default for NvmeofService {
 impl NvmeofService {
     pub fn new() -> Self {
         Self
+    }
+
+    pub async fn repair_namespace(
+        &self,
+        req: RepairNamespaceRequest,
+        identity: BlockVolumeId,
+    ) -> Result<(NvmeofSubsystem, NvmeofSubsystem), NvmeofError> {
+        let mut subsystem = state_dir()
+            .load::<NvmeofSubsystem>(&req.subsystem_id)
+            .await
+            .ok_or_else(|| NvmeofError::NotFound(req.subsystem_id.clone()))?;
+        let previous = subsystem.clone();
+        repair_subsystem_namespace(&mut subsystem, req.nsid, req.device_path, identity)?;
+        state_dir().save(&subsystem.id, &subsystem).await?;
+        Ok((subsystem, previous))
+    }
+
+    pub async fn restore_subsystem_state(
+        &self,
+        subsystem: &NvmeofSubsystem,
+    ) -> Result<(), NvmeofError> {
+        state_dir().save(&subsystem.id, subsystem).await?;
+        Ok(())
     }
 
     /// Restore NVMe-oF configfs state from persisted JSON files.
@@ -1234,6 +1269,33 @@ fn is_managed_namespace(namespace: &Namespace) -> bool {
         || namespace.device_path.starts_with("/dev/loop")
 }
 
+fn repair_subsystem_namespace(
+    subsystem: &mut NvmeofSubsystem,
+    nsid: u32,
+    device_path: String,
+    identity: BlockVolumeId,
+) -> Result<(), NvmeofError> {
+    let namespace = subsystem
+        .namespaces
+        .iter_mut()
+        .find(|namespace| namespace.nsid == nsid)
+        .ok_or(NvmeofError::NamespaceNotFound(nsid))?;
+    if !namespace.backing_volume_unresolved && namespace.backing_volume.is_some() {
+        return Err(NvmeofError::InvalidBackingVolume(format!(
+            "namespace {nsid} is already resolved"
+        )));
+    }
+    if !namespace.device_path.starts_with("/dev/loop") {
+        return Err(NvmeofError::InvalidBackingVolume(format!(
+            "namespace {nsid} is not an unresolved managed block volume"
+        )));
+    }
+    namespace.device_path = device_path;
+    namespace.backing_volume = Some(identity);
+    namespace.backing_volume_unresolved = false;
+    Ok(())
+}
+
 async fn restore_namespace(ns_path: &str, namespace: &Namespace) -> Result<(), NvmeofError> {
     configfs_write(&format!("{ns_path}/enable"), "0").await?;
     if !Path::new(&namespace.device_path).exists() {
@@ -1316,7 +1378,11 @@ fn remap_subsystem(
         if !is_managed_namespace(namespace) {
             continue;
         }
-        let identity = namespace.backing_volume.clone();
+        let identity = namespace.backing_volume.clone().or_else(|| {
+            mappings
+                .legacy_identity_for_exact_path(&namespace.device_path)
+                .cloned()
+        });
         let resolved = identity
             .as_ref()
             .and_then(|identity| mappings.current.get(identity))
@@ -1484,6 +1550,85 @@ mod tests {
         assert!(safe);
         assert_eq!(subsystem.namespaces[0].device_path, "/dev/loop9");
         assert_eq!(subsystem.namespaces[1].device_path, "/dev/loop4");
+    }
+
+    #[test]
+    fn migrates_legacy_namespace_from_exact_preexisting_attachment() {
+        let identity = volume("pool-a", 10);
+        let mut mappings = BlockDeviceMappings::default();
+        mappings
+            .current
+            .insert(identity.clone(), "/dev/loop7".into());
+        mappings
+            .preexisting
+            .insert("/dev/loop7".into(), identity.clone());
+        let mut subsystem = subsystem("custom-name", vec![namespace(1, "/dev/loop7", None)]);
+        subsystem.allowed_hosts = vec!["nqn.test:host".into()];
+        subsystem.allow_any_host = false;
+
+        let (changed, safe) = remap_subsystem(&mut subsystem, &mappings);
+
+        assert!(changed);
+        assert!(safe);
+        assert_eq!(subsystem.namespaces[0].backing_volume, Some(identity));
+        assert!(!subsystem.namespaces[0].backing_volume_unresolved);
+        assert_eq!(subsystem.allowed_hosts, ["nqn.test:host"]);
+        assert!(!subsystem.allow_any_host);
+    }
+
+    #[test]
+    fn freshly_allocated_loop_path_is_not_legacy_namespace_evidence() {
+        let identity = volume("pool-a", 10);
+        let mut mappings = BlockDeviceMappings::default();
+        mappings.current.insert(identity, "/dev/loop0".into());
+        let mut subsystem = subsystem("volume", vec![namespace(1, "/dev/loop0", None)]);
+
+        let (_, safe) = remap_subsystem(&mut subsystem, &mappings);
+
+        assert!(!safe);
+        assert!(subsystem.namespaces[0].backing_volume.is_none());
+        assert!(subsystem.namespaces[0].backing_volume_unresolved);
+    }
+
+    #[test]
+    fn repair_changes_only_selected_unresolved_namespace() {
+        let identity = volume("pool-a", 10);
+        let preserved = volume("pool-b", 20);
+        let mut unresolved = namespace(1, "/dev/loop0", None);
+        unresolved.backing_volume_unresolved = true;
+        let mut subsystem = subsystem(
+            "repair",
+            vec![
+                unresolved,
+                namespace(2, "/dev/loop4", Some(preserved.clone())),
+            ],
+        );
+        subsystem.allowed_hosts = vec!["nqn.test:host".into()];
+
+        repair_subsystem_namespace(&mut subsystem, 1, "/dev/loop7".into(), identity.clone())
+            .unwrap();
+
+        assert_eq!(subsystem.namespaces[0].device_path, "/dev/loop7");
+        assert_eq!(subsystem.namespaces[0].backing_volume, Some(identity));
+        assert!(!subsystem.namespaces[0].backing_volume_unresolved);
+        assert_eq!(subsystem.namespaces[1].backing_volume, Some(preserved));
+        assert_eq!(subsystem.allowed_hosts, ["nqn.test:host"]);
+    }
+
+    #[test]
+    fn repair_rejects_resolved_or_raw_namespaces() {
+        let identity = volume("pool-a", 10);
+        let mut resolved = subsystem(
+            "resolved",
+            vec![namespace(1, "/dev/loop0", Some(identity.clone()))],
+        );
+        assert!(
+            repair_subsystem_namespace(&mut resolved, 1, "/dev/loop1".into(), identity.clone())
+                .is_err()
+        );
+
+        let mut raw = subsystem("raw", vec![namespace(1, "/dev/sda", None)]);
+        assert!(repair_subsystem_namespace(&mut raw, 1, "/dev/loop1".into(), identity).is_err());
     }
 
     #[test]

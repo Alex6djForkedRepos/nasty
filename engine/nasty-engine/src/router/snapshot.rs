@@ -20,6 +20,13 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    let _block_share_guard =
+        if matches!(req.method.as_str(), "snapshot.clone" | "snapshot.rollback") {
+            Some(state.block_share_mutation.lock().await)
+        } else {
+            None
+        };
+
     Some(match req.method.as_str() {
         "snapshot.list" => match require_str(req, "filesystem") {
             Ok(fs_name) => {

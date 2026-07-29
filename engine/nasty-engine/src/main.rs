@@ -89,6 +89,7 @@ pub struct AppState {
     pub apps: nasty_apps::AppsService,
     pub app_firewall_sync: tokio::sync::Mutex<()>,
     pub portal_firewall_sync: tokio::sync::Mutex<()>,
+    pub block_share_mutation: Arc<tokio::sync::Mutex<()>>,
     pub backups: nasty_backup::BackupService,
     pub firmware: nasty_system::firmware::FirmwareService,
     /// Cached alerts result (timestamp, json value). Avoids re-evaluating
@@ -236,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         apps: nasty_apps::AppsService::new(),
         app_firewall_sync: tokio::sync::Mutex::new(()),
         portal_firewall_sync: tokio::sync::Mutex::new(()),
+        block_share_mutation: Arc::new(tokio::sync::Mutex::new(())),
         backups: nasty_backup::BackupService::new(),
         firmware: nasty_system::firmware::FirmwareService::new(),
         alerts_cache: tokio::sync::Mutex::new(None),
