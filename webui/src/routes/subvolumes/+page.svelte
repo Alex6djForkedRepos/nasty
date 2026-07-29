@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { getClient } from '$lib/client';
 	import { formatBytes } from '$lib/format';
+	import { isShareCollection } from '$lib/share-events';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
@@ -252,8 +253,10 @@
 	 * counts/names in the table proper come from this server-side
 	 * compute. Keyed by subvolume path for O(1) lookup per row. */
 	let dependentsByPath = $state(new Map<string, SubvolumeDependents>());
+	let sharesLoadGeneration = 0;
 
 	async function loadShares() {
+		const generation = ++sharesLoadGeneration;
 		const [nfs, smb, iscsi, nvmeof, vms, appsList, appsStat, deps] = await Promise.allSettled([
 			client.call<NfsShare[]>('share.nfs.list'),
 			client.call<SmbShare[]>('share.smb.list'),
@@ -264,6 +267,7 @@
 			client.call<AppsStatus>('apps.status'),
 			client.call<SubvolumeDependents[]>('subvolume.list_dependents'),
 		]);
+		if (generation !== sharesLoadGeneration) return;
 		allNfs = nfs.status === 'fulfilled' ? nfs.value : [];
 		allSmb = smb.status === 'fulfilled' ? smb.value : [];
 		allIscsi = iscsi.status === 'fulfilled' ? iscsi.value : [];
@@ -379,17 +383,24 @@
 	function handleEvent(_: string, params: unknown) {
 		const p = params as { collection?: string };
 		if (p?.collection === 'subvolume' || p?.collection === 'snapshot') {
-			refresh();
-			if (pageTab === 'snapshots') loadSnapshots();
+			void refresh();
+			if (pageTab === 'snapshots') void loadSnapshots();
 		}
 		// Share changes invalidate the usage column — reload so the badges stay accurate.
-		if (p?.collection === 'nfs' || p?.collection === 'smb' || p?.collection === 'iscsi' || p?.collection === 'nvmeof') {
-			loadShares();
+		if (isShareCollection(p?.collection)) {
+			void loadShares();
 		}
+	}
+
+	function handleReconnect() {
+		void refresh();
+		void loadShares();
+		if (pageTab === 'snapshots') void loadSnapshots();
 	}
 
 	onMount(async () => {
 		client.onEvent(handleEvent);
+		client.onReconnect(handleReconnect);
 		filesystems = await client.call<Filesystem[]>('fs.list');
 		const mounted = filesystems.filter(p => p.mounted);
 		if (mounted.length > 0) {
@@ -399,7 +410,10 @@
 		loading = false;
 	});
 
-	onDestroy(() => client.offEvent(handleEvent));
+	onDestroy(() => {
+		client.offEvent(handleEvent);
+		client.offReconnect(handleReconnect);
+	});
 
 	async function refresh() {
 		const mounted = filesystems.filter(p => p.mounted);
