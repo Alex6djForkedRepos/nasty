@@ -24,6 +24,9 @@ function initialNvmeState() {
 		newPort: 4420,
 		addNsSubsys: '',
 		addNsDevice: '',
+		repairNsSubsys: '',
+		repairNsId: 0,
+		repairNsDevice: '',
 		addPortSubsys: '',
 		addPortTransport: 'tcp',
 		addPortAddr: '0.0.0.0',
@@ -118,6 +121,27 @@ export async function nvmeRemoveNamespace(subsystemId: string, nsid: number) {
 		'Namespace removed'
 	);
 	await nvmeRefresh();
+}
+
+export async function nvmeRepairNamespace() {
+	if (!nvme.repairNsSubsys || !nvme.repairNsDevice) return;
+	if (!await confirm(
+		'Reconnect this namespace?',
+		'Only select the original block subvolume. Choosing a different volume would expose its data through this subsystem.',
+	)) return;
+	const repaired = await withToast(
+		() => getClient().call('share.nvmeof.repair_namespace', {
+			subsystem_id: nvme.repairNsSubsys,
+			nsid: nvme.repairNsId,
+			device_path: nvme.repairNsDevice,
+		}),
+		'Namespace backing volume reconnected',
+	);
+	if (repaired !== undefined) {
+		nvme.repairNsSubsys = '';
+		nvme.repairNsDevice = '';
+		await Promise.all([nvmeRefresh(), nvmeLoadProtocol()]);
+	}
 }
 
 export async function nvmeAddPort() {

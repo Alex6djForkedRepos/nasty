@@ -25,6 +25,8 @@ pub enum IscsiError {
     BackstoreNotFound(String),
     #[error("path is not within a NASty filesystem: {0}")]
     PathNotInPool(String),
+    #[error("LUN backing volume cannot be repaired: {0}")]
+    InvalidBackingVolume(String),
     #[error("configfs error: {0}")]
     ConfigFs(String),
     #[error("command failed: {0}")]
@@ -227,6 +229,16 @@ pub struct RemoveLunRequest {
     pub target_id: String,
     /// LUN ID to remove.
     pub lun_id: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RepairLunRequest {
+    /// ID of the target containing the unresolved LUN.
+    pub target_id: String,
+    /// LUN whose managed backing identity should be repaired.
+    pub lun_id: u32,
+    /// Currently attached managed block-subvolume device.
+    pub device_path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -476,6 +488,26 @@ impl IscsiService {
             .await
             .map(|t| t.redacted())
             .ok_or_else(|| IscsiError::NotFound(id.to_string()))
+    }
+
+    pub async fn repair_lun(
+        &self,
+        req: RepairLunRequest,
+        identity: BlockVolumeId,
+    ) -> Result<(IscsiTarget, IscsiTarget), IscsiError> {
+        let mut target = state_dir()
+            .load::<IscsiTarget>(&req.target_id)
+            .await
+            .ok_or_else(|| IscsiError::NotFound(req.target_id.clone()))?;
+        let previous = target.clone();
+        repair_target_lun(&mut target, req.lun_id, req.device_path, identity)?;
+        state_dir().save(&target.id, &target).await?;
+        Ok((target, previous))
+    }
+
+    pub async fn restore_target_state(&self, target: &IscsiTarget) -> Result<(), IscsiError> {
+        state_dir().save(&target.id, target).await?;
+        Ok(())
     }
 
     pub async fn create(&self, req: CreateTargetRequest) -> Result<IscsiTarget, IscsiError> {
@@ -1207,6 +1239,33 @@ fn is_managed_lun(lun: &Lun) -> bool {
             || lun.backstore_path.starts_with("/dev/loop"))
 }
 
+fn repair_target_lun(
+    target: &mut IscsiTarget,
+    lun_id: u32,
+    device_path: String,
+    identity: BlockVolumeId,
+) -> Result<(), IscsiError> {
+    let lun = target
+        .luns
+        .iter_mut()
+        .find(|lun| lun.lun_id == lun_id)
+        .ok_or_else(|| IscsiError::NotFound(format!("LUN {lun_id}")))?;
+    if !lun.backing_volume_unresolved && lun.backing_volume.is_some() {
+        return Err(IscsiError::InvalidBackingVolume(format!(
+            "LUN {lun_id} is already resolved"
+        )));
+    }
+    if lun.backstore_type != "block" || !lun.backstore_path.starts_with("/dev/loop") {
+        return Err(IscsiError::InvalidBackingVolume(format!(
+            "LUN {lun_id} is not an unresolved managed block volume"
+        )));
+    }
+    lun.backstore_path = device_path;
+    lun.backing_volume = Some(identity);
+    lun.backing_volume_unresolved = false;
+    Ok(())
+}
+
 fn remap_target(
     target: &mut IscsiTarget,
     mappings: &BlockDeviceMappings,
@@ -1219,7 +1278,11 @@ fn remap_target(
         if !is_managed_lun(lun) {
             continue;
         }
-        let identity = lun.backing_volume.clone();
+        let identity = lun.backing_volume.clone().or_else(|| {
+            mappings
+                .legacy_identity_for_exact_path(&lun.backstore_path)
+                .cloned()
+        });
         let resolved = identity
             .as_ref()
             .and_then(|identity| mappings.current.get(identity))
@@ -1819,6 +1882,85 @@ mod tests {
         assert_eq!(target.luns[1].backstore_path, "/dev/loop4");
         assert_eq!(patches[0], ("backstore-0".into(), "/dev/loop9".into()));
         assert_eq!(patches[1], ("backstore-1".into(), "/dev/loop4".into()));
+    }
+
+    #[test]
+    fn migrates_legacy_lun_from_exact_preexisting_attachment() {
+        let identity = volume("pool-a", 10);
+        let mut mappings = BlockDeviceMappings::default();
+        mappings
+            .current
+            .insert(identity.clone(), "/dev/loop7".into());
+        mappings
+            .preexisting
+            .insert("/dev/loop7".into(), identity.clone());
+        let mut target = target("custom-name", vec![lun(0, "/dev/loop7", None)]);
+        target.alias = Some("preserved alias".into());
+        target.portals = vec![Portal {
+            ip: "10.0.0.1".into(),
+            port: 3260,
+            iser: false,
+        }];
+
+        let (changed, safe, _) = remap_target(&mut target, &mappings);
+
+        assert!(changed);
+        assert!(safe);
+        assert_eq!(target.luns[0].backing_volume, Some(identity));
+        assert!(!target.luns[0].backing_volume_unresolved);
+        assert_eq!(target.alias.as_deref(), Some("preserved alias"));
+        assert_eq!(target.portals[0].ip, "10.0.0.1");
+    }
+
+    #[test]
+    fn freshly_allocated_loop_path_is_not_legacy_migration_evidence() {
+        let identity = volume("pool-a", 10);
+        let mut mappings = BlockDeviceMappings::default();
+        mappings.current.insert(identity, "/dev/loop0".into());
+        let mut target = target("volume", vec![lun(0, "/dev/loop0", None)]);
+
+        let (_, safe, patches) = remap_target(&mut target, &mappings);
+
+        assert!(!safe);
+        assert!(target.luns[0].backing_volume.is_none());
+        assert!(target.luns[0].backing_volume_unresolved);
+        assert_eq!(patches[0].1, UNRESOLVED_BACKSTORE);
+    }
+
+    #[test]
+    fn repair_changes_only_selected_unresolved_lun() {
+        let identity = volume("pool-a", 10);
+        let preserved = volume("pool-b", 20);
+        let mut unresolved = lun(0, "/dev/loop0", None);
+        unresolved.backing_volume_unresolved = true;
+        let mut target = target(
+            "repair",
+            vec![unresolved, lun(1, "/dev/loop4", Some(preserved.clone()))],
+        );
+        target.alias = Some("keep me".into());
+
+        repair_target_lun(&mut target, 0, "/dev/loop7".into(), identity.clone()).unwrap();
+
+        assert_eq!(target.luns[0].backstore_path, "/dev/loop7");
+        assert_eq!(target.luns[0].backing_volume, Some(identity));
+        assert!(!target.luns[0].backing_volume_unresolved);
+        assert_eq!(target.luns[1].backing_volume, Some(preserved));
+        assert_eq!(target.alias.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn repair_rejects_resolved_or_raw_luns() {
+        let identity = volume("pool-a", 10);
+        let mut resolved = target(
+            "resolved",
+            vec![lun(0, "/dev/loop0", Some(identity.clone()))],
+        );
+        assert!(
+            repair_target_lun(&mut resolved, 0, "/dev/loop1".into(), identity.clone()).is_err()
+        );
+
+        let mut raw = target("raw", vec![lun(0, "/dev/sda", None)]);
+        assert!(repair_target_lun(&mut raw, 0, "/dev/loop1".into(), identity).is_err());
     }
 
     #[test]

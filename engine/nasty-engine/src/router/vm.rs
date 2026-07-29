@@ -16,6 +16,12 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    let _block_share_guard = if req.method == "vm.clone" {
+        Some(state.block_share_mutation.lock().await)
+    } else {
+        None
+    };
+
     Some(match req.method.as_str() {
         "vm.capabilities" => ok(req, state.vms.capabilities().await),
         "vm.list" => match state.vms.list().await {

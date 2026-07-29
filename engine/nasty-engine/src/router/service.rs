@@ -16,6 +16,21 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    let block_protocol_mutation = matches!(
+        req.method.as_str(),
+        "service.protocol.enable" | "service.protocol.disable"
+    ) && req.params.as_ref().is_some_and(|params| {
+        matches!(
+            params.get("name").and_then(serde_json::Value::as_str),
+            Some("iscsi" | "nvmeof")
+        )
+    });
+    let _block_share_guard = if block_protocol_mutation {
+        Some(state.block_share_mutation.lock().await)
+    } else {
+        None
+    };
+
     Some(match req.method.as_str() {
         "service.protocol.list" => ok(req, state.protocols.list().await),
         "service.protocol.enable" => match require_str(req, "name") {

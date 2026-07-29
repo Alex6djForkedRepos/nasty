@@ -78,6 +78,7 @@
 	let shareNvmeofPort = $state('4420');
 
 	let shareSubvolumes: Subvolume[] = $state([]);
+	let isAdmin = $state(false);
 
 	// Inline subvolume creation within share wizard
 	let showInlineCreate = $state(false);
@@ -303,6 +304,9 @@
 	onMount(async () => {
 		client.onEvent(handleEvent);
 		await Promise.all([
+			client.call<{ role: string; scoped: boolean }>('auth.me').then(identity => {
+				isAdmin = identity.role === 'admin' && !identity.scoped;
+			}).catch(() => { isAdmin = false; }),
 			nfsRefresh().then(() => { nfs.loading = false; }),
 			smbRefresh().then(() => { smb.loading = false; }),
 			iscsiRefresh().then(() => { iscsi.loading = false; }),
@@ -551,12 +555,12 @@
 
 <!-- ════════════════════════════════════════════════════ iSCSI ════════════════════════════════════════════════════ -->
 {:else if activeTab === 'iscsi'}
-	<IscsiPanel />
+	<IscsiPanel {isAdmin} />
 
 
 <!-- ════════════════════════════════════════════════════ NVMe-oF ════════════════════════════════════════════════════ -->
 {:else if activeTab === 'nvmeof'}
-	<NvmeofPanel />
+	<NvmeofPanel {isAdmin} />
 
 
 <!-- ════════════════════════════════════════════════════ Guest Shares ════════════════════════════════════════════════════ -->

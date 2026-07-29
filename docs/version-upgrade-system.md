@@ -234,6 +234,14 @@ Custom URLs are still allowed and visible, but they are not the primary UX targe
 - boot is not meant to be blocked by that absence
 - only `flake.nix` and `flake.lock` are restored
 
+## Legacy block-export migration
+
+Releases before v0.0.15 persisted managed iSCSI LUNs and NVMe-oF namespaces by their current `/dev/loopN` path. Loop numbers are not stable across reboots, so newer engines persist the filesystem UUID and bcachefs subvolume ID instead.
+
+During an in-place upgrade, the engine records the exact managed backing identity of loops that were already attached before it allocates any new loops. Legacy exports are migrated only when their saved path matches that boot-scoped evidence. The evidence survives engine-process restarts in `/run`, but is cleared by reboot. A loop path freshly assigned during cold boot is never accepted as migration evidence.
+
+If an identity cannot be proven safely, the protocol remains quiesced and the Sharing page marks the affected LUN or namespace as requiring repair. An unscoped Admin can reconnect only that entry to its original managed block subvolume. The target or subsystem name, portals, ACLs, CHAP credentials, allowed hosts, and other access settings are preserved. Cross-protocol conflicts are rejected, and a failed live activation rolls the identity change back.
+
 ## Practical summary
 
 In plain terms, the system now works like this:

@@ -17,6 +17,7 @@
 		iscsiRemove,
 		iscsiAddLun,
 		iscsiRemoveLun,
+		iscsiRepairLun,
 		iscsiAddAcl,
 		iscsiRemoveAcl,
 		iscsiAddPortal,
@@ -25,7 +26,9 @@
 		iscsiLoadSubvolumes,
 	} from '$lib/sharing/iscsi.svelte';
 
-	$effect(() => { if (iscsi.showCreate || iscsi.addLunTarget) iscsiLoadSubvolumes(); });
+	let { isAdmin = false }: { isAdmin?: boolean } = $props();
+
+	$effect(() => { if (iscsi.showCreate || iscsi.addLunTarget || iscsi.repairLunTarget) iscsiLoadSubvolumes(); });
 
 	// Per-form "tried" flags — defer amber required-field decoration
 	// until each submit button is clicked at least once.
@@ -43,6 +46,11 @@
 		if (!iscsi.addLunPath) { addLunTried = true; return; }
 		addLunTried = false;
 		await iscsiAddLun();
+	}
+	function startRepairLun(targetId: string, lunId: number) {
+		iscsi.repairLunTarget = targetId;
+		iscsi.repairLunId = lunId;
+		iscsi.repairLunDevice = '';
 	}
 	async function iscsiAddAclGuarded() {
 		if (!iscsi.addAclIqn) { addAclTried = true; return; }
@@ -150,6 +158,7 @@
 						{target.luns.length} LUN{target.luns.length !== 1 ? 's' : ''}
 						&middot; {target.portals.length} portal{target.portals.length !== 1 ? 's' : ''}
 						&middot; {target.acls.length === 0 ? 'open (any initiator)' : `${target.acls.length} ACL${target.acls.length !== 1 ? 's' : ''}`}
+						{#if target.luns.some(lun => lun.backing_volume_unresolved)}<Badge variant="secondary" class="ml-2 border-amber-500/50 text-amber-500">Repair required</Badge>{/if}
 					</td>
 					<td class="p-3" onclick={(e) => e.stopPropagation()}>
 						<div class="flex gap-2">
@@ -229,13 +238,31 @@
 									{:else}
 										<div class="space-y-1">
 											{#each target.luns as lun}
-												<div class="flex items-center gap-3 rounded bg-secondary/50 px-2 py-1.5">
+												<div class="rounded bg-secondary/50 px-2 py-1.5">
+													<div class="flex items-center gap-3">
 													<div class="text-sm">
 														<span class="font-mono text-xs font-semibold">LUN {lun.lun_id}</span>
 														<span class="ml-2 text-muted-foreground">{lun.backstore_path}</span>
 														<span class="ml-1 text-xs text-muted-foreground">({lun.backstore_type})</span>
 													</div>
+													{#if lun.backing_volume_unresolved}
+														<Badge variant="secondary" class="border-amber-500/50 text-amber-500">Backing unresolved</Badge>
+														{#if isAdmin}<Button variant="outline" size="xs" onclick={() => startRepairLun(target.id, lun.lun_id)}>Reconnect</Button>{/if}
+													{/if}
 													<Button variant="destructive" size="xs" onclick={() => iscsiRemoveLun(target.id, lun.lun_id)}>Remove</Button>
+													</div>
+													{#if lun.backing_volume_unresolved && !isAdmin}
+														<p class="mt-2 text-xs text-amber-500">An unscoped Admin must reconnect this LUN to its original block subvolume.</p>
+													{:else if iscsi.repairLunTarget === target.id && iscsi.repairLunId === lun.lun_id}
+														<div class="mt-2 flex items-center gap-2 border-t border-border pt-2">
+															<select bind:value={iscsi.repairLunDevice} class="h-8 min-w-72 rounded-md border border-input bg-background px-2 text-xs">
+																<option value="">Select the original block subvolume...</option>
+																{#each iscsi.blockSubvolumes as sv}<option value={sv.block_device}>{sv.filesystem}/{sv.name} ({sv.block_device})</option>{/each}
+															</select>
+															<Button size="xs" disabled={!iscsi.repairLunDevice} onclick={iscsiRepairLun}>Reconnect</Button>
+															<Button size="xs" variant="ghost" onclick={() => { iscsi.repairLunTarget = ''; iscsi.repairLunDevice = ''; }}>Cancel</Button>
+														</div>
+													{/if}
 												</div>
 											{/each}
 										</div>

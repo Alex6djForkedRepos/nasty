@@ -21,7 +21,8 @@ use nasty_apps::{
 use nasty_backup::{BackupProfile, BackupSnapshot, BackupStatus};
 use nasty_sharing::iscsi::{
     AddAclRequest, AddLunRequest, AddPortalRequest, CreateTargetRequest, DeleteTargetRequest,
-    IscsiTarget, RemoveAclRequest, RemoveLunRequest, RemovePortalRequest, SetPortalsRequest,
+    IscsiTarget, RemoveAclRequest, RemoveLunRequest, RemovePortalRequest, RepairLunRequest,
+    SetPortalsRequest,
 };
 use nasty_sharing::nfs::{
     CreateNfsShareRequest, DeleteNfsShareRequest, NfsShare, UpdateNfsShareRequest,
@@ -29,7 +30,7 @@ use nasty_sharing::nfs::{
 use nasty_sharing::nvmeof::{
     AddHostRequest, AddNamespaceRequest, AddPortRequest, CreateSubsystemRequest,
     DeleteSubsystemRequest, NvmeofSubsystem, RemoveHostRequest, RemoveNamespaceRequest,
-    RemovePortRequest,
+    RemovePortRequest, RepairNamespaceRequest,
 };
 use nasty_sharing::smb::{
     CreateSmbShareRequest, CreateSmbUserRequest, DeleteSmbShareRequest, SmbGroup, SmbShare,
@@ -973,6 +974,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     result: Some(gen_schema::<IscsiTarget>(generator)),
                 },
                 Method {
+                    name: "share.iscsi.repair_lun",
+                    desc: "Reconnect an unresolved legacy LUN to a managed block subvolume without changing target, portal, or ACL settings.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<RepairLunRequest>(generator)),
+                    result: Some(gen_schema::<IscsiTarget>(generator)),
+                },
+                Method {
                     name: "share.iscsi.add_acl",
                     desc: "Allow an iSCSI initiator IQN to connect.",
                     role: MethodRole::Operator,
@@ -1052,6 +1060,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     desc: "Remove a namespace from a subsystem.",
                     role: MethodRole::Operator,
                     params: MethodParams::Schema(gen_schema::<RemoveNamespaceRequest>(generator)),
+                    result: Some(gen_schema::<NvmeofSubsystem>(generator)),
+                },
+                Method {
+                    name: "share.nvmeof.repair_namespace",
+                    desc: "Reconnect an unresolved legacy namespace to a managed block subvolume without changing subsystem, port, or host settings.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<RepairNamespaceRequest>(generator)),
                     result: Some(gen_schema::<NvmeofSubsystem>(generator)),
                 },
                 Method {

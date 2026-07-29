@@ -15,6 +15,31 @@ use crate::cmd;
 use crate::filesystem::FilesystemService;
 
 const BLOCK_FILE_NAME: &str = "vol.img";
+const LEGACY_EXPORT_EVIDENCE: &str = "/run/nasty-block-export-legacy-evidence.json";
+
+async fn load_or_initialize_legacy_evidence(
+    path: &Path,
+    observed: &HashMap<String, BlockVolumeId>,
+) -> Result<HashMap<String, BlockVolumeId>, String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map_err(|error| format!("parse {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+            let contents = serde_json::to_vec(observed)
+                .map_err(|error| format!("serialize legacy export evidence: {error}"))?;
+            tokio::fs::write(&temporary, contents)
+                .await
+                .map_err(|error| format!("write {}: {error}", temporary.display()))?;
+            if let Err(error) = tokio::fs::rename(&temporary, path).await {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(format!("publish {}: {error}", path.display()));
+            }
+            Ok(observed.clone())
+        }
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
 
 fn subvol_path(mount_point: &str, name: &str) -> String {
     format!("{mount_point}/{name}")
@@ -824,6 +849,8 @@ pub struct FindByPropertyRequest {
 pub struct SubvolumeService {
     filesystems: FilesystemService,
     destination_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    restore_block_devices_lock: Mutex<()>,
+    legacy_export_evidence: Mutex<Option<HashMap<String, BlockVolumeId>>>,
 }
 
 impl SubvolumeService {
@@ -831,7 +858,24 @@ impl SubvolumeService {
         Self {
             filesystems,
             destination_locks: Mutex::new(HashMap::new()),
+            restore_block_devices_lock: Mutex::new(()),
+            legacy_export_evidence: Mutex::new(None),
         }
+    }
+
+    async fn legacy_export_evidence(
+        &self,
+        observed: &HashMap<String, BlockVolumeId>,
+    ) -> Result<HashMap<String, BlockVolumeId>, String> {
+        let mut cached = self.legacy_export_evidence.lock().await;
+        if let Some(evidence) = cached.as_ref() {
+            return Ok(evidence.clone());
+        }
+
+        let evidence =
+            load_or_initialize_legacy_evidence(Path::new(LEGACY_EXPORT_EVIDENCE), observed).await?;
+        *cached = Some(evidence.clone());
+        Ok(evidence)
     }
 
     async fn lock_destination(&self, filesystem: &str, name: &str) -> OwnedMutexGuard<()> {
@@ -868,6 +912,7 @@ impl SubvolumeService {
     /// Re-attach loop devices for block subvolumes after filesystems are mounted.
     /// Returns stable identities and current loop paths for sharing restoration.
     pub async fn restore_block_devices(&self) -> BlockDeviceMappings {
+        let _restore_guard = self.restore_block_devices_lock.lock().await;
         let all = match self.list_all(None, None).await {
             Ok(v) => v,
             Err(e) => {
@@ -882,6 +927,30 @@ impl SubvolumeService {
             .collect();
 
         let mut mappings = BlockDeviceMappings::default();
+
+        // Capture exact path-to-identity evidence before this engine allocates
+        // any loops. The /run manifest survives process restarts but not a
+        // reboot, preventing a fresh cold-boot assignment from becoming
+        // migration evidence on a later refresh.
+        let mut observed_existing = HashMap::new();
+        let mut existing_by_identity = HashMap::new();
+        for subvol in &block_subvols {
+            let Some(identity) = subvol.block_volume_id.as_ref() else {
+                continue;
+            };
+            let img_path = format!("{}/{}", subvol.path, BLOCK_FILE_NAME);
+            if let Some(device) = find_loop_device(&img_path).await {
+                observed_existing.insert(device.clone(), identity.clone());
+                existing_by_identity.insert(identity.clone(), device);
+            }
+        }
+        let evidence = match self.legacy_export_evidence(&observed_existing).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                warn!("Cannot establish safe legacy block-export evidence: {error}");
+                return mappings;
+            }
+        };
 
         if block_subvols.is_empty() {
             info!("No block subvolumes to restore");
@@ -906,7 +975,7 @@ impl SubvolumeService {
             }
 
             // Use existing loop device if already attached (engine restart, not reboot)
-            let loop_dev = if let Some(existing) = find_loop_device(&img_path).await {
+            let loop_dev = if let Some(existing) = existing_by_identity.remove(&identity) {
                 info!(
                     "Loop device already attached for {}/{}",
                     subvol.filesystem, subvol.name
@@ -937,7 +1006,10 @@ impl SubvolumeService {
                 }
             };
 
-            mappings.current.insert(identity, loop_dev);
+            mappings.current.insert(identity.clone(), loop_dev.clone());
+            if evidence.get(&loop_dev) == Some(&identity) {
+                mappings.preexisting.insert(loop_dev, identity);
+            }
         }
 
         mappings
@@ -3156,6 +3228,46 @@ async fn materialize_subvol_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_evidence_survives_process_restart_without_accepting_new_loops() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nasty-legacy-export-evidence-{}-{unique}.json",
+            std::process::id()
+        ));
+        let original = BlockVolumeId {
+            filesystem_uuid: "pool-a".into(),
+            subvolume_id: 10,
+        };
+        let replacement = BlockVolumeId {
+            filesystem_uuid: "pool-b".into(),
+            subvolume_id: 20,
+        };
+        let first = HashMap::from([("/dev/loop0".into(), original.clone())]);
+        assert_eq!(
+            load_or_initialize_legacy_evidence(&path, &first)
+                .await
+                .unwrap(),
+            first
+        );
+
+        let after_restart = HashMap::from([
+            ("/dev/loop0".into(), replacement),
+            ("/dev/loop1".into(), original),
+        ]);
+        assert_eq!(
+            load_or_initialize_legacy_evidence(&path, &after_restart)
+                .await
+                .unwrap(),
+            first
+        );
+
+        tokio::fs::remove_file(path).await.unwrap();
+    }
 
     #[test]
     fn bcachefs_subvolume_id_is_preserved() {

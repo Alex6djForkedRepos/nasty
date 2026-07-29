@@ -24,6 +24,9 @@ function initialIscsiState() {
 		addLunTarget: '',
 		addLunPath: '',
 		addLunType: '',
+		repairLunTarget: '',
+		repairLunId: 0,
+		repairLunDevice: '',
 		addAclTarget: '',
 		addAclIqn: '',
 		addAclUser: '',
@@ -116,6 +119,27 @@ export async function iscsiRemoveLun(targetId: string, lunId: number) {
 	if (!await confirm(`Remove LUN ${lunId}?`)) return;
 	await withToast(() => getClient().call('share.iscsi.remove_lun', { target_id: targetId, lun_id: lunId }), 'LUN removed');
 	await iscsiRefresh();
+}
+
+export async function iscsiRepairLun() {
+	if (!iscsi.repairLunTarget || !iscsi.repairLunDevice) return;
+	if (!await confirm(
+		'Reconnect this LUN?',
+		'Only select the original block subvolume. Choosing a different volume would expose its data through this target.',
+	)) return;
+	const repaired = await withToast(
+		() => getClient().call('share.iscsi.repair_lun', {
+			target_id: iscsi.repairLunTarget,
+			lun_id: iscsi.repairLunId,
+			device_path: iscsi.repairLunDevice,
+		}),
+		'LUN backing volume reconnected',
+	);
+	if (repaired !== undefined) {
+		iscsi.repairLunTarget = '';
+		iscsi.repairLunDevice = '';
+		await Promise.all([iscsiRefresh(), iscsiLoadProtocol()]);
+	}
 }
 
 export async function iscsiAddAcl() {
