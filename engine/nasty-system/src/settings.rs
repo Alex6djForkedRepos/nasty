@@ -296,7 +296,7 @@ pub struct Settings {
     /// TTL on the parent zone).
     #[serde(default)]
     pub tls_dns_propagation_wait: Option<u32>,
-    /// Whether anonymous telemetry is enabled (drive count, storage capacity).
+    /// Whether pseudonymous usage telemetry is enabled.
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
     /// OpenID Connect single-sign-on configuration. Disabled by default.
@@ -563,7 +563,7 @@ pub struct SettingsUpdate {
     pub tls_dns_resolver: Option<String>,
     /// Propagation wait in seconds. 0 clears (engine treats as default).
     pub tls_dns_propagation_wait: Option<u32>,
-    /// Enable/disable anonymous telemetry.
+    /// Enable/disable pseudonymous usage telemetry.
     pub telemetry_enabled: Option<bool>,
 }
 
