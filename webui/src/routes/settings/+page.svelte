@@ -979,12 +979,14 @@
 				</Button>
 			</section>
 
-			<!-- Telemetry -->
+			<!-- Usage telemetry -->
 			<section class="rounded-lg border border-border p-5">
-				<h2 class="mb-2 text-base font-semibold">Anonymous Telemetry</h2>
+				<h2 class="mb-2 text-base font-semibold">Usage Telemetry</h2>
 				<p class="mb-4 text-sm text-muted-foreground">
-					Help improve NASty by sharing anonymous usage data: number of drives and storage capacity.
-					No personal information is collected.
+					Help improve NASty by sending a random installation ID and daily totals for mounted storage,
+					configured VMs and apps, software version, build, and CPU architecture. The report does not
+					include names, paths, file contents, hostnames, or hardware identifiers.
+					<a href="https://github.com/nasty-project/nasty-telemetry#what-is-collected" target="_blank" rel="noreferrer" class="text-blue-400 hover:underline">See exactly what is collected.</a>
 				</p>
 
 				<div class="mb-4">

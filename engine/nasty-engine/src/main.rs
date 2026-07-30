@@ -765,7 +765,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Start daily anonymous telemetry (if not opted out)
+    // Start daily pseudonymous usage telemetry (if not opted out)
     telemetry::spawn_daily(state.clone());
 
     // Background alert evaluation + notifications

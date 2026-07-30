@@ -1985,7 +1985,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             "Telemetry",
             vec![Method {
                 name: "telemetry.send",
-                desc: "Trigger an immediate anonymous telemetry report (drive/VM/app counts, version, arch) to the NASty telemetry endpoint. No-op when telemetry is disabled in settings.",
+                desc: "Trigger an immediate usage telemetry report (random installation ID; mounted drive, capacity, and used-space totals; VM/app counts; version/build; architecture). No-op when telemetry is disabled in settings.",
                 role: MethodRole::Admin,
                 params: MethodParams::None,
                 result: Some(serde_json::json!({
