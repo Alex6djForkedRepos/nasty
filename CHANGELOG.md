@@ -1,5 +1,206 @@
 # Changelog
 
+## v0.0.15 — 2026-07-30
+
+> **This is the user access, data safety & recovery release.** NASty gains a
+> read-only personal file portal for standard SMB and domain users, three
+> navigation styles, safer system-recovery backups, and browsable guest
+> folders. Underneath, updates and firewall changes become transactional,
+> filesystem creation gains a non-destructive preflight, snapshots and scoped
+> share sources enforce tighter boundaries, and iSCSI/NVMe-oF exports move from
+> unstable loop paths to immutable storage identities.
+
+### Headline changes
+
+- **Standard-user file portal (#691).** A new deny-by-default `User` role maps
+  an account to an existing local SMB or domain principal. Standard users land
+  on a responsive, read-only portal where they can browse and download files
+  from authorized SMB shares, review their activity, and change their password.
+  An optional ACME-managed files hostname can keep this traffic separate from
+  the administrative UI.
+
+- **Safer storage and block identity (#675–#679, #681, #698, #699, #711,
+  #716).** Subvolume resize is grow-only; block volumes can initialize ext3,
+  ext4, or XFS during creation; quota, teardown, snapshot provenance, and
+  path-derived identifiers are hardened; and filesystem creation validates the
+  complete block topology before touching a disk. Managed iSCSI LUNs and
+  NVMe-oF namespaces now follow filesystem UUID + bcachefs subvolume ID instead
+  of trusting `/dev/loopN`.
+
+- **Transactional updates and firewall (#664, #666, #668, #674, #680, #700,
+  #701).** Wrapper and lock changes are staged as a matching pair, built before
+  installation, health-checked after activation, and rolled back with the prior
+  generation on failure. nftables policy replacement gets the same atomic,
+  compensating treatment. Mild follows only published stable releases,
+  WebUI-triggered rebuilds survive engine restarts, and iSCSI activation is
+  owned by the engine rather than racing NixOS.
+
+- **Three navigation styles (#683–#686, #704).** Choose Classic, Icons, or a
+  searchable Launcher. Icon mode adds category drill-down; Launcher provides a
+  central workspace with category-aware history. New browsers default to Icons
+  while existing saved preferences are preserved.
+
+- **NASty System Recovery backups (#713).** The old single-path configuration
+  preset becomes an Admin-only recovery preset covering engine state,
+  `/etc/nixos`, Caddy TLS state, the host credential key, and Secure Boot keys
+  when present. Coverage warnings now require a successful backup using the
+  profile's current sources and repository definition.
+
+- **Guest sharing and security hardening (#663, #682, #687–#690, #707, #708).**
+  Guest folders gain public navigation and per-file downloads while the control
+  plane, file opens, and ZIP traversal become descriptor-anchored, bounded, and
+  fail-closed. Specialized endpoints enforce explicit role/scope policy,
+  corrupt auth state blocks startup, scoped share sources cannot cross ownership
+  boundaries, and credentialed iSCSI ACLs now enforce CHAP.
+
+### Users, authentication & authorization
+
+- Standard users can browse only enabled, non-guest SMB shares whose
+  `valid_users` policy reproducibly grants their principal. Shares with raw
+  Samba parameters are excluded. The role is available to real users, not API
+  tokens or OIDC auto-provisioning (#691).
+- HTTP/WebSocket endpoints outside normal JSON-RPC now consistently enforce
+  authentication, forced-password-change state, role, and resource scope.
+  Terminals and sensitive deployment/import endpoints require an unscoped
+  Admin; file mutations require Operator/Admin authority within any filesystem
+  scope, while VM consoles require an unscoped Operator/Admin (#663).
+- Existing `auth.json` must be a regular, non-symlinked, initialized JSON file
+  owned by root with no group/other permission bits. Invalid state stops the
+  engine instead of silently recreating `admin/admin`; only a genuinely absent
+  file triggers first-boot bootstrap (#682).
+- Snapshot list/delete/clone/rollback operations enforce filesystem and owner
+  provenance. Matching owners can recover their orphan snapshots; foreign or
+  ownerless orphan cleanup remains Admin-only (#679, #711).
+- Scoped NFS/SMB creates and iSCSI/NVMe-oF additions authorize the deepest
+  managed source and reject foreign nested resources, unmanaged devices, and
+  scoped name collisions (#707).
+
+### Files & guest sharing
+
+- Public guest folders now support bounded directory listings, breadcrumbs,
+  nested navigation, and per-file downloads. `HEAD` preflights do not consume a
+  download and expired password grants recover cleanly (#690).
+- Guest-share management requires an unscoped Operator/Admin, redacts records,
+  serializes counters/revocation, and rate-limits before token or Argon2 work
+  (#687).
+- Single-file downloads and ZIP archives walk retained descriptors with Linux
+  `openat2` constraints. Symlinks, magic links, mount crossings, special files,
+  excessive depth/entries/bytes, and abandoned producer work are rejected;
+  unsafe archive names are encoded safely (#688, #689).
+- Guest-link download limits accept Svelte numeric values correctly, require a
+  positive whole number, and surface failed creation instead of leaving the
+  dialog pending (#692).
+- Upload replacement requires explicit confirmation and completed uploads are
+  published atomically. Logout resets session-scoped stores and network rollback
+  state now survives reconnects and concurrent clients (#696).
+- Calculated zero-byte directories are shown as `Empty` (#671).
+
+### Storage & snapshots
+
+- Shrink requests are rejected before mutation. Quota units are converted
+  consistently and resize metadata changes only after the kernel operation
+  succeeds (#675).
+- Block-subvolume creation can initialize ext3, ext4, or XFS in the same
+  transaction, records the filesystem UUID, serializes destination changes, and
+  quarantines uncertain interrupted creates instead of deleting by pathname
+  (#676).
+- bcachefs project quotas resolve the mounted block device correctly on
+  multi-device filesystems, and filesystem destruction detaches dependent loop
+  devices before unmounting (#677).
+- App, filesystem, subvolume, snapshot, and clone identifiers are validated
+  before external side effects. Compose installation refuses pre-existing
+  unowned state directories (#678).
+- Filesystem creation rejects aliases, overlapping selections, mounts, swap,
+  holders, read-only devices, and existing filesystem/LVM/RAID signatures before
+  partitioning, wiping, or formatting. Device identity and GPT geometry are
+  revalidated before destructive phases (#699).
+- Snapshots expose bcachefs's authoritative creation timestamp, and Operations
+  shows the latest scrub timestamp, duration, and outcome while idle (#681,
+  #694).
+- Subvolume `Used by` badges refresh after NFS, SMB, iSCSI, or NVMe-oF changes
+  and resynchronize after reconnects (#715).
+
+### Sharing & block exports
+
+- iSCSI LUNs and NVMe-oF namespaces persist immutable block-volume identities
+  and remap each export independently. Unresolved identities quiesce the
+  affected protocol instead of risking the wrong volume (#698).
+- Legacy exports migrate only when their old loop path matches exact
+  boot-scoped evidence captured before any new loop allocation. Ambiguous entries
+  remain offline with **Repair required**; an unscoped Admin can reconnect the
+  affected LUN or namespace without replacing target names, portals, ACLs, CHAP
+  credentials, or host restrictions (#716).
+- Credentialed iSCSI ACLs enable CHAP. Partial, empty, or duplicate credentials
+  are rejected; passwordless ACLs remain supported; failed mutations roll back
+  (#708).
+- NVMe-oF restore accepts configfs relative symlinks only when they resolve to
+  the intended subsystem (#709).
+- iSCSI target creation rolls back incomplete target/TPG state and initializes a
+  completely cold configfs fabric correctly (#711, #712).
+
+### Updates, firewall & system
+
+- Tagged-release, channel, and manual version changes share one detached update
+  transaction that stages wrapper files, builds the exact closure, activates it,
+  checks engine/Caddy health, and restores both files and generation on failure
+  (#666).
+- Wrapper flakes now correctly feed the operator's `bcachefs-tools` pin to both
+  userspace and DKMS. Older wrappers are migrated transactionally (#668).
+- Update progress and logs again follow the transaction's live phases, including
+  unknown non-idle states (#674).
+- Mild discovers only the latest published, non-draft, non-prerelease semantic
+  release. Spicy remains tag-driven (#680).
+- `/etc/nixos/custom.nix` is imported when present, shown read-only in Settings,
+  and left untouched by wrapper regeneration and upgrades (#662).
+- The nftables table is validated and replaced atomically; failed live or
+  persistence changes preserve or compensate back to the prior policy. Managed
+  Docker DNAT is allowed explicitly while unrelated inbound DNAT requires a
+  custom firewall rule (#664).
+- Apps enablement preserves a populated real `/var/lib/docker` directory and
+  refuses to start Docker until the managed data-root setup succeeds (#695).
+- WebUI `nasty-rebuild` runs in a journal-backed transient unit, and
+  `nasty-sync -s` reads the running bcachefs module version through `modinfo`
+  (#701, #702).
+- Domain-controller provisioning waits for authenticated LDAP readiness before
+  reporting success or allowing immediate member joins (#703).
+
+### WebUI, tools & platform
+
+- Navigation adds Classic, Icons, and Launcher modes; the Launcher shortcut is
+  named **Start** and new browsers default to Icons (#683–#686, #704).
+- The Help & Community page links to `r/NAStyProject` (#714).
+- Linux moves from 6.18.38 to **6.18.40** across three weekly nixpkgs updates
+  (#672, #693, #705).
+- `diskwatch` moves from 0.1.2 to **0.1.5**, adding independent-filesystem
+  attribution fixes and runtime-selectable themes (#669, #706).
+- `nasty-top` moves from 0.0.8 to **0.0.9**, fixing bcachefs 1.38.8 by-UUID
+  discovery and hardening monitoring (#673). bcachefs remains at 1.38.8.
+
+### Upgrading
+
+- **Legacy iSCSI/NVMe-oF exports:** migration is automatic only when the upgraded
+  engine can prove that the old `/dev/loopN` attachment already belonged to the
+  managed block subvolume. If it cannot, the protocol intentionally stays
+  offline. Open Sharing and use **Reconnect** on each `Repair required` entry,
+  selecting the original backing volume carefully (#698, #716).
+- **Authentication state:** `/var/lib/nasty/auth.json` must be a regular,
+  root-owned file with no group/other permissions (normally `0600`). Invalid
+  state now blocks engine startup instead of resetting credentials (#682).
+- **External DNAT:** port forwards not managed by NASty now require an enabled
+  custom firewall rule for the original destination port (#664).
+- **Storage creation:** whole-device targets carrying filesystem, RAID, or LVM
+  signatures are no longer implicitly reused or wiped. Clear those signatures
+  separately; existing GPT disks can still contribute an explicitly listed free
+  extent without touching their current partitions (#699).
+- **Subvolume resize:** shrinking is no longer supported; equal-size and growth
+  requests remain valid (#675).
+- **Docker data root:** a populated real `/var/lib/docker` is preserved and blocks
+  Apps enablement until it is moved or migrated explicitly (#695).
+- **System Recovery repositories contain secrets:** the preset may include auth
+  state, recovery keys, TLS private keys, the host credential key, and Secure
+  Boot signing keys. Protect the repository with a strong, separately stored
+  password (#713).
+
 ## v0.0.14 — 2026-07-15
 
 > **This is the enterprise identity, fast-fabric & recovery release** — the
