@@ -181,6 +181,11 @@ impl SmbService {
         Ok(state_dir().load_all().await)
     }
 
+    /// List all shares, failing instead of silently omitting unreadable state.
+    pub async fn list_strict(&self) -> Result<Vec<SmbShare>, SmbError> {
+        Ok(state_dir().load_all_strict().await?)
+    }
+
     pub async fn get(&self, id: &str) -> Result<SmbShare, SmbError> {
         state_dir()
             .load::<SmbShare>(id)
