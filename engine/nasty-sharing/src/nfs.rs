@@ -160,6 +160,11 @@ impl NfsService {
         Ok(state_dir().load_all().await)
     }
 
+    /// List all exports, failing instead of silently omitting unreadable state.
+    pub async fn list_strict(&self) -> Result<Vec<NfsShare>, NfsError> {
+        Ok(state_dir().load_all_strict().await?)
+    }
+
     /// Get a single share by ID
     pub async fn get(&self, id: &str) -> Result<NfsShare, NfsError> {
         state_dir()

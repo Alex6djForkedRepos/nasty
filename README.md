@@ -165,7 +165,7 @@ See [FAQ.md](FAQ.md) for common questions about bcachefs, NixOS, and project sta
 
 ## Telemetry
 
-NASty sends a random installation ID and daily aggregate usage data for mounted storage, configured VMs and apps, software version/build, and CPU architecture. The report does not include names, paths, file contents, hostnames, or hardware identifiers. Disable anytime from **Settings → Telemetry**. Details: [nasty-telemetry](https://github.com/nasty-project/nasty-telemetry).
+NASty sends a random installation ID and daily aggregate usage data for mounted storage, configured VMs, apps, and sharing exports, software version/build, and CPU architecture. The report does not include names, paths, file contents, hostnames, or hardware identifiers. Disable anytime from **Settings → Telemetry**. Details: [nasty-telemetry](https://github.com/nasty-project/nasty-telemetry).
 
 ## License
 

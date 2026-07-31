@@ -23,6 +23,14 @@ struct Report {
     commit: Option<String>,
     vms: usize,
     apps: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    smb_shares: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nfs_exports: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iscsi_luns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nvmeof_namespaces: Option<usize>,
     arch: &'static str,
 }
 
@@ -87,6 +95,33 @@ async fn collect_report(state: &AppState) -> Option<Report> {
 
     let vms = state.vms.list().await.map(|v| v.len()).unwrap_or(0);
     let apps = state.apps.list().await.map(|a| a.len()).unwrap_or(0);
+    let (smb, nfs, iscsi, nvmeof) = tokio::join!(
+        state.smb.list_strict(),
+        state.nfs.list_strict(),
+        state.iscsi.list(),
+        state.nvmeof.list(),
+    );
+    let smb_shares = smb
+        .inspect_err(|e| debug!("Failed to count SMB shares for telemetry: {e}"))
+        .ok()
+        .map(|shares| shares.len());
+    let nfs_exports = nfs
+        .inspect_err(|e| debug!("Failed to count NFS exports for telemetry: {e}"))
+        .ok()
+        .map(|exports| exports.len());
+    let iscsi_luns = iscsi
+        .inspect_err(|e| debug!("Failed to count iSCSI LUNs for telemetry: {e}"))
+        .ok()
+        .map(|targets| targets.iter().map(|target| target.luns.len()).sum());
+    let nvmeof_namespaces = nvmeof
+        .inspect_err(|e| debug!("Failed to count NVMe-oF namespaces for telemetry: {e}"))
+        .ok()
+        .map(|subsystems| {
+            subsystems
+                .iter()
+                .map(|subsystem| subsystem.namespaces.len())
+                .sum()
+        });
 
     Some(Report {
         instance_id: id,
@@ -97,6 +132,10 @@ async fn collect_report(state: &AppState) -> Option<Report> {
         commit: build_commit(),
         vms,
         apps,
+        smb_shares,
+        nfs_exports,
+        iscsi_luns,
+        nvmeof_namespaces,
         arch: std::env::consts::ARCH,
     })
 }
@@ -114,12 +153,16 @@ pub async fn send_report(state: &AppState) -> bool {
     };
 
     debug!(
-        "Sending telemetry: drives={}, total={}B, used={}B, vms={}, apps={}, arch={}, version={}, commit={:?}",
+        "Sending telemetry: drives={}, total={}B, used={}B, vms={}, apps={}, smb={:?}, nfs={:?}, iscsi={:?}, nvmeof={:?}, arch={}, version={}, commit={:?}",
         report.drives,
         report.total_bytes,
         report.used_bytes,
         report.vms,
         report.apps,
+        report.smb_shares,
+        report.nfs_exports,
+        report.iscsi_luns,
+        report.nvmeof_namespaces,
         report.arch,
         report.version,
         report.commit
@@ -145,6 +188,62 @@ pub async fn send_report(state: &AppState) -> bool {
             debug!("Telemetry report failed: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_serializes_protocol_export_counts() {
+        let value = serde_json::to_value(Report {
+            instance_id: "instance".to_string(),
+            drives: 2,
+            total_bytes: 100,
+            used_bytes: 50,
+            version: "1.2.3",
+            commit: None,
+            vms: 1,
+            apps: 2,
+            smb_shares: Some(3),
+            nfs_exports: Some(4),
+            iscsi_luns: Some(5),
+            nvmeof_namespaces: Some(6),
+            arch: "x86_64",
+        })
+        .unwrap();
+
+        assert_eq!(value["smb_shares"], 3);
+        assert_eq!(value["nfs_exports"], 4);
+        assert_eq!(value["iscsi_luns"], 5);
+        assert_eq!(value["nvmeof_namespaces"], 6);
+        assert!(value.get("commit").is_none());
+    }
+
+    #[test]
+    fn report_omits_unobserved_protocol_counts() {
+        let value = serde_json::to_value(Report {
+            instance_id: "instance".to_string(),
+            drives: 2,
+            total_bytes: 100,
+            used_bytes: 50,
+            version: "1.2.3",
+            commit: None,
+            vms: 1,
+            apps: 2,
+            smb_shares: None,
+            nfs_exports: None,
+            iscsi_luns: None,
+            nvmeof_namespaces: None,
+            arch: "x86_64",
+        })
+        .unwrap();
+
+        assert!(value.get("smb_shares").is_none());
+        assert!(value.get("nfs_exports").is_none());
+        assert!(value.get("iscsi_luns").is_none());
+        assert!(value.get("nvmeof_namespaces").is_none());
     }
 }
 

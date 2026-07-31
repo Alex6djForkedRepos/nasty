@@ -984,7 +984,7 @@
 				<h2 class="mb-2 text-base font-semibold">Usage Telemetry</h2>
 				<p class="mb-4 text-sm text-muted-foreground">
 					Help improve NASty by sending a random installation ID and daily totals for mounted storage,
-					configured VMs and apps, software version, build, and CPU architecture. The report does not
+					configured VMs, apps, and sharing exports, software version, build, and CPU architecture. The report does not
 					include names, paths, file contents, hostnames, or hardware identifiers.
 					<a href="https://github.com/nasty-project/nasty-telemetry#what-is-collected" target="_blank" rel="noreferrer" class="text-blue-400 hover:underline">See exactly what is collected.</a>
 				</p>
