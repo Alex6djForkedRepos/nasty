@@ -444,6 +444,7 @@ export type MountFailureReason =
 	| 'needs_unlock'
 	| 'needs_check'
 	| 'busy'
+	| 'identity_mismatch'
 	| 'unknown';
 
 export interface MissingDevice {
