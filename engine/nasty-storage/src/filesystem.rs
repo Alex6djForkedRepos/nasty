@@ -427,7 +427,7 @@ pub struct CreateFilesystemRequest {
     /// `store_key != false`, and a usable TPM2 on the host — request
     /// is rejected upfront when any are missing.
     pub bind_to_tpm: Option<bool>,
-    /// Filesystem-wide label (used as default when no per-device labels set).
+    /// Default per-device tiering label when targets are set and no device label is provided.
     pub label: Option<String>,
     /// Tiering targets set at format time.
     pub foreground_target: Option<String>,
@@ -743,6 +743,8 @@ pub enum MountFailureReason {
     NeedsCheck,
     /// The mount point or a member device is busy / already in use.
     Busy,
+    /// The discovered or mounted filesystem UUID differs from persisted state.
+    IdentityMismatch,
     /// Couldn't be classified; the raw stderr carries the detail.
     Unknown,
 }
@@ -1872,7 +1874,7 @@ async fn revalidate_create_targets(
 }
 
 fn build_create_format_args(req: &CreateFilesystemRequest, devices: &[DeviceSpec]) -> Vec<String> {
-    let mut args = vec!["format".to_string(), format!("--label={}", req.name)];
+    let mut args = vec!["format".to_string(), format!("--fs_label={}", req.name)];
     if req.replicas > 1 {
         args.push(format!("--replicas={}", req.replicas));
     }
@@ -2090,9 +2092,30 @@ impl FilesystemService {
                 continue;
             }
 
+            if opts.uuid.as_deref().is_none_or(str::is_empty) {
+                let failure = missing_persisted_identity_failure(name);
+                error!("{}", failure.message);
+                self.record_mount_failure(name, failure).await;
+                failed_names.push(name.to_string());
+                continue;
+            }
+
             let mount_point = format!("{NASTY_MOUNT_BASE}/{name}");
 
             if is_mountpoint(&mount_point).await {
+                let expected_uuid = opts.uuid.as_deref().filter(|uuid| !uuid.is_empty());
+                let actual_uuid = mounted_fs_uuid_at(&mount_point).await.ok().flatten();
+                if !mounted_identity_matches(expected_uuid, actual_uuid.as_deref()) {
+                    let failure = identity_mismatch_failure(
+                        name,
+                        expected_uuid.unwrap_or("unknown"),
+                        actual_uuid.as_deref(),
+                    );
+                    error!("{}", failure.message);
+                    self.record_mount_failure(name, failure).await;
+                    failed_names.push(name.to_string());
+                    continue;
+                }
                 info!("Filesystem '{name}' already mounted at {mount_point}");
                 continue;
             }
@@ -2186,6 +2209,7 @@ impl FilesystemService {
     /// Uncached implementation of filesystem listing.
     async fn list_uncached(&self) -> Result<Vec<Filesystem>, FilesystemError> {
         let mounts = read_bcachefs_mounts().await?;
+        let state = load_fs_state().await;
 
         // A single bcachefs filesystem can have multiple mount points — e.g. kubelet
         // bind-mounts a subvolume under /var/lib/kubelet/... while the canonical
@@ -2221,10 +2245,11 @@ impl FilesystemService {
             // get_mount_usage itself so we don't need to match here.
             let (total, used, available) = get_mount_usage(mount_point).await.unwrap_or((0, 0, 0));
 
-            let name = Path::new(mount_point)
+            let mount_name = Path::new(mount_point)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let name = mounted_filesystem_name(&state, &mount_name, uuid);
 
             seen_uuids.insert(uuid.clone());
             let uuid = uuid.clone();
@@ -2249,15 +2274,12 @@ impl FilesystemService {
         }
 
         // Discover unmounted bcachefs filesystems via blkid
-        let state = load_fs_state().await;
         let unmounted = discover_unmounted_bcachefs(&seen_uuids).await;
         for (uuid, _label, devices) in unmounted {
             // Infer filesystem name from existing mount directory or fs-state.json.
             // Note: blkid's LABEL_SUB is the bcachefs per-device tiering label
             // (e.g. "fast", "slow"), NOT the filesystem name — don't use it.
-            let name = find_fs_name_by_uuid(&state, &uuid)
-                .or_else(|| find_fs_name_by_devices(&devices))
-                .unwrap_or_else(|| uuid[..8].to_string());
+            let name = filesystem_name_for_uuid(&state, &uuid);
 
             let mount_point = format!("{NASTY_MOUNT_BASE}/{name}");
             let has_mount_dir = Path::new(&mount_point).is_dir();
@@ -2304,9 +2326,13 @@ impl FilesystemService {
         }
 
         // Overlay persisted mount options onto sysfs options
-        let state = load_fs_state().await;
         for fs in &mut filesystems {
-            if let Some(opts) = state.get(&fs.name) {
+            if let Some(opts) = state.get(&fs.name).filter(|opts| {
+                opts.uuid
+                    .as_deref()
+                    .filter(|uuid| !uuid.is_empty())
+                    .is_some_and(|uuid| uuid == fs.uuid)
+            }) {
                 if fs.options.version_upgrade.is_none() {
                     fs.options.version_upgrade = opts.version_upgrade.clone();
                 }
@@ -2371,11 +2397,21 @@ impl FilesystemService {
 
     /// Get a single filesystem by name
     pub async fn get(&self, name: &str) -> Result<Filesystem, FilesystemError> {
-        let filesystems = self.list().await?;
-        filesystems
-            .into_iter()
-            .find(|p| p.name == name)
-            .ok_or_else(|| FilesystemError::NotFound(name.to_string()))
+        let state = load_fs_state().await;
+        let expected_uuid = match state.get(name) {
+            Some(opts) => Some(
+                opts.uuid
+                    .as_deref()
+                    .filter(|uuid| !uuid.is_empty())
+                    .ok_or_else(|| {
+                        FilesystemError::CommandFailed(format!(
+                            "filesystem '{name}' has legacy state without a UUID; refusing a name-only operation"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+        select_filesystem_for_mount(self.list().await?, name, expected_uuid)
     }
 
     /// Create a new bcachefs filesystem: format devices, create mount point, mount
@@ -2386,6 +2422,9 @@ impl FilesystemService {
         let _mutation_guard = self.block_mutations.lock().await;
         let plan = build_create_plan(req).await?;
         let mut req = plan.request.clone();
+        if load_fs_state().await.contains_key(&req.name) {
+            return Err(FilesystemError::AlreadyExists(req.name.clone()));
+        }
         let mount_point = plan.mount_point.clone();
         reserve_create_mount_point(&plan).await?;
         req.devices = match execute_partition_plan(&plan).await {
@@ -2484,6 +2523,24 @@ impl FilesystemService {
             }
         }
 
+        let uuid = get_fs_uuid(&req.devices[0].path)
+            .await
+            .filter(|uuid| !uuid.is_empty())
+            .ok_or_else(|| {
+                FilesystemError::CommandFailed(format!(
+                    "filesystem '{}' was formatted, but its UUID could not be verified; refusing to mount it",
+                    req.name
+                ))
+            })?;
+        verify_device_paths_uuid(
+            req.devices
+                .iter()
+                .map(|device| device.path.clone())
+                .collect(),
+            &uuid,
+        )
+        .await?;
+
         let device_arg = req
             .devices
             .iter()
@@ -2527,6 +2584,18 @@ impl FilesystemService {
         .await
         .map_err(FilesystemError::CommandFailed)?;
 
+        let mounted_uuid = mounted_fs_uuid_at(&mount_point).await.ok().flatten();
+        if mounted_uuid.as_deref() != Some(uuid.as_str()) {
+            let rollback = cmd::run_ok("umount", &[&mount_point]).await;
+            let suffix = rollback
+                .err()
+                .map(|error| format!("; rollback unmount also failed: {error}"))
+                .unwrap_or_default();
+            return Err(FilesystemError::CommandFailed(format!(
+                "mounted filesystem UUID did not match expected UUID {uuid}{suffix}"
+            )));
+        }
+
         // Apply I/O scheduler to member block devices
         let dev_list: Vec<FilesystemDevice> = req
             .devices
@@ -2553,9 +2622,6 @@ impl FilesystemService {
         {
             warn!("Failed to set I/O scheduler: {e}");
         }
-
-        // Read back the filesystem info
-        let uuid = get_fs_uuid(&req.devices[0].path).await.unwrap_or_default();
 
         // Track mount state with identity info for boot reconciliation
         let mut saved_opts = mount_opts;
@@ -2639,11 +2705,18 @@ impl FilesystemService {
         let _mutation_guard = self.block_mutations.lock().await;
 
         let fs = self.get(&req.name).await?;
+        verify_filesystem_device_identity(&fs).await?;
+
+        let mount_dir = format!("{NASTY_MOUNT_BASE}/{}", req.name);
+        if is_mountpoint(&mount_dir).await {
+            verify_mountpoint_identity(&mount_dir, &fs.uuid).await?;
+        }
 
         // Unmount if mounted
         if fs.mounted
             && let Some(ref mp) = fs.mount_point
         {
+            verify_mountpoint_identity(mp, &fs.uuid).await?;
             detach_filesystem_loop_devices(mp).await?;
             info!("Unmounting filesystem '{}' from {}", req.name, mp);
             cmd::run_ok("umount", &[mp.as_str()])
@@ -2656,16 +2729,13 @@ impl FilesystemService {
         let uuid_mount = format!("UUID={}", fs.uuid);
         let _ = cmd::run_ok("umount", &[&uuid_mount]).await;
 
-        // Forget the filesystem entirely — destroy wipes the
-        // superblocks below, so keeping a stale state entry would
-        // have `restore_mounts` waiting 60 s for the now-gone devices
-        // on every boot. Distinct from plain `unmount`, which uses
-        // `save_fs_unmounted` to preserve tuned options.
-        forget_fs(&req.name).await;
-
         // Remove mount point directory if it exists
-        let mount_dir = format!("{NASTY_MOUNT_BASE}/{}", req.name);
-        let _ = tokio::fs::remove_dir_all(&mount_dir).await;
+        if is_mountpoint(&mount_dir).await {
+            return Err(FilesystemError::CommandFailed(format!(
+                "mount point {mount_dir} is still occupied; refusing to remove it"
+            )));
+        }
+        let _ = tokio::fs::remove_dir(&mount_dir).await;
 
         // Wipe bcachefs superblocks from all member devices
         for dev in &fs.devices {
@@ -2676,6 +2746,11 @@ impl FilesystemService {
                     FilesystemError::CommandFailed(format!("failed to wipe {}: {e}", dev.path))
                 })?;
         }
+
+        // Forget only after every destructive step succeeded. A failed
+        // destroy must retain the UUID binding so a retry cannot target a
+        // different filesystem that later appears under the same name.
+        forget_fs(&req.name).await;
 
         // Flush the kernel's blkid cache so the ghost filesystem disappears
         let _ = cmd::run_ok("udevadm", &["trigger"]).await;
@@ -2701,6 +2776,14 @@ impl FilesystemService {
         force_degraded: bool,
     ) -> Result<Filesystem, FilesystemError> {
         let state = load_fs_state().await;
+        if state
+            .get(name)
+            .is_some_and(|opts| opts.uuid.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(FilesystemError::CommandFailed(format!(
+                "filesystem '{name}' has legacy state without a UUID; refusing a name-only mount"
+            )));
+        }
         let mut opts = get_fs_mount_options(&state, name);
         if force_degraded {
             opts.degraded = Some(true);
@@ -2715,14 +2798,49 @@ impl FilesystemService {
         opts: &FsMountOptions,
     ) -> Result<Filesystem, FilesystemError> {
         info!("Mounting filesystem '{}'", name);
-        let fs = self.get(name).await?;
+        let expected_uuid = opts.uuid.as_deref().filter(|uuid| !uuid.is_empty());
+        let filesystems = self.list().await?;
+        let visible_uuid = filesystems
+            .iter()
+            .find(|filesystem| filesystem.name == name)
+            .map(|filesystem| filesystem.uuid.clone());
+        let fs = match select_filesystem_for_mount(filesystems, name, expected_uuid) {
+            Ok(filesystem) => filesystem,
+            Err(error) => {
+                if let Some(expected_uuid) = expected_uuid {
+                    self.record_mount_failure(
+                        name,
+                        identity_mismatch_failure(name, expected_uuid, visible_uuid.as_deref()),
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        };
         if fs.mounted {
             info!("Filesystem '{}' is already mounted", name);
             return Ok(fs);
         }
 
         let mount_point = format!("{NASTY_MOUNT_BASE}/{name}");
+        if is_mountpoint(&mount_point).await {
+            let actual_uuid = mounted_fs_uuid_at(&mount_point).await.ok().flatten();
+            if actual_uuid.as_deref() != Some(fs.uuid.as_str()) {
+                let failure = identity_mismatch_failure(name, &fs.uuid, actual_uuid.as_deref());
+                let message = failure.message.clone();
+                self.record_mount_failure(name, failure).await;
+                return Err(FilesystemError::CommandFailed(message));
+            }
+            self.invalidate_list_cache().await;
+            return select_filesystem_for_mount(self.list().await?, name, Some(&fs.uuid));
+        }
         tokio::fs::create_dir_all(&mount_point).await?;
+
+        if let Err(error) = verify_filesystem_device_identity(&fs).await {
+            self.record_mount_failure(name, identity_mismatch_failure(name, &fs.uuid, None))
+                .await;
+            return Err(error);
+        }
 
         let first_device = fs.devices.first().map(|d| d.path.as_str()).unwrap_or("");
 
@@ -2802,6 +2920,18 @@ impl FilesystemService {
             return Err(FilesystemError::CommandFailed(e));
         }
 
+        let mounted_uuid = mounted_fs_uuid_at(&mount_point).await.ok().flatten();
+        if mounted_uuid.as_deref() != Some(fs.uuid.as_str()) {
+            let rollback = cmd::run_ok("umount", &[&mount_point]).await;
+            let failure = identity_mismatch_failure(name, &fs.uuid, mounted_uuid.as_deref());
+            let mut message = failure.message.clone();
+            if let Err(error) = rollback {
+                message.push_str(&format!(" Rollback unmount also failed: {error}"));
+            }
+            self.record_mount_failure(name, failure).await;
+            return Err(FilesystemError::CommandFailed(message));
+        }
+
         // Apply I/O scheduler to member block devices
         if let Some(ref sched) = opts.io_scheduler
             && let Err(e) = apply_io_scheduler(&fs.devices, sched).await
@@ -2830,7 +2960,7 @@ impl FilesystemService {
         self.clear_mount_failure(name).await;
 
         self.invalidate_list_cache().await;
-        self.get(name).await
+        select_filesystem_for_mount(self.list().await?, name, Some(&fs.uuid))
     }
 
     /// Unlock an encrypted filesystem with a passphrase (does not mount).
@@ -3098,6 +3228,12 @@ impl FilesystemService {
             let mut state = load_fs_state().await;
             {
                 let opts = state.entry(req.name.clone()).or_default();
+                opts.uuid = Some(fs.uuid.clone());
+                opts.devices = fs
+                    .devices
+                    .iter()
+                    .map(|device| device.path.clone())
+                    .collect();
                 if let Some(ref v) = req.version_upgrade {
                     opts.version_upgrade = Some(v.clone());
                 }
@@ -3132,13 +3268,19 @@ impl FilesystemService {
 
         if mount_changed {
             // Remount in-place (no unmount needed, works even when busy)
-            let mount_point = format!("{NASTY_MOUNT_BASE}/{}", req.name);
+            let mount_point = fs.mount_point.as_deref().ok_or_else(|| {
+                FilesystemError::CommandFailed(format!(
+                    "filesystem '{}' has no active mount point to remount",
+                    req.name
+                ))
+            })?;
+            verify_mountpoint_identity(mount_point, &fs.uuid).await?;
             let state = load_fs_state().await;
             let mount_opt_str =
                 build_mount_opts(state.get(&req.name).unwrap_or(&FsMountOptions::default()));
             cmd::run_ok(
                 "mount",
-                &["-o", &format!("remount,{mount_opt_str}"), &mount_point],
+                &["-o", &format!("remount,{mount_opt_str}"), mount_point],
             )
             .await
             .map_err(FilesystemError::CommandFailed)?;
@@ -3154,7 +3296,10 @@ impl FilesystemService {
     pub async fn unmount(&self, name: &str) -> Result<(), FilesystemError> {
         info!("Unmounting filesystem '{}'", name);
         let fs = self.get(name).await?;
-        if let Some(ref mp) = fs.mount_point {
+        if fs.mounted
+            && let Some(ref mp) = fs.mount_point
+        {
+            verify_mountpoint_identity(mp, &fs.uuid).await?;
             info!("Running umount on {}", mp);
             cmd::run_ok("umount", &[mp.as_str()])
                 .await
@@ -3165,7 +3310,7 @@ impl FilesystemService {
         }
 
         // Track mount state
-        save_fs_unmounted(name).await;
+        save_fs_unmounted(name, &fs).await;
 
         self.invalidate_list_cache().await;
         Ok(())
@@ -5504,6 +5649,55 @@ fn find_fs_name_by_uuid(state: &FsState, uuid: &str) -> Option<String> {
     None
 }
 
+fn filesystem_name_for_uuid(state: &FsState, uuid: &str) -> String {
+    find_fs_name_by_uuid(state, uuid).unwrap_or_else(|| uuid.chars().take(8).collect::<String>())
+}
+
+fn mounted_filesystem_name(state: &FsState, mount_name: &str, uuid: &str) -> String {
+    match state
+        .get(mount_name)
+        .and_then(|opts| opts.uuid.as_deref())
+        .filter(|expected_uuid| *expected_uuid != uuid)
+    {
+        Some(_) => filesystem_name_for_uuid(state, uuid),
+        None => mount_name.to_string(),
+    }
+}
+
+fn select_filesystem_by_name(
+    filesystems: Vec<Filesystem>,
+    name: &str,
+) -> Result<Filesystem, FilesystemError> {
+    let mut matches = filesystems.into_iter().filter(|fs| fs.name == name);
+    let filesystem = matches
+        .next()
+        .ok_or_else(|| FilesystemError::NotFound(name.to_string()))?;
+    if matches.next().is_some() {
+        return Err(FilesystemError::InvalidInput(format!(
+            "filesystem name '{name}' is ambiguous; identify the filesystem by UUID"
+        )));
+    }
+    Ok(filesystem)
+}
+
+fn select_filesystem_for_mount(
+    filesystems: Vec<Filesystem>,
+    name: &str,
+    expected_uuid: Option<&str>,
+) -> Result<Filesystem, FilesystemError> {
+    if let Some(expected_uuid) = expected_uuid {
+        return filesystems
+            .into_iter()
+            .find(|fs| fs.uuid == expected_uuid)
+            .ok_or_else(|| {
+                FilesystemError::CommandFailed(format!(
+                    "filesystem '{name}' with expected UUID {expected_uuid} is not available; refusing to mount a different filesystem"
+                ))
+            });
+    }
+    select_filesystem_by_name(filesystems, name)
+}
+
 async fn discover_unmounted_bcachefs(
     seen_uuids: &std::collections::HashSet<String>,
 ) -> Vec<(String, String, Vec<String>)> {
@@ -5626,9 +5820,15 @@ async fn save_fs_mounted_with_opts(fs_name: &str, mut opts: FsMountOptions) {
 /// which silently wiped the operator's config (and produced the
 /// "encrypted=None at boot → systemd-ask-password deadlock" reported
 /// on 10.10.10.71 after a passing unmount/mount cycle).
-async fn save_fs_unmounted(fs_name: &str) {
+async fn save_fs_unmounted(fs_name: &str, fs: &Filesystem) {
     let mut state = load_fs_state().await;
     let opts = state.entry(fs_name.to_string()).or_default();
+    opts.uuid = Some(fs.uuid.clone());
+    opts.devices = fs
+        .devices
+        .iter()
+        .map(|device| device.path.clone())
+        .collect();
     opts.mounted = Some(false);
     if let Err(e) = save_fs_state(&state).await {
         warn!("save_fs_state(unmounted: {fs_name}) failed: {e}");
@@ -5897,6 +6097,41 @@ fn classify_mount_failure(raw: &str, missing: &[MissingDevice]) -> (MountFailure
         "The filesystem couldn't be mounted. See the details below for the bcachefs error."
             .to_string(),
     )
+}
+
+fn mounted_identity_matches(expected_uuid: Option<&str>, actual_uuid: Option<&str>) -> bool {
+    expected_uuid.is_some_and(|expected| actual_uuid == Some(expected))
+}
+
+fn missing_persisted_identity_failure(name: &str) -> MountFailure {
+    let message = format!(
+        "Filesystem '{name}' has legacy state without a UUID. NASty refused to restore it by name because another pool could now use the same device paths."
+    );
+    MountFailure {
+        attempted_at: unix_now_secs(),
+        reason: MountFailureReason::IdentityMismatch,
+        message: message.clone(),
+        missing_devices: Vec::new(),
+        raw: message,
+    }
+}
+
+fn identity_mismatch_failure(
+    name: &str,
+    expected_uuid: &str,
+    actual_uuid: Option<&str>,
+) -> MountFailure {
+    let actual = actual_uuid.unwrap_or("an unknown or non-bcachefs filesystem");
+    let message = format!(
+        "Mount point {NASTY_MOUNT_BASE}/{name} belongs to {actual}, but '{name}' is tracked as UUID {expected_uuid}. NASty refused to use this mount."
+    );
+    MountFailure {
+        attempted_at: unix_now_secs(),
+        reason: MountFailureReason::IdentityMismatch,
+        message: message.clone(),
+        missing_devices: Vec::new(),
+        raw: message,
+    }
 }
 
 /// Assemble a [`MountFailure`] from a failed mount: figure out which
@@ -6646,8 +6881,15 @@ async fn read_io_scheduler(devices: &[FilesystemDevice]) -> Option<String> {
 
 async fn is_mountpoint(path: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
+    if tokio::fs::read_to_string("/proc/self/mountinfo")
+        .await
+        .is_ok_and(|contents| mountinfo_has_mountpoint(&contents, path))
+    {
+        return true;
+    }
     // A path is a mount point when its device ID differs from its parent's,
-    // or when it is the filesystem root (path == parent, same inode).
+    // or when it is the filesystem root. The mountinfo check above also
+    // catches bind mounts that share their parent's device ID.
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return false;
     };
@@ -6660,18 +6902,67 @@ async fn is_mountpoint(path: &str) -> bool {
     meta.dev() != parent_meta.dev() || meta.ino() == parent_meta.ino()
 }
 
-/// Try to find filesystem name from existing mount point directories
-fn find_fs_name_by_devices(_devices: &[String]) -> Option<String> {
-    // Check if any directory exists under the mount base
-    let base = Path::new(NASTY_MOUNT_BASE);
-    if let Ok(entries) = std::fs::read_dir(base) {
-        for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                return Some(entry.file_name().to_string_lossy().to_string());
-            }
+fn mountinfo_has_mountpoint(contents: &str, path: &str) -> bool {
+    contents.lines().any(|line| {
+        line.split_whitespace()
+            .nth(4)
+            .is_some_and(|mount_point| mount_point == path)
+    })
+}
+
+async fn mounted_fs_uuid_at(mount_point: &str) -> Result<Option<String>, FilesystemError> {
+    let mounts = read_bcachefs_mounts().await?;
+    let Some(devices) = mounts.get(mount_point) else {
+        return Ok(None);
+    };
+    if let Some(uuid) = by_uuid_source(devices) {
+        return Ok(Some(uuid.to_string()));
+    }
+    let Some(first_device) = devices.first() else {
+        return Ok(None);
+    };
+    Ok(get_fs_uuid(first_device)
+        .await
+        .filter(|uuid| !uuid.is_empty()))
+}
+
+async fn verify_mountpoint_identity(
+    mount_point: &str,
+    expected_uuid: &str,
+) -> Result<(), FilesystemError> {
+    let actual_uuid = mounted_fs_uuid_at(mount_point).await?;
+    if actual_uuid.as_deref() != Some(expected_uuid) {
+        return Err(FilesystemError::CommandFailed(format!(
+            "mount point {mount_point} does not contain expected filesystem UUID {expected_uuid}; refusing the operation"
+        )));
+    }
+    Ok(())
+}
+
+async fn verify_device_paths_uuid(
+    paths: Vec<String>,
+    expected_uuid: &str,
+) -> Result<(), FilesystemError> {
+    for path in paths {
+        let actual_uuid = get_fs_uuid(&path).await;
+        if actual_uuid.as_deref() != Some(expected_uuid) {
+            return Err(FilesystemError::CommandFailed(format!(
+                "device {path} no longer belongs to filesystem UUID {expected_uuid}; refusing the operation"
+            )));
         }
     }
-    None
+    Ok(())
+}
+
+async fn verify_filesystem_device_identity(fs: &Filesystem) -> Result<(), FilesystemError> {
+    verify_device_paths_uuid(
+        fs.devices
+            .iter()
+            .map(|device| device.path.clone())
+            .collect(),
+        &fs.uuid,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -6709,6 +7000,106 @@ mod tests {
             journal_flush_delay: None,
             io_scheduler: None,
         }
+    }
+
+    fn filesystem_fixture(name: &str, uuid: &str) -> Filesystem {
+        Filesystem {
+            name: name.to_string(),
+            uuid: uuid.to_string(),
+            devices: Vec::new(),
+            mount_point: None,
+            mounted: false,
+            total_bytes: 0,
+            used_bytes: 0,
+            available_bytes: 0,
+            options: FilesystemOptions::default(),
+            last_mount_error: None,
+        }
+    }
+
+    #[test]
+    fn unknown_filesystem_uses_uuid_prefix_instead_of_managed_mount_directory() {
+        let state = HashMap::from([(
+            "first".to_string(),
+            FsMountOptions {
+                uuid: Some("aaaaaaaa-main".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert_eq!(filesystem_name_for_uuid(&state, "aaaaaaaa-main"), "first");
+        assert_eq!(filesystem_name_for_uuid(&state, "bbbbbbbb-usb"), "bbbbbbbb");
+        assert_eq!(
+            mounted_filesystem_name(&state, "first", "bbbbbbbb-usb"),
+            "bbbbbbbb"
+        );
+        assert_eq!(
+            mounted_filesystem_name(&state, "first", "aaaaaaaa-main"),
+            "first"
+        );
+    }
+
+    #[test]
+    fn mount_selection_uses_persisted_uuid_even_when_names_collide() {
+        let filesystems = vec![
+            filesystem_fixture("first", "bbbbbbbb-usb"),
+            filesystem_fixture("first", "aaaaaaaa-main"),
+        ];
+
+        let selected =
+            select_filesystem_for_mount(filesystems.clone(), "first", Some("aaaaaaaa-main"))
+                .unwrap();
+        assert_eq!(selected.uuid, "aaaaaaaa-main");
+        assert!(select_filesystem_by_name(filesystems, "first").is_err());
+
+        let only_usb = vec![filesystem_fixture("first", "bbbbbbbb-usb")];
+        let error =
+            select_filesystem_for_mount(only_usb, "first", Some("aaaaaaaa-main")).unwrap_err();
+        assert!(error.to_string().contains("refusing to mount"));
+    }
+
+    #[test]
+    fn mounted_identity_requires_the_persisted_uuid() {
+        assert!(mounted_identity_matches(
+            Some("aaaaaaaa-main"),
+            Some("aaaaaaaa-main")
+        ));
+        assert!(!mounted_identity_matches(
+            Some("aaaaaaaa-main"),
+            Some("bbbbbbbb-usb")
+        ));
+        assert!(!mounted_identity_matches(Some("aaaaaaaa-main"), None));
+        assert!(!mounted_identity_matches(None, Some("bbbbbbbb-usb")));
+    }
+
+    #[test]
+    fn mountinfo_detects_bind_mounts_at_the_exact_target() {
+        let mountinfo = "36 25 0:32 / /fs/first rw,relatime - bcachefs /dev/sdb rw\n\
+                         37 25 0:32 /subvol /fs/second rw,relatime - bcachefs /dev/sdb rw\n";
+        assert!(mountinfo_has_mountpoint(mountinfo, "/fs/first"));
+        assert!(mountinfo_has_mountpoint(mountinfo, "/fs/second"));
+        assert!(!mountinfo_has_mountpoint(mountinfo, "/fs/third"));
+    }
+
+    #[test]
+    fn create_format_uses_filesystem_label_without_implicit_device_labels() {
+        let req = create_request(&["/dev/sdb", "/dev/sdc"]);
+        let args = build_create_format_args(&req, &req.devices);
+
+        assert!(args.contains(&"--fs_label=tank".to_string()));
+        assert!(!args.contains(&"--label=tank".to_string()));
+    }
+
+    #[test]
+    fn create_format_keeps_device_labels_for_tiering() {
+        let mut req = create_request(&["/dev/sdb", "/dev/sdc"]);
+        req.foreground_target = Some("fast".to_string());
+        req.devices[0].label = Some("fast".to_string());
+        let args = build_create_format_args(&req, &req.devices);
+
+        assert!(args.contains(&"--fs_label=tank".to_string()));
+        assert!(args.contains(&"--label=fast".to_string()));
+        assert!(args.contains(&"--label=tank".to_string()));
     }
 
     fn create_inventory_fixture() -> BlockInventory {

@@ -598,7 +598,7 @@
 
 	function buildFormatCommand(): string[] {
 		const profile = activeProfile();
-		const args = ['bcachefs', 'format'];
+		const args = ['bcachefs', 'format', `--fs_label=${newName}`];
 
 		if (replicas > 1) args.push(`--replicas=${replicas}`);
 		{
@@ -1963,7 +1963,7 @@
 		<p class="mt-1 text-sm text-muted-foreground">Use the <strong>Create Filesystem</strong> button above to get started.</p>
 	</div>
 {:else}
-	{#each filesystems as fs (fs.name)}
+	{#each filesystems as fs (fs.uuid)}
 		<Card class="mb-4">
 			<CardContent class="pt-4">
 				<div class="flex flex-wrap items-center justify-between gap-4">
