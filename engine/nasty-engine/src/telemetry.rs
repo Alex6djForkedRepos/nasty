@@ -191,6 +191,31 @@ pub async fn send_report(state: &AppState) -> bool {
     }
 }
 
+/// Spawn the daily telemetry background task.
+pub fn spawn_daily(state: Arc<AppState>) {
+    let h = tokio::spawn(async move {
+        // Random initial delay (0-24h) to spread load across instances
+        let jitter = rand::rng().random_range(0..TELEMETRY_INTERVAL.as_secs());
+        debug!("Telemetry: first report in {}s", jitter);
+        tokio::time::sleep(Duration::from_secs(jitter)).await;
+
+        let mut ticker = interval(TELEMETRY_INTERVAL);
+        loop {
+            ticker.tick().await;
+            send_report(&state).await;
+        }
+    });
+    // Observer spawn — telemetry loop is supposed to run forever; if
+    // it exits (cleanly or by panic) we want a single log line so the
+    // user can see why telemetry stopped reporting.
+    tokio::spawn(async move {
+        match h.await {
+            Ok(()) => tracing::warn!("telemetry loop exited unexpectedly"),
+            Err(e) => tracing::warn!("telemetry loop panicked / cancelled: {e}"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,29 +270,4 @@ mod tests {
         assert!(value.get("iscsi_luns").is_none());
         assert!(value.get("nvmeof_namespaces").is_none());
     }
-}
-
-/// Spawn the daily telemetry background task.
-pub fn spawn_daily(state: Arc<AppState>) {
-    let h = tokio::spawn(async move {
-        // Random initial delay (0-24h) to spread load across instances
-        let jitter = rand::rng().random_range(0..TELEMETRY_INTERVAL.as_secs());
-        debug!("Telemetry: first report in {}s", jitter);
-        tokio::time::sleep(Duration::from_secs(jitter)).await;
-
-        let mut ticker = interval(TELEMETRY_INTERVAL);
-        loop {
-            ticker.tick().await;
-            send_report(&state).await;
-        }
-    });
-    // Observer spawn — telemetry loop is supposed to run forever; if
-    // it exits (cleanly or by panic) we want a single log line so the
-    // user can see why telemetry stopped reporting.
-    tokio::spawn(async move {
-        match h.await {
-            Ok(()) => tracing::warn!("telemetry loop exited unexpectedly"),
-            Err(e) => tracing::warn!("telemetry loop panicked / cancelled: {e}"),
-        }
-    });
 }
