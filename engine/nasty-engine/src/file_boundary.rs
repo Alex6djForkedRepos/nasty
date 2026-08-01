@@ -185,7 +185,10 @@ fn classify_node(fd: OwnedFd, expected_device: Option<u64>) -> io::Result<Bounda
         return readable_regular_file(fd, expected_device).map(BoundaryNode::File);
     }
     if metadata.is_dir() {
-        let fd = readable_directory(fd, &metadata)?;
+        // Keep the O_PATH descriptor returned by openat2. It is already a
+        // stable directory handle and is valid as a dirfd for the guarded
+        // openat/openat2 calls below; reopening it through /proc/self/fd adds
+        // a filesystem-specific failure point without strengthening the jail.
         return Ok(BoundaryNode::Directory(BoundaryDirectory {
             fd: Arc::new(fd),
             device: metadata.dev(),
@@ -221,28 +224,6 @@ fn readable_regular_file(fd: OwnedFd, expected_device: Option<u64>) -> io::Resul
     #[cfg(not(target_os = "linux"))]
     {
         Ok(File::from(fd))
-    }
-}
-
-fn readable_directory(fd: OwnedFd, metadata: &std::fs::Metadata) -> io::Result<OwnedFd> {
-    #[cfg(target_os = "linux")]
-    {
-        let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
-            .open(path)?;
-        let reopened = file.metadata()?;
-        if reopened.dev() != metadata.dev() || reopened.ino() != metadata.ino() {
-            return Err(invalid_path("reopened directory identity changed"));
-        }
-        Ok(file.into())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = metadata;
-        Ok(fd)
     }
 }
 

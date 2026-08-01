@@ -909,8 +909,23 @@ impl GuestShareService {
                 .enumerate()
                 .filter_map(|(root, path)| {
                     let path = PathBuf::from(path);
-                    let node = crate::file_boundary::open_root_beneath(&files_root, &path).ok()?;
-                    let metadata = node.metadata().ok()?;
+                    let node = crate::file_boundary::open_root_beneath(&files_root, &path)
+                        .map_err(|error| {
+                            tracing::warn!(
+                                "Guest share root {} could not be opened: {error}",
+                                path.display()
+                            );
+                        })
+                        .ok()?;
+                    let metadata = node
+                        .metadata()
+                        .map_err(|error| {
+                            tracing::warn!(
+                                "Guest share root {} metadata failed: {error}",
+                                path.display()
+                            );
+                        })
+                        .ok()?;
                     Some(PublicEntry {
                         root,
                         name: path

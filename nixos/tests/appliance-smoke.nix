@@ -19,6 +19,7 @@ let
     import ssl
     import subprocess
     import sys
+    import urllib.parse
     import urllib.request
     import websocket
 
@@ -81,6 +82,11 @@ let
             return json.loads(resp.read())["token"]
 
 
+    def http_json(url):
+        with urllib.request.urlopen(url) as resp:
+            return json.loads(resp.read())
+
+
     # ── Session 1: change the default admin password ──────────────
     # Default admin/admin has must_change_password set, which gates
     # most RPC methods. Change it, then re-login so subsequent calls
@@ -139,10 +145,44 @@ let
             f"created filesystem missing from fs.list: {fs_list!r}"
         )
 
+        # Public folder links and the standard-user portal both walk paths
+        # through file_boundary. Exercise a real /fs/<name> mount here: unit
+        # tests use ordinary temp directories and cannot catch mount-crossing
+        # regressions in the descriptor opener.
+        subprocess.run(
+            ["mkdir", "-p", "/fs/smoke-pool/media/movies"],
+            check=True,
+        )
+        with open("/fs/smoke-pool/media/movies/readme.txt", "w") as marker:
+            marker.write("portal-boundary-ok")
+        guest = call(ws, "guestshare.create", 5, {
+            "paths": ["/fs/smoke-pool/media"],
+            "expires_at": None,
+            "password": None,
+            "max_downloads": None,
+            "note": "appliance smoke",
+        })
+        public_base = (
+            "http://127.0.0.1:2137/api/public/share/"
+            + urllib.parse.quote(guest["token"], safe="")
+        )
+        public_meta = http_json(public_base)
+        assert public_meta["entries"] == [{
+            "root": 0,
+            "name": "media",
+            "is_dir": True,
+            "size": 0,
+        }], f"mounted guest folder missing from metadata: {public_meta!r}"
+        public_listing = http_json(public_base + "/browse?root=0")
+        assert any(
+            entry["name"] == "movies" and entry["is_dir"]
+            for entry in public_listing["entries"]
+        ), f"mounted guest folder cannot be browsed: {public_listing!r}"
+
         # Unknown method must come back as a JSON-RPC error envelope,
         # not a silent drop.
-        ws.send(json.dumps({"jsonrpc": "2.0", "method": "no.such.method", "id": 5}))
-        bad = recv_response(ws, 5)
+        ws.send(json.dumps({"jsonrpc": "2.0", "method": "no.such.method", "id": 6}))
+        bad = recv_response(ws, 6)
         assert bad.get("error"), f"unknown method should error: {bad!r}"
         print("unknown method error:", bad["error"], file=sys.stderr)
     finally:
