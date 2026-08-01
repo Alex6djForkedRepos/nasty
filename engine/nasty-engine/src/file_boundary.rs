@@ -317,15 +317,23 @@ fn open_relative(base: &OwnedFd, relative: &Path, no_xdev: bool) -> io::Result<O
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return open_relative_components(base, relative, no_xdev);
+        }
+        return Err(error);
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
 }
 
-/// macOS development/tests use component-at-a-time `openat`. The appliance
-/// uses the Linux implementation above; unsupported Linux kernels fail closed.
+/// macOS uses component-at-a-time `openat`. Linux uses the same guarded walk
+/// only when `openat2` is unavailable (including seccomp returning ENOSYS).
 #[cfg(not(target_os = "linux"))]
 fn open_relative(base: &OwnedFd, relative: &Path, no_xdev: bool) -> io::Result<OwnedFd> {
+    open_relative_components(base, relative, no_xdev)
+}
+
+fn open_relative_components(base: &OwnedFd, relative: &Path, no_xdev: bool) -> io::Result<OwnedFd> {
     let components: Vec<&OsStr> = relative
         .components()
         .map(|component| match component {
@@ -343,6 +351,9 @@ fn open_relative(base: &OwnedFd, relative: &Path, no_xdev: bool) -> io::Result<O
     for (index, component) in components.iter().enumerate() {
         let parent = current.as_ref().unwrap_or(base).as_raw_fd();
         let name = c_string(component)?;
+        #[cfg(target_os = "linux")]
+        let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        #[cfg(not(target_os = "linux"))]
         let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
         if index + 1 < components.len() {
             flags |= libc::O_DIRECTORY;
@@ -486,6 +497,38 @@ mod tests {
         report.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"original");
         assert!(opened.open_child(OsStr::new("../docs/report.txt")).is_err());
+    }
+
+    #[test]
+    fn component_fallback_walks_from_stable_descriptors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tmp.path().join("fs");
+        let shared = files.join("pool/docs");
+        std::fs::create_dir_all(shared.join("nested")).unwrap();
+        std::fs::write(shared.join("nested/report.txt"), b"report").unwrap();
+
+        let files_fd = open_directory(&files).unwrap();
+        let shared_fd = open_relative_components(&files_fd, Path::new("pool/docs"), false).unwrap();
+        let root = classify_node(shared_fd, None).unwrap();
+        let BoundaryNode::Directory(directory) = root else {
+            panic!("shared root should be a directory");
+        };
+        assert!(
+            directory
+                .entry_names(10)
+                .unwrap()
+                .iter()
+                .any(|name| name == "nested")
+        );
+
+        let mut report = open_regular_from_root(
+            BoundaryNode::Directory(directory),
+            Path::new("nested/report.txt"),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        report.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"report");
     }
 
     #[cfg(unix)]
