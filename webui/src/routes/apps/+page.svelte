@@ -15,6 +15,7 @@
 	import SortTh from '$lib/components/SortTh.svelte';
 	import CodeEditor from '$lib/components/CodeEditor.svelte';
 	import PathPicker from '$lib/components/PathPicker.svelte';
+	import AppIcon from '$lib/components/AppIcon.svelte';
 	import { CircleCheck, Circle, FolderOpen } from '@lucide/svelte';
 	import type { Filesystem, FsDependents } from '$lib/types';
 	import { unlockFs } from '$lib/unlock-fs.svelte';
@@ -2552,6 +2553,7 @@
 					<tr class="border-b border-border hover:bg-muted/30 transition-colors">
 						<td class="p-3">
 							<div class="flex items-center gap-2">
+								<AppIcon {app} />
 								<span class="font-semibold">{app.name}</span>
 								<Badge variant="outline" class="text-[0.6rem]">{app.kind}</Badge>
 								{#if app.unsafe_mode}

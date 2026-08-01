@@ -51,6 +51,7 @@ All dependencies use licenses compatible with GPL-3.0.
 | clsx | MIT |
 | layerchart | MIT |
 | lightningcss | MPL-2.0 |
+| simple-icons | CC0-1.0 |
 | svelte | MIT |
 | svelte-check | MIT |
 | tailwind-merge | MIT |
