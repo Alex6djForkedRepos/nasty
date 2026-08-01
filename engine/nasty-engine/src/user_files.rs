@@ -121,10 +121,20 @@ pub(crate) async fn browse_handler(
         Err(()) => return unavailable(StatusCode::NOT_FOUND),
     };
     let display_path = query.path.clone();
+    let share_id = share.id.clone();
     let result = tokio::task::spawn_blocking(move || browse_share(&share, &relative, display_path))
         .await
+        .map_err(|error| {
+            tracing::warn!("Portal browse task failed for share {share_id}: {error}");
+        })
         .ok()
-        .and_then(Result::ok);
+        .and_then(|result| {
+            result
+                .map_err(|error| {
+                    tracing::warn!("Portal browse failed for share {share_id}: {error}");
+                })
+                .ok()
+        });
     match result {
         Some(result) => Json(result).into_response(),
         None => unavailable(StatusCode::NOT_FOUND),
