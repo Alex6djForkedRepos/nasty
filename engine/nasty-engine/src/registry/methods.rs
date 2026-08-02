@@ -2237,7 +2237,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "subvolume.update",
-                    desc: "Update mutable subvolume attributes (compression, comments, foreground/background/promote/metadata targets, data replicas) via bcachefs `set-file-option` and xattrs.",
+                    desc: "Update mutable subvolume attributes (compression, comments, foreground/background/promote/metadata targets, data replicas, erasure coding) via bcachefs `set-file-option` and xattrs.",
                     role: MethodRole::Operator,
                     params: MethodParams::Schema(gen_schema::<UpdateSubvolumeRequest>(generator)),
                     result: Some(gen_schema::<Subvolume>(generator)),
