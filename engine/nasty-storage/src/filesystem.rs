@@ -2584,7 +2584,7 @@ impl FilesystemService {
         .await
         .map_err(FilesystemError::CommandFailed)?;
 
-        let mounted_uuid = mounted_fs_uuid_at(&mount_point).await.ok().flatten();
+        let mounted_uuid = mounted_fs_uuid_after_mount(&mount_point).await;
         if mounted_uuid.as_deref() != Some(uuid.as_str()) {
             let rollback = cmd::run_ok("umount", &[&mount_point]).await;
             let suffix = rollback
@@ -2920,7 +2920,7 @@ impl FilesystemService {
             return Err(FilesystemError::CommandFailed(e));
         }
 
-        let mounted_uuid = mounted_fs_uuid_at(&mount_point).await.ok().flatten();
+        let mounted_uuid = mounted_fs_uuid_after_mount(&mount_point).await;
         if mounted_uuid.as_deref() != Some(fs.uuid.as_str()) {
             let rollback = cmd::run_ok("umount", &[&mount_point]).await;
             let failure = identity_mismatch_failure(name, &fs.uuid, mounted_uuid.as_deref());
@@ -6924,6 +6924,19 @@ async fn mounted_fs_uuid_at(mount_point: &str) -> Result<Option<String>, Filesys
     Ok(get_fs_uuid(first_device)
         .await
         .filter(|uuid| !uuid.is_empty()))
+}
+
+/// A successful mount can become visible before blkid/lsblk can resolve its UUID.
+/// Retry only the unavailable case; a reported mismatch must fail immediately.
+async fn mounted_fs_uuid_after_mount(mount_point: &str) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let uuid = mounted_fs_uuid_at(mount_point).await.ok().flatten();
+        if uuid.is_some() || tokio::time::Instant::now() >= deadline {
+            return uuid;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn verify_mountpoint_identity(
