@@ -233,12 +233,24 @@ impl ProtocolService {
         let state = load_state().await;
 
         for &proto in Protocol::ALL {
-            if !state.get(proto) || excluded.contains(&proto) {
+            let enabled = state.get(proto);
+            if !enabled || excluded.contains(&proto) {
                 if excluded.contains(&proto) {
                     warn!(
                         "Skipping {} restore because its persisted backing state is unsafe",
                         proto.display_name()
                     );
+                }
+
+                // smartd used to be pulled in directly by multi-user.target.
+                // Stop an old-generation instance during a live upgrade when
+                // the persisted protocol preference says SMART is disabled.
+                if !enabled && proto == Protocol::Smart {
+                    for svc in proto.services() {
+                        if let Err(e) = systemctl("stop", svc).await {
+                            warn!("Failed to stop disabled {svc}: {e}");
+                        }
+                    }
                 }
                 continue;
             }
@@ -602,8 +614,9 @@ async fn load_state() -> ProtocolState {
             }
         },
         Err(_) => {
-            // Fresh install: disable SMART by default on VMs since smartd
-            // cannot find SMART-capable drives in virtual environments.
+            // Fresh install: disable SMART by default on VMs because virtual
+            // disks usually do not expose it. Operators with passed-through
+            // disks or controllers can explicitly enable monitoring.
             // Persist immediately — this function is called on every
             // protocol-status refresh, so without persistence the file
             // never appears, and the VM detection (plus its info!) runs

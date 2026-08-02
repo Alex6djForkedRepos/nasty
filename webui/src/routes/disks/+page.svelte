@@ -344,8 +344,8 @@
 	<!-- SMART Health tab -->
 	{:else if activeTab === 'smart'}
 		{#if isVirtual}
-			<p class="text-sm text-muted-foreground">SMART monitoring is not available on virtual machines.</p>
-		{:else}
+			<p class="mb-4 text-sm text-muted-foreground">Virtual disks usually do not expose SMART data. Monitoring can still work for disks or controllers passed through from the host.</p>
+		{/if}
 		<div class="mb-4 flex items-center gap-4">
 			{#if smartProtocol}
 				<Badge variant={smartProtocol.enabled ? 'default' : 'secondary'}>
@@ -726,7 +726,6 @@
 				</Card>
 			{/each}
 		{/if}
-		{/if}
 
 	<!-- Topology tab -->
 	{:else if activeTab === 'topology'}
@@ -825,7 +824,7 @@
 						{/each}
 					</tbody>
 				</table>
-				{#if !smartProtocol?.enabled && !isVirtual}
+				{#if !smartProtocol?.enabled}
 					<p class="mt-3 text-xs text-muted-foreground">Enable SMART monitoring for detailed topology with controller, model, serial, and health info.</p>
 				{/if}
 			{/if}
