@@ -627,6 +627,8 @@ export interface Subvolume {
 	parent: string | null;
 	direct_io: boolean;
 	bcachefs_options?: Record<string, string>;
+	bcachefs_overrides?: Record<string, string>;
+	bcachefs_inherited_options?: Record<string, string>;
 }
 
 export interface Snapshot {

@@ -7,6 +7,7 @@
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
+	import { readSubvolumeCompressionPolicy, readSubvolumeStoragePolicy, storagePolicyUpdate, type ErasureCodeSetting } from '$lib/subvolume-storage-policy';
 	import type { Filesystem, Subvolume, SubvolumeDependents, Snapshot, SubvolumeType, NfsShare, SmbShare, IscsiTarget, NvmeofSubsystem, App, AppsStatus, VmStatus } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
@@ -193,11 +194,15 @@
 	// Inline editing
 	let editingField = $state<'compression' | 'comments' | null>(null);
 	let editValue = $state('');
+	let storagePolicySv = $state<Subvolume | null>(null);
+	let editDataReplicas = $state('');
+	let editErasureCode = $state<ErasureCodeSetting>('inherit');
+	let originalStoragePolicy = $state<ReturnType<typeof readSubvolumeStoragePolicy> | null>(null);
 
 	function startEdit(field: 'compression' | 'comments') {
 		editingField = field;
 		editValue = field === 'compression'
-			? (detailSv?.compression ?? '')
+			? (detailSv ? compressionPolicyFor(detailSv).compression : '')
 			: (detailSv?.comments ?? '');
 	}
 
@@ -208,7 +213,7 @@
 			filesystem: target.filesystem,
 			name: target.name,
 		};
-		params[editingField] = editValue;
+		params[editingField] = editingField === 'compression' && editValue === '' ? 'inherit' : editValue;
 		const ok = await withToast(
 			() => client.call('subvolume.update', params),
 			`${editingField === 'compression' ? 'Compression' : 'Comments'} updated`
@@ -223,6 +228,74 @@
 
 	function cancelEdit() {
 		editingField = null;
+	}
+
+	function filesystemOptionsFor(sv: Subvolume | null) {
+		return sv ? filesystems.find(fs => fs.name === sv.filesystem)?.options : undefined;
+	}
+
+	function storagePolicyFor(sv: Subvolume) {
+		return readSubvolumeStoragePolicy(
+			sv.bcachefs_options,
+			sv.bcachefs_overrides,
+			sv.bcachefs_inherited_options,
+			filesystemOptionsFor(sv),
+		);
+	}
+
+	function compressionPolicyFor(sv: Subvolume) {
+		return readSubvolumeCompressionPolicy(
+			sv.bcachefs_options,
+			sv.bcachefs_overrides,
+			sv.bcachefs_inherited_options,
+			filesystemOptionsFor(sv),
+		);
+	}
+
+	function openStoragePolicy(sv: Subvolume) {
+		const policy = storagePolicyFor(sv);
+		storagePolicySv = sv;
+		originalStoragePolicy = policy;
+		editDataReplicas = policy.dataReplicas;
+		editErasureCode = policy.erasureCode;
+	}
+
+	const editedEffectiveDataReplicas = $derived.by(() => {
+		if (editDataReplicas) return Number.parseInt(editDataReplicas, 10);
+		return storagePolicySv ? storagePolicyFor(storagePolicySv).configuredInheritedDataReplicas : 1;
+	});
+	const editedErasureCodeEnabled = $derived.by(() => {
+		if (editErasureCode === 'enabled') return true;
+		if (editErasureCode === 'disabled') return false;
+		return storagePolicySv ? storagePolicyFor(storagePolicySv).configuredInheritedErasureCode : false;
+	});
+	const invalidErasureCodePolicy = $derived(
+		editedErasureCodeEnabled && (editedEffectiveDataReplicas < 2 || editedEffectiveDataReplicas > 3)
+	);
+
+	async function saveStoragePolicy() {
+		if (!storagePolicySv) return;
+		const target = storagePolicySv;
+		const update = storagePolicyUpdate(editDataReplicas, editErasureCode, originalStoragePolicy ?? undefined);
+		if (Object.keys(update).length === 0) {
+			storagePolicySv = null;
+			return;
+		}
+		if (invalidErasureCodePolicy) return;
+		const ok = await withToast(
+			() => client.call('subvolume.update', {
+				filesystem: target.filesystem,
+				name: target.name,
+				...update,
+			}),
+			'Storage policy updated'
+		);
+		if (ok !== undefined) {
+			storagePolicySv = null;
+			await refresh();
+			const updated = subvolumes.find(sv => sv.filesystem === target.filesystem && sv.name === target.name);
+			if (updated) detailSv = updated;
+		}
 	}
 
 	// Consumers linked to the detail subvolume
@@ -978,7 +1051,8 @@
 			<div class="mb-4">
 				<Label for="sv-compression">Compression</Label>
 				<select id="sv-compression" bind:value={newCompression} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-					<option value="">None</option>
+					<option value="">{inheritLabel(fsDefaults()?.compression)}</option>
+					<option value="none">None</option>
 					<option value="lz4">LZ4</option>
 					<option value="zstd">Zstd</option>
 					<option value="gzip">Gzip</option>
@@ -1297,6 +1371,8 @@
 								</div>
 
 								{#if detailTab === 'info'}
+									{@const storagePolicy = storagePolicyFor(detailSv)}
+									{@const compressionPolicy = compressionPolicyFor(detailSv)}
 									<div class="grid grid-cols-[auto_1fr_auto_1fr] gap-x-6 gap-y-1.5 text-sm">
 										<span class="text-muted-foreground">Type</span>
 										<span>
@@ -1310,24 +1386,35 @@
 
 										<span class="text-muted-foreground">Compression</span>
 										<span>
-											{#if editingField === 'compression'}
-												<span class="flex items-center gap-1">
-													<select bind:value={editValue} class="h-7 rounded-md border border-input bg-transparent px-2 text-xs">
-														<option value="">None</option>
-														<option value="lz4">LZ4</option>
+										{#if editingField === 'compression'}
+											<span class="flex items-center gap-1">
+												<select bind:value={editValue} class="h-7 rounded-md border border-input bg-transparent px-2 text-xs">
+													<option value="">Inherit ({compressionPolicy.inheritedCompression})</option>
+													<option value="none">None</option>
+													<option value="lz4">LZ4</option>
 														<option value="zstd">Zstd</option>
 														<option value="gzip">Gzip</option>
 													</select>
 													<button onclick={saveEdit} class="p-0.5 text-green-400 hover:text-green-300"><Check class="h-3.5 w-3.5" /></button>
 													<button onclick={cancelEdit} class="p-0.5 text-muted-foreground hover:text-foreground"><X class="h-3.5 w-3.5" /></button>
-												</span>
-											{:else}
-												<button class="group flex items-center gap-1 hover:text-blue-400 transition-colors" onclick={() => startEdit('compression')}>
-													{detailSv.compression ?? 'None'}
-													<Pencil class="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
+											</span>
+										{:else}
+											<button class="group flex items-center gap-1 hover:text-blue-400 transition-colors" onclick={() => startEdit('compression')}>
+												{compressionPolicy.effectiveCompression} {compressionPolicy.inherited ? '(inherited)' : '(override)'}
+												<Pencil class="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
 												</button>
 											{/if}
 										</span>
+										<span class="text-muted-foreground">Data Replicas</span>
+										<button class="group flex items-center gap-1 text-left hover:text-blue-400 transition-colors" onclick={() => openStoragePolicy(detailSv!)}>
+											{storagePolicy.effectiveDataReplicas} {storagePolicy.dataReplicasInherited ? '(inherited)' : '(override)'}
+											<Pencil class="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
+										</button>
+										<span class="text-muted-foreground">Erasure Coding</span>
+										<button class="group flex items-center gap-1 text-left hover:text-blue-400 transition-colors" onclick={() => openStoragePolicy(detailSv!)}>
+											{storagePolicy.effectiveErasureCode ? 'Enabled' : 'Disabled'} {storagePolicy.erasureCodeInherited ? '(inherited)' : '(override)'}
+											<Pencil class="h-3 w-3 opacity-0 group-hover:opacity-100 transition-opacity" />
+										</button>
 										<span class="text-muted-foreground">{detailSv.subvolume_type === 'block' ? 'Size' : 'Quota'}</span>
 										<span>
 											{#if showResize}
@@ -1655,6 +1742,43 @@
 		<Dialog.Footer>
 			<Button size="sm" onclick={createSnapshot}>Create</Button>
 			<Button variant="secondary" size="sm" onclick={() => showSnap = null}>Cancel</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
+
+<Dialog.Root open={storagePolicySv !== null} onOpenChange={(open) => { if (!open) storagePolicySv = null; }}>
+	<Dialog.Content>
+		<Dialog.Header>
+			<Dialog.Title>Storage policy for "{storagePolicySv?.name ?? ''}"</Dialog.Title>
+		</Dialog.Header>
+		<div class="space-y-4 py-2">
+			<div>
+				<Label for="edit-data-replicas">Data Replicas</Label>
+				<select id="edit-data-replicas" bind:value={editDataReplicas} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
+					<option value="">Inherit ({storagePolicySv ? storagePolicyFor(storagePolicySv).configuredInheritedDataReplicas : 1})</option>
+					<option value="1">1</option>
+					<option value="2">2</option>
+					<option value="3">3</option>
+					<option value="4">4</option>
+				</select>
+				<p class="mt-1 text-xs text-muted-foreground">Data redundancy level for this subvolume. Erasure coding supports levels 2 and 3.</p>
+			</div>
+			<div>
+				<Label for="edit-erasure-code">Erasure Coding</Label>
+				<select id="edit-erasure-code" bind:value={editErasureCode} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
+					<option value="inherit">Inherit ({storagePolicySv && storagePolicyFor(storagePolicySv).configuredInheritedErasureCode ? 'enabled' : 'disabled'})</option>
+					<option value="enabled">Enabled</option>
+					<option value="disabled">Disabled</option>
+				</select>
+				<p class="mt-1 text-xs text-muted-foreground">Existing data is reconciled in the background after the policy changes.</p>
+			</div>
+			{#if invalidErasureCodePolicy}
+				<p class="text-sm text-amber-500">Erasure coding requires 2 or 3 data replicas.</p>
+			{/if}
+		</div>
+		<Dialog.Footer>
+			<Button variant="secondary" onclick={() => storagePolicySv = null}>Cancel</Button>
+			<Button onclick={saveStoragePolicy} disabled={invalidErasureCodePolicy}>Save Policy</Button>
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>

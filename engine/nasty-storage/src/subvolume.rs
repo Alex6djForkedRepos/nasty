@@ -92,6 +92,8 @@ pub enum SubvolumeError {
     InvalidName(String),
     #[error("invalid volsize: {0}")]
     InvalidVolsize(String),
+    #[error("invalid storage policy: {0}")]
+    InvalidStoragePolicy(String),
     #[error("cannot shrink subvolume from {current} to {requested} bytes")]
     ShrinkNotSupported { current: u64, requested: u64 },
     #[error("could not delete child subvolume(s): {0}")]
@@ -455,10 +457,15 @@ pub struct Subvolume {
     /// Whether O_DIRECT is enabled on the loop device (block subvolumes only).
     #[serde(default)]
     pub direct_io: bool,
-    /// Effective bcachefs options set on this subvolume (from bcachefs_effective.* xattrs).
-    /// Only includes options that differ from the filesystem default.
+    /// Effective bcachefs inode options (from bcachefs_effective.* xattrs).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub bcachefs_options: HashMap<String, String>,
+    /// Explicit bcachefs options set on this subvolume (from bcachefs.* xattrs).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub bcachefs_overrides: HashMap<String, String>,
+    /// Effective bcachefs options inherited from the parent directory.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub bcachefs_inherited_options: HashMap<String, String>,
     /// True only when this response came from the create operation that
     /// successfully created the underlying bcachefs subvolume.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -507,12 +514,15 @@ struct SubvolumeAttrs {
     properties: HashMap<String, String>,
     /// Effective bcachefs options (from bcachefs_effective.* xattrs).
     bcachefs_options: HashMap<String, String>,
+    /// Explicit bcachefs overrides (from bcachefs.* xattrs).
+    bcachefs_overrides: HashMap<String, String>,
 }
 
 /// Read all xattrs from a subvolume in one pass.
 /// Splits results into internal metadata (`user.nasty.*`) and user-visible properties
 /// (`user.nasty-csi:*` etc), avoiding duplicate enumeration.
 const BCACHEFS_EFFECTIVE_NS: &str = "bcachefs_effective.";
+const BCACHEFS_NS: &str = "bcachefs.";
 
 fn read_string_xattr(path: &Path, key: &str) -> Option<String> {
     xattr::get(path, key)
@@ -525,6 +535,7 @@ fn read_all_xattrs(path: &Path) -> SubvolumeAttrs {
     let mut meta_raw: HashMap<String, String> = HashMap::new();
     let mut properties: HashMap<String, String> = HashMap::new();
     let mut bcachefs_options: HashMap<String, String> = HashMap::new();
+    let mut bcachefs_overrides: HashMap<String, String> = HashMap::new();
 
     if let Ok(attrs) = xattr::list(path) {
         for name in attrs {
@@ -539,6 +550,8 @@ fn read_all_xattrs(path: &Path) -> SubvolumeAttrs {
             if let Some(key) = name_str.strip_prefix(BCACHEFS_EFFECTIVE_NS) {
                 // bcachefs effective options (bcachefs_effective.*)
                 bcachefs_options.insert(key.to_string(), value);
+            } else if let Some(key) = name_str.strip_prefix(BCACHEFS_NS) {
+                bcachefs_overrides.insert(key.to_string(), value);
             } else if let Some(key) = name_str.strip_prefix(XATTR_NS) {
                 if key.starts_with(NASTY_KEY_PREFIX) {
                     meta_raw.insert(key.to_string(), value);
@@ -584,6 +597,7 @@ fn read_all_xattrs(path: &Path) -> SubvolumeAttrs {
         },
         properties,
         bcachefs_options,
+        bcachefs_overrides,
     }
 }
 
@@ -800,7 +814,7 @@ pub struct UpdateSubvolumeRequest {
     pub filesystem: String,
     /// Name of the subvolume to update.
     pub name: String,
-    /// New compression algorithm (e.g. `lz4`, `zstd`, `none`). `none` clears compression.
+    /// New compression algorithm (e.g. `lz4`, `zstd`, `none`). Use `inherit` to remove the override.
     pub compression: Option<String>,
     /// New description for the subvolume. Empty string clears the comment.
     pub comments: Option<String>,
@@ -812,8 +826,92 @@ pub struct UpdateSubvolumeRequest {
     pub promote_target: Option<String>,
     /// Device or label for metadata/btree writes. Use `-` to remove.
     pub metadata_target: Option<String>,
-    /// Number of data replicas. Use `0` to reset to filesystem default.
+    /// Number of data replicas. Use `0` to inherit from the parent directory.
     pub data_replicas: Option<u32>,
+    /// Erasure-coding policy for this subvolume.
+    pub erasure_code: Option<SubvolumeErasureCode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubvolumeErasureCode {
+    /// Remove the subvolume override and inherit from the parent directory.
+    Inherit,
+    /// Enable erasure coding for data in this subvolume.
+    Enabled,
+    /// Disable erasure coding for data in this subvolume.
+    Disabled,
+}
+
+impl SubvolumeErasureCode {
+    fn file_option(self) -> &'static str {
+        match self {
+            Self::Inherit => "--erasure_code=-",
+            Self::Enabled => "--erasure_code=1",
+            Self::Disabled => "--erasure_code=0",
+        }
+    }
+}
+
+fn option_enabled(value: Option<&String>) -> bool {
+    value.is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn option_replicas(options: &HashMap<String, String>) -> u32 {
+    options
+        .get("data_replicas")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+}
+
+fn option_replicas_or(
+    options: &HashMap<String, String>,
+    fallback: &HashMap<String, String>,
+) -> u32 {
+    options
+        .get("data_replicas")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| option_replicas(fallback))
+}
+
+fn option_enabled_or(
+    options: &HashMap<String, String>,
+    fallback: &HashMap<String, String>,
+) -> bool {
+    options
+        .get("erasure_code")
+        .map(|value| option_enabled(Some(value)))
+        .unwrap_or_else(|| option_enabled(fallback.get("erasure_code")))
+}
+
+fn add_storage_defaults(
+    options: &mut HashMap<String, String>,
+    data_replicas: u32,
+    erasure_code: bool,
+) {
+    options
+        .entry("data_replicas".to_string())
+        .or_insert_with(|| data_replicas.to_string());
+    options
+        .entry("erasure_code".to_string())
+        .or_insert_with(|| if erasure_code { "1" } else { "0" }.to_string());
+}
+
+fn validate_storage_policy(data_replicas: u32, erasure_code: bool) -> Result<(), SubvolumeError> {
+    if erasure_code && !(2..=3).contains(&data_replicas) {
+        return Err(SubvolumeError::InvalidStoragePolicy(format!(
+            "erasure coding requires 2 or 3 data replicas (got {data_replicas})"
+        )));
+    }
+    Ok(())
+}
+
+fn compression_file_option(value: &str) -> (&str, bool) {
+    match value {
+        "inherit" | "-" => ("-", true),
+        "none" | "" => ("none", true),
+        value => (value, false),
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1126,6 +1224,8 @@ impl SubvolumeService {
             .get(fs_name)
             .await
             .map_err(|_| SubvolumeError::FilesystemNotFound(fs_name.to_string()))?;
+        let filesystem_data_replicas = fs.options.data_replicas.unwrap_or(1);
+        let filesystem_erasure_code = fs.options.erasure_code.unwrap_or(false);
         let filesystem_uuid = fs.uuid;
         let mount_point = fs
             .mount_point
@@ -1156,6 +1256,16 @@ impl SubvolumeService {
 
             // Single-pass xattr read: meta + properties in one list+get sweep
             let attrs = read_all_xattrs(path);
+            let mut bcachefs_inherited_options = path
+                .parent()
+                .map(read_all_xattrs)
+                .map(|attrs| attrs.bcachefs_options)
+                .unwrap_or_default();
+            add_storage_defaults(
+                &mut bcachefs_inherited_options,
+                filesystem_data_replicas,
+                filesystem_erasure_code,
+            );
 
             // Apply owner filter: operators only see their own subvolumes
             if let Some(filter) = owner_filter
@@ -1253,6 +1363,8 @@ impl SubvolumeService {
                 parent,
                 direct_io: attrs.meta.direct_io,
                 bcachefs_options: attrs.bcachefs_options,
+                bcachefs_overrides: attrs.bcachefs_overrides,
+                bcachefs_inherited_options,
                 created: false,
             });
         }
@@ -1909,15 +2021,33 @@ impl SubvolumeService {
         req: UpdateSubvolumeRequest,
         owner_filter: Option<&str>,
     ) -> Result<Subvolume, SubvolumeError> {
+        let _destination_guard = self.lock_destination(&req.filesystem, &req.name).await;
         let subvol = self.get(&req.filesystem, &req.name, owner_filter).await?;
         let path = &subvol.path;
 
-        if let Some(ref comp) = req.compression {
-            let comp_value = if comp == "none" || comp.is_empty() {
-                "none"
-            } else {
-                comp.as_str()
+        if req.data_replicas.is_some() || req.erasure_code.is_some() {
+            let data_replicas = match req.data_replicas {
+                Some(0) => option_replicas(&subvol.bcachefs_inherited_options),
+                Some(replicas) => replicas,
+                None => {
+                    option_replicas_or(&subvol.bcachefs_options, &subvol.bcachefs_inherited_options)
+                }
             };
+            let erasure_code = match req.erasure_code {
+                Some(SubvolumeErasureCode::Inherit) => {
+                    option_enabled(subvol.bcachefs_inherited_options.get("erasure_code"))
+                }
+                Some(SubvolumeErasureCode::Enabled) => true,
+                Some(SubvolumeErasureCode::Disabled) => false,
+                None => {
+                    option_enabled_or(&subvol.bcachefs_options, &subvol.bcachefs_inherited_options)
+                }
+            };
+            validate_storage_policy(data_replicas, erasure_code)?;
+        }
+
+        if let Some(ref comp) = req.compression {
+            let (comp_value, clear_metadata) = compression_file_option(comp);
             info!(
                 "Setting compression={} on subvolume '{}'",
                 comp_value, req.name
@@ -1933,7 +2063,7 @@ impl SubvolumeService {
             .await
             .map_err(SubvolumeError::CommandFailed)?;
 
-            if comp_value == "none" {
+            if clear_metadata {
                 let _ = xattr::remove(path, XATTR_NASTY_COMPRESSION);
             } else {
                 xattr::set(path, XATTR_NASTY_COMPRESSION, comp_value.as_bytes()).map_err(|e| {
@@ -1969,7 +2099,13 @@ impl SubvolumeService {
             }
         }
 
-        // Update data replicas if specified (use 0 to reset to filesystem default)
+        let previous_data_replicas = subvol
+            .bcachefs_overrides
+            .get("data_replicas")
+            .map(|replicas| format!("--data_replicas={replicas}"))
+            .unwrap_or_else(|| "--data_replicas=-".to_string());
+
+        // Update data replicas if specified (use 0 to inherit from the parent)
         if let Some(replicas) = req.data_replicas {
             info!(
                 "Setting data_replicas={} on subvolume '{}'",
@@ -1983,6 +2119,32 @@ impl SubvolumeService {
             cmd::run_ok("bcachefs", &["set-file-option", &flag, path])
                 .await
                 .map_err(SubvolumeError::CommandFailed)?;
+        }
+
+        if let Some(erasure_code) = req.erasure_code {
+            info!(
+                "Setting erasure_code={:?} on subvolume '{}'",
+                erasure_code, req.name
+            );
+            if let Err(error) = cmd::run_ok(
+                "bcachefs",
+                &["set-file-option", erasure_code.file_option(), path],
+            )
+            .await
+            {
+                if req.data_replicas.is_some()
+                    && let Err(rollback_error) = cmd::run_ok(
+                        "bcachefs",
+                        &["set-file-option", &previous_data_replicas, path],
+                    )
+                    .await
+                {
+                    return Err(SubvolumeError::CommandFailed(format!(
+                        "{error}; restoring data replicas also failed: {rollback_error}"
+                    )));
+                }
+                return Err(SubvolumeError::CommandFailed(error));
+            }
         }
 
         self.get(&req.filesystem, &req.name, owner_filter).await
@@ -3611,6 +3773,62 @@ mod tests {
             "block_filesystem": "btrfs",
         }));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_request_accepts_subvolume_erasure_code_policies() {
+        for (value, expected, option) in [
+            ("inherit", SubvolumeErasureCode::Inherit, "--erasure_code=-"),
+            ("enabled", SubvolumeErasureCode::Enabled, "--erasure_code=1"),
+            (
+                "disabled",
+                SubvolumeErasureCode::Disabled,
+                "--erasure_code=0",
+            ),
+        ] {
+            let request: UpdateSubvolumeRequest = serde_json::from_value(serde_json::json!({
+                "filesystem": "tank",
+                "name": "documents",
+                "erasure_code": value,
+            }))
+            .unwrap();
+            let policy = request.erasure_code.unwrap();
+            assert_eq!(policy, expected);
+            assert_eq!(policy.file_option(), option);
+        }
+    }
+
+    #[test]
+    fn erasure_coding_requires_supported_replica_counts() {
+        assert!(validate_storage_policy(2, true).is_ok());
+        assert!(validate_storage_policy(3, true).is_ok());
+        assert!(validate_storage_policy(1, false).is_ok());
+        assert!(validate_storage_policy(4, false).is_ok());
+        assert!(matches!(
+            validate_storage_policy(1, true),
+            Err(SubvolumeError::InvalidStoragePolicy(_))
+        ));
+        assert!(matches!(
+            validate_storage_policy(4, true),
+            Err(SubvolumeError::InvalidStoragePolicy(_))
+        ));
+    }
+
+    #[test]
+    fn storage_defaults_only_fill_missing_inherited_options() {
+        let mut options = HashMap::from([("data_replicas".to_string(), "3".to_string())]);
+        add_storage_defaults(&mut options, 2, true);
+        assert_eq!(options.get("data_replicas").map(String::as_str), Some("3"));
+        assert_eq!(options.get("erasure_code").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn compression_policy_distinguishes_none_from_inheritance() {
+        assert_eq!(compression_file_option("inherit"), ("-", true));
+        assert_eq!(compression_file_option("-"), ("-", true));
+        assert_eq!(compression_file_option("none"), ("none", true));
+        assert_eq!(compression_file_option(""), ("none", true));
+        assert_eq!(compression_file_option("zstd"), ("zstd", false));
     }
 
     #[tokio::test]
