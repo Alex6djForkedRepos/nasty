@@ -1281,7 +1281,13 @@ pub(crate) async fn evaluate_active_alerts(
                 // An operator-disabled reconcile is expected to sit on
                 // pending work indefinitely — never a stall (#487).
                 Ok(s) if s.enabled => {
-                    reconcile_stall_check(&fs.name, &alerts::parse_reconcile_sample(&s.raw))
+                    let sample = alerts::parse_reconcile_sample(&s.raw);
+                    let progress = if sample.pending.is_some() && !sample.active {
+                        read_reconcile_progress(&fs.uuid).await
+                    } else {
+                        ReconcileProgressSample::Unavailable
+                    };
+                    reconcile_stall_check(&fs.name, &sample, progress)
                 }
                 Ok(_) | Err(_) => {
                     clear_reconcile_tracker(&fs.name);
@@ -1386,37 +1392,160 @@ pub(crate) async fn evaluate_active_alerts(
     active
 }
 
-/// How long reconcile must sit on *unchanged* pending counters, in a
-/// non-active state, before it counts as stalled (#487). Generous on
-/// purpose: bcachefs paces background work in throttled bursts with
-/// long `waiting` gaps, and a heavily-loaded pool can legitimately go
-/// many minutes without the counters moving.
+/// How long reconcile must have pending work with no pending-counter or
+/// `moving_ctxts` progress before it counts as stalled (#487, #735). Generous
+/// on purpose: bcachefs paces background work in throttled bursts with long
+/// `waiting` gaps, and a heavily-loaded pool can legitimately go many minutes
+/// without the counters moving.
 const RECONCILE_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const RECONCILE_PROGRESS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Per-filesystem fingerprint of the last reconcile pending counters +
-/// when that fingerprint was first seen. Process-lifetime state for
-/// the stall detector; an engine restart just restarts the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReconcileProgress {
+    keys_moved: u64,
+    bytes_seen: u64,
+    bytes_moved: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileProgressSample {
+    Available(Option<ReconcileProgress>),
+    Unavailable,
+}
+
+#[derive(Debug)]
+struct ReconcileTrackerEntry {
+    pending: String,
+    progress: ReconcileProgressSample,
+    unchanged_since: std::time::Instant,
+}
+
+/// Per-filesystem pending and real movement counters, plus when both were
+/// last observed to change. Process-lifetime state for the stall detector;
+/// an engine restart just restarts the window.
 static RECONCILE_STALL_TRACKER: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    std::sync::Mutex<std::collections::HashMap<String, ReconcileTrackerEntry>>,
+> = std::sync::LazyLock::new(Default::default);
+static RECONCILE_PROGRESS_READS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Stall decision for one reconcile sample (#487): pending work exists,
-/// the thread isn't actively progressing, and the pending counters
-/// haven't changed for [`RECONCILE_STALL_WINDOW`]. Anything else —
-/// no pending work, an active state, or counters that moved — resets
-/// the window.
-fn reconcile_stall_check(fs_name: &str, sample: &nasty_system::alerts::ReconcileSample) -> bool {
+struct ReconcileProgressReadGuard {
+    uuid: String,
+}
+
+impl ReconcileProgressReadGuard {
+    fn acquire(uuid: &str) -> Option<Self> {
+        let mut reads = RECONCILE_PROGRESS_READS.lock().unwrap();
+        reads.insert(uuid.to_string()).then(|| Self {
+            uuid: uuid.to_string(),
+        })
+    }
+}
+
+impl Drop for ReconcileProgressReadGuard {
+    fn drop(&mut self) {
+        RECONCILE_PROGRESS_READS.lock().unwrap().remove(&self.uuid);
+    }
+}
+
+fn reconcile_progress(
+    contexts: &[nasty_storage::filesystem::MoveCtx],
+) -> Option<ReconcileProgress> {
+    let mut progress = None;
+    for context in contexts
+        .iter()
+        .filter(|context| context.kind == "reconcile")
+    {
+        let aggregate = progress.get_or_insert(ReconcileProgress {
+            keys_moved: 0,
+            bytes_seen: 0,
+            bytes_moved: 0,
+        });
+        aggregate.keys_moved = aggregate.keys_moved.saturating_add(context.keys_moved);
+        aggregate.bytes_seen = aggregate.bytes_seen.saturating_add(context.bytes_seen);
+        aggregate.bytes_moved = aggregate.bytes_moved.saturating_add(context.bytes_moved);
+    }
+    progress
+}
+
+async fn read_reconcile_progress(uuid: &str) -> ReconcileProgressSample {
+    let Some(guard) = ReconcileProgressReadGuard::acquire(uuid) else {
+        return ReconcileProgressSample::Unavailable;
+    };
+    let path = format!("/sys/fs/bcachefs/{uuid}/internal/moving_ctxts");
+    let read = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        std::fs::read_to_string(path)
+    });
+    match tokio::time::timeout(RECONCILE_PROGRESS_READ_TIMEOUT, read).await {
+        Ok(Ok(Ok(raw))) => ReconcileProgressSample::Available(reconcile_progress(
+            &nasty_storage::filesystem::parse_moving_ctxts(&raw),
+        )),
+        // Older kernels without moving_ctxts retain the legacy pending-only
+        // detector. Other failures are unknown rather than proof of no progress.
+        Ok(Ok(Err(error))) if error.kind() == std::io::ErrorKind::NotFound => {
+            ReconcileProgressSample::Available(None)
+        }
+        Ok(Ok(Err(_))) | Ok(Err(_)) | Err(_) => ReconcileProgressSample::Unavailable,
+    }
+}
+
+/// Stall decision for one reconcile sample (#487, #735): pending work exists,
+/// the thread isn't actively progressing, and neither the pending counters nor
+/// `internal/moving_ctxts` progress has changed for the full window.
+fn reconcile_stall_check(
+    fs_name: &str,
+    sample: &nasty_system::alerts::ReconcileSample,
+    progress: ReconcileProgressSample,
+) -> bool {
+    reconcile_stall_check_at(
+        fs_name,
+        sample,
+        progress,
+        std::time::Instant::now(),
+        RECONCILE_STALL_WINDOW,
+    )
+}
+
+fn reconcile_stall_check_at(
+    fs_name: &str,
+    sample: &nasty_system::alerts::ReconcileSample,
+    progress: ReconcileProgressSample,
+    now: std::time::Instant,
+    window: std::time::Duration,
+) -> bool {
     let mut tracker = RECONCILE_STALL_TRACKER.lock().unwrap();
     let Some(fingerprint) = sample.pending.as_ref().filter(|_| !sample.active) else {
         tracker.remove(fs_name);
         return false;
     };
-    match tracker.get(fs_name) {
-        Some((prev, since)) if prev == fingerprint => since.elapsed() >= RECONCILE_STALL_WINDOW,
-        _ => {
+    match tracker.get_mut(fs_name) {
+        Some(previous) if previous.pending != *fingerprint => {
+            previous.pending = fingerprint.clone();
+            previous.progress = progress;
+            previous.unchanged_since = now;
+            false
+        }
+        Some(previous) => match progress {
+            ReconcileProgressSample::Unavailable => false,
+            _ if previous.progress == progress => {
+                now.saturating_duration_since(previous.unchanged_since) >= window
+            }
+            _ => {
+                previous.progress = progress;
+                previous.unchanged_since = now;
+                false
+            }
+        },
+        None => {
             tracker.insert(
                 fs_name.to_string(),
-                (fingerprint.clone(), std::time::Instant::now()),
+                ReconcileTrackerEntry {
+                    pending: fingerprint.clone(),
+                    progress,
+                    unchanged_since: now,
+                },
             );
             false
         }
@@ -1444,7 +1573,181 @@ pub(super) async fn read_bcachefs_error_count(uuid: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_operator_allowed, is_read_only, is_universally_allowed, is_user_allowed};
+    use super::{
+        ReconcileProgress, ReconcileProgressSample, clear_reconcile_tracker, is_operator_allowed,
+        is_read_only, is_universally_allowed, is_user_allowed, reconcile_progress,
+        reconcile_stall_check_at,
+    };
+
+    #[test]
+    fn reconcile_progress_uses_only_reconcile_movement_counters() {
+        let contexts = nasty_storage::filesystem::parse_moving_ctxts(
+            "scrub: active\n  keys moved: 999\nreconcile_work: active\n  keys moved: 11\n  bytes seen: 2K\n  bytes moved: 1K\n",
+        );
+
+        assert_eq!(
+            reconcile_progress(&contexts),
+            Some(ReconcileProgress {
+                keys_moved: 11,
+                bytes_seen: 2 * 1024,
+                bytes_moved: 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_movement_resets_stall_window_when_pending_is_unchanged() {
+        let fs_name = "reconcile-movement-test";
+        clear_reconcile_tracker(fs_name);
+        let sample = nasty_system::alerts::ReconcileSample {
+            pending: Some("pending: 900 GiB".into()),
+            active: false,
+        };
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(30 * 60);
+        let initial = ReconcileProgressSample::Available(Some(ReconcileProgress {
+            keys_moved: 10,
+            bytes_seen: 1_000,
+            bytes_moved: 500,
+        }));
+
+        assert!(!reconcile_stall_check_at(
+            fs_name, &sample, initial, start, window
+        ));
+        assert!(reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            initial,
+            start + window,
+            window,
+        ));
+
+        let advanced = ReconcileProgressSample::Available(Some(ReconcileProgress {
+            keys_moved: 11,
+            bytes_seen: 1_000,
+            bytes_moved: 500,
+        }));
+        assert!(!reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            advanced,
+            start + window,
+            window,
+        ));
+        assert!(reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            advanced,
+            start + window + window,
+            window,
+        ));
+        clear_reconcile_tracker(fs_name);
+    }
+
+    #[test]
+    fn unavailable_reconcile_progress_does_not_reset_or_fire_stall_timer() {
+        let fs_name = "reconcile-progress-unavailable-test";
+        clear_reconcile_tracker(fs_name);
+        let sample = nasty_system::alerts::ReconcileSample {
+            pending: Some("pending: 900 GiB".into()),
+            active: false,
+        };
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(30 * 60);
+        let progress = ReconcileProgressSample::Available(Some(ReconcileProgress {
+            keys_moved: 10,
+            bytes_seen: 1_000,
+            bytes_moved: 500,
+        }));
+
+        assert!(!reconcile_stall_check_at(
+            fs_name, &sample, progress, start, window
+        ));
+        assert!(!reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            ReconcileProgressSample::Unavailable,
+            start + window,
+            window,
+        ));
+        assert!(reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            progress,
+            start + window,
+            window,
+        ));
+        clear_reconcile_tracker(fs_name);
+    }
+
+    #[test]
+    fn pending_changes_reset_timer_while_reconcile_progress_is_unavailable() {
+        let fs_name = "reconcile-pending-change-unavailable-test";
+        clear_reconcile_tracker(fs_name);
+        let first = nasty_system::alerts::ReconcileSample {
+            pending: Some("pending: 900 GiB".into()),
+            active: false,
+        };
+        let second = nasty_system::alerts::ReconcileSample {
+            pending: Some("pending: 800 GiB".into()),
+            active: false,
+        };
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(30 * 60);
+        let progress = ReconcileProgressSample::Available(Some(ReconcileProgress {
+            keys_moved: 10,
+            bytes_seen: 1_000,
+            bytes_moved: 500,
+        }));
+
+        assert!(!reconcile_stall_check_at(
+            fs_name, &first, progress, start, window
+        ));
+        assert!(!reconcile_stall_check_at(
+            fs_name,
+            &second,
+            ReconcileProgressSample::Unavailable,
+            start + window,
+            window,
+        ));
+        assert!(!reconcile_stall_check_at(
+            fs_name,
+            &second,
+            progress,
+            start + window,
+            window,
+        ));
+        clear_reconcile_tracker(fs_name);
+    }
+
+    #[test]
+    fn missing_moving_ctxts_falls_back_to_pending_only_stall_detection() {
+        let fs_name = "reconcile-progress-unsupported-test";
+        clear_reconcile_tracker(fs_name);
+        let sample = nasty_system::alerts::ReconcileSample {
+            pending: Some("pending: 900 GiB".into()),
+            active: false,
+        };
+        let start = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(30 * 60);
+        let unsupported = ReconcileProgressSample::Available(None);
+
+        assert!(!reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            unsupported,
+            start,
+            window,
+        ));
+        assert!(reconcile_stall_check_at(
+            fs_name,
+            &sample,
+            unsupported,
+            start + window,
+            window,
+        ));
+        clear_reconcile_tracker(fs_name);
+    }
 
     #[test]
     fn standard_user_rpc_policy_is_explicit_and_deny_by_default() {

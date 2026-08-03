@@ -4767,6 +4767,8 @@ fn validate_compression(spec: &str) -> Result<(), String> {
 pub struct MoveCtx {
     /// Normalized kind: `scrub` | `reconcile` | `copygc` | `evacuate` | `other`.
     pub kind: String,
+    /// Keys the operation has relocated so far.
+    pub keys_moved: u64,
     /// Bytes the operation has scanned/considered so far.
     pub bytes_seen: u64,
     /// Bytes it has actually relocated so far.
@@ -4802,12 +4804,15 @@ pub fn parse_moving_ctxts(raw: &str) -> Vec<MoveCtx> {
             };
             cur = Some(MoveCtx {
                 kind: kind.to_string(),
+                keys_moved: 0,
                 bytes_seen: 0,
                 bytes_moved: 0,
             });
         } else if let Some(c) = cur.as_mut() {
             let t = line.trim();
-            if let Some(v) = t.strip_prefix("bytes seen:") {
+            if let Some(v) = t.strip_prefix("keys moved:") {
+                c.keys_moved = v.trim().parse().unwrap_or(0);
+            } else if let Some(v) = t.strip_prefix("bytes seen:") {
                 c.bytes_seen = parse_human_bytes(v.trim()).unwrap_or(0);
             } else if let Some(v) = t.strip_prefix("bytes moved:") {
                 c.bytes_moved = parse_human_bytes(v.trim()).unwrap_or(0);
@@ -7561,6 +7566,7 @@ scrub: data type==(unknown data_type 254) pos=extents:5764607:9038848:U32_MAX
         let ctxs = parse_moving_ctxts(raw);
         assert_eq!(ctxs.len(), 1);
         assert_eq!(ctxs[0].kind, "scrub");
+        assert_eq!(ctxs[0].keys_moved, 5886);
         assert_eq!(ctxs[0].bytes_seen, (1.44 * 1024.0 * 1024.0 * 1024.0) as u64);
         assert_eq!(
             ctxs[0].bytes_moved,
@@ -7579,6 +7585,7 @@ reconcile_work: data type==user pos=extents:POS_MIN
         let ctxs = parse_moving_ctxts(raw);
         assert_eq!(ctxs.len(), 1);
         assert_eq!(ctxs[0].kind, "reconcile");
+        assert_eq!(ctxs[0].keys_moved, 0);
         assert_eq!(ctxs[0].bytes_seen, 0);
         assert_eq!(ctxs[0].bytes_moved, 0);
     }
