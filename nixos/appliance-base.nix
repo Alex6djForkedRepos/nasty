@@ -159,7 +159,9 @@
     };
   };
 
-  # Enable SMART monitoring; skip silently on VMs (no SMART-capable devices)
+  # Define smartd, but let the engine own its lifecycle from protocols.json.
+  # Most VMs leave SMART disabled by default; VMs with passed-through disks or
+  # controllers can opt in and start the same service as physical appliances.
   services.smartd.enable = true;
   # smartd's default `-a` tracks attribute changes by *normalized* value, so
   # Temperature_Celsius (194) and Airflow_Temperature_Cel (190) hit the journal
@@ -174,7 +176,7 @@
   # which would *trigger* a journal line on every raw change, i.e. spam one
   # entry per 1 °C of drift.
   services.smartd.defaults.monitored = "-a -r 194 -r 190";
-  systemd.services.smartd.unitConfig.ConditionVirtualization = "no";
+  systemd.services.smartd.wantedBy = lib.mkForce [ ];
 
   # VM guest tools — QEMU/KVM half (always-on, effectively free).
   #

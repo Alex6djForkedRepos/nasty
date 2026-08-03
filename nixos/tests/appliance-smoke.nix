@@ -130,6 +130,11 @@ let
         # The test disk is still unformatted at this point.
         assert fs_list == [], f"fs.list expected empty, got {fs_list!r}"
 
+        smart = call(ws, "service.protocol.enable", 20, {"name": "smart"})
+        assert smart["enabled"] is True and smart["running"] is True, smart
+        smart = call(ws, "service.protocol.disable", 21, {"name": "smart"})
+        assert smart["enabled"] is False and smart["running"] is False, smart
+
         # Apps require their Docker data root on a managed bcachefs pool.
         # Create one through the public RPC so the later apps smoke exercises
         # the same supported setup path as a real appliance.
@@ -340,6 +345,14 @@ pkgs.testers.runNixOSTest {
     services.timesyncd.enable = lib.mkForce false;
     services.openssh.enable = true;
     services.avahi.enable = true;
+    services.smartd.enable = true;
+    systemd.services.smartd.wantedBy = lib.mkForce [ ];
+    # The VM's synthetic disk has no SMART support. Use a deterministic
+    # long-running stand-in so the test can exercise protocol lifecycle.
+    systemd.services.smartd.serviceConfig = {
+      Type = lib.mkForce "simple";
+      ExecStart = lib.mkForce "${pkgs.coreutils}/bin/sleep infinity";
+    };
 
     # The rpc-smoke script needs websocket-client at runtime in the guest.
     environment.systemPackages = [ pythonWithWs ];
@@ -367,11 +380,21 @@ pkgs.testers.runNixOSTest {
         f"baseline does not block DNAT forwarding: {baseline}"
     )
     assert "dport 443" not in baseline, f"baseline unexpectedly exposes WebUI: {baseline}"
+    machine.succeed("systemctl start smartd.service")
+    machine.wait_for_unit("smartd.service")
     machine.succeed(
         "systemctl start nasty-engine.service sshd.service avahi-daemon.service"
     )
     machine.wait_for_unit("nasty-engine.service")
     machine.wait_for_unit("sshd.service")
+
+    # SMART stays opt-in on ordinary VMs, but the unit must remain startable
+    # for guests with passed-through disks or controllers (#734).
+    machine.succeed("test ! -e /etc/systemd/system/multi-user.target.wants/smartd.service")
+    machine.fail("systemctl cat smartd.service | grep -q '^ConditionVirtualization='")
+    machine.fail("systemctl is-active --quiet smartd.service")
+    protocols = json.loads(machine.succeed("cat /var/lib/nasty/protocols.json"))
+    assert protocols["smart"] is False, protocols
     machine.wait_for_unit("avahi-daemon.service")
 
     dynamic_firewall = machine.succeed("nft list table inet nasty")
