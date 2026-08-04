@@ -438,7 +438,7 @@ async fn decompress_to_tmp(
     // stdin: the source file; stdout: the tmp file. Using -dc keeps
     // the original around so the user's upload isn't consumed.
     let tmp_file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
-    let mut child = Command::new(bin)
+    let mut child = nasty_common::priority::bulk_command(bin)
         .args(["-dc"])
         .arg(source)
         .stdout(std::process::Stdio::from(tmp_file))
@@ -683,7 +683,7 @@ async fn qemu_img_info(path: &Path) -> Result<ImageInfo, String> {
 /// by `\r` (in-place updates) — we read raw bytes and split on either
 /// `\r` or `\n` so each progress tick gets surfaced.
 async fn run_convert(socket: &mut WebSocket, input: &Path, output_dev: &str) -> Result<(), String> {
-    let mut child = Command::new("qemu-img")
+    let mut child = nasty_common::priority::bulk_command("qemu-img")
         .args(["convert", "-p", "-O", "raw"])
         .arg(input)
         .arg(output_dev)

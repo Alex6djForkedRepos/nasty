@@ -19,7 +19,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::domain::{run_cmd, run_cmd_stdin};
+use crate::domain::{run_cmd, run_cmd_bulk, run_cmd_stdin};
 
 pub const DC_CONF_PATH: &str = "/etc/samba/smb.dc.conf";
 pub const DC_STATE_PATH: &str = "/var/lib/nasty/dc.json";
@@ -682,7 +682,7 @@ impl DcService {
         let resolved = validate_backup_dest(Path::new(dest), Path::new(FS_ROOT))?;
         tokio::fs::create_dir_all(&resolved).await?;
         let target = resolved.to_string_lossy().to_string();
-        samba_tool(&with_conf(vec![
+        samba_tool_bulk(&with_conf(vec![
             "domain".into(),
             "backup".into(),
             "offline".into(),
@@ -826,6 +826,11 @@ impl DcService {
 async fn samba_tool(argv: &[String]) -> Result<String, DcError> {
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     Ok(run_cmd("samba-tool", &args, &[]).await?)
+}
+
+async fn samba_tool_bulk(argv: &[String]) -> Result<String, DcError> {
+    let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+    Ok(run_cmd_bulk("samba-tool", &args, &[]).await?)
 }
 
 /// Run samba-tool feeding `stdin_input` (the only way secrets travel).

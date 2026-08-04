@@ -987,7 +987,7 @@ impl VmService {
         // real error the operator sees — instead of "Started VM" for a guest
         // that never launched.
         let qemu_bin = format!("qemu-system-{}", std::env::consts::ARCH);
-        let output = Command::new(&qemu_bin)
+        let output = nasty_common::priority::bulk_command(&qemu_bin)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

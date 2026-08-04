@@ -412,6 +412,9 @@ impl SecureBootEnrollmentService {
                 "--collect",
                 "--no-block",
                 "--description=NASty Secure Boot enrollment rebuild",
+                "--property=Nice=10",
+                "--property=IOSchedulingClass=best-effort",
+                "--property=IOSchedulingPriority=7",
                 "/run/current-system/sw/bin/nasty-rebuild",
             ])
             .output()
@@ -525,7 +528,7 @@ async fn remove_overlay_file() -> Result<(), EnrollmentError> {
 /// `/etc/nixos/flake.lock`. Network-bound — fails when the box is
 /// offline; the caller surfaces the failure to the operator.
 async fn run_nix_flake_lock() -> Result<(), EnrollmentError> {
-    let out = Command::new("nix")
+    let out = nasty_common::priority::bulk_command("nix")
         .args([
             "--extra-experimental-features",
             "nix-command flakes",

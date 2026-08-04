@@ -344,6 +344,24 @@ pub(crate) async fn run_cmd(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run a long CPU/IO-heavy command below control-plane priority.
+pub(crate) async fn run_cmd_bulk(
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<String, DomainError> {
+    let output = nasty_common::priority::bulk_command(program)
+        .args(args)
+        .envs(envs.iter().copied())
+        .output()
+        .await
+        .map_err(|e| DomainError::CommandFailed(format!("failed to run {program}: {e}")))?;
+    if !output.status.success() {
+        return Err(command_error(program, &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// Run a command, writing `stdin_input` (plus a trailing newline) to its
 /// stdin — used to hand credentials to `net ads join`/`net ads leave`
 /// without ever putting the password in argv (visible via `/proc/*/cmdline`).

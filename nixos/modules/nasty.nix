@@ -808,6 +808,9 @@ in {
 
       (writeShellScriptBin "nasty-cleanup" ''
         set -euo pipefail
+        ${pkgs.coreutils}/bin/env -u POSIXLY_CORRECT \
+          ${pkgs.util-linux}/bin/renice -n 10 -p $$ >/dev/null
+        ${pkgs.util-linux}/bin/ionice -c2 -n7 -p $$
         echo "==> Removing old NixOS generations (keeping last 3)..."
         nix-env --delete-generations +3 -p /nix/var/nix/profiles/system 2>/dev/null || true
         echo "==> Running garbage collection..."
@@ -826,6 +829,12 @@ in {
       (writeShellScriptBin "nasty-rebuild" ''
         set -euo pipefail
 
+        # Absolute priorities keep direct and already-demoted transient-unit
+        # invocations at the same level instead of applying nice twice.
+        ${pkgs.coreutils}/bin/env -u POSIXLY_CORRECT \
+          ${pkgs.util-linux}/bin/renice -n 10 -p $$ >/dev/null
+        ${pkgs.util-linux}/bin/ionice -c2 -n7 -p $$
+
         # The WebUI terminal's PTY belongs to nasty-engine. Activation stops
         # the engine, so keeping switch-to-configuration attached to that PTY
         # makes its next stderr write fail and the Rust binary panic (exit 101).
@@ -843,6 +852,9 @@ in {
             --description "NASty manual rebuild" \
             --property StandardOutput=journal \
             --property StandardError=journal \
+            --property Nice=10 \
+            --property IOSchedulingClass=best-effort \
+            --property IOSchedulingPriority=7 \
             --setenv "PATH=$PATH" \
             -- /run/current-system/sw/bin/nasty-rebuild
           echo "==> Rebuild detached from the WebUI terminal. Follow it with:"
@@ -1003,6 +1015,13 @@ in {
           sed -i -E "s#^(\s*nasty\.url\s*=\s*\")github:nasty-project/nasty/[^\"]+(\")#\1github:nasty-project/nasty/$nasty_ref\2#" /etc/nixos/flake.nix
         fi
 
+        run_bulk() (
+          ${pkgs.coreutils}/bin/env -u POSIXLY_CORRECT \
+            ${pkgs.util-linux}/bin/renice -n 10 -p $BASHPID >/dev/null
+          ${pkgs.util-linux}/bin/ionice -c2 -n7 -p $BASHPID
+          exec "$@"
+        )
+
         # Run the actual rebuild work — either inline (from a real SSH
         # session) or detached as a systemd transient unit (from the
         # WebUI terminal, so the rebuild survives the engine restart
@@ -1033,11 +1052,14 @@ in {
               --collect \
               --no-block \
               --description "nasty-sync detached rebuild" \
+              --property Nice=10 \
+              --property IOSchedulingClass=best-effort \
+              --property IOSchedulingPriority=7 \
               --setenv "PATH=$PATH" \
               -- bash -c "$script"
             echo "==> Started. Detaching."
           else
-            bash -c "$script"
+            run_bulk bash -c "$script"
           fi
         }
 
@@ -1085,7 +1107,7 @@ in {
           update)
             echo "==> Bumping nasty input to current main HEAD..."
             cd /etc/nixos
-            nix flake update nasty
+            run_bulk nix flake update nasty
             run_rebuild "set -euo pipefail; cd /etc/nixos; echo '==> Rebuilding system...'; nixos-rebuild switch --flake /etc/nixos; systemctl is-active --quiet nasty-engine || systemctl start nasty-engine; echo '==> Done.'" "nasty-sync-rebuild"
             # Inline-path bookkeeping. Detached path can't update this
             # in real time; the engine startup hook will reconcile.
@@ -1099,7 +1121,7 @@ in {
           update-with-bcachefs)
             cd /etc/nixos
             echo "==> Bumping nasty input to current main HEAD..."
-            nix flake update nasty
+            run_bulk nix flake update nasty
             # If a positional <ref> was passed, use it. Otherwise pull
             # the bcachefs ref the new nasty HEAD declares — read it
             # directly out of the freshly-fetched nasty source in the
@@ -1135,7 +1157,7 @@ in {
               exit 1
             fi
             echo "==> Re-resolving lock for bcachefs-tools..."
-            nix flake lock
+            run_bulk nix flake lock
             run_rebuild "set -euo pipefail; cd /etc/nixos; echo '==> Rebuilding system...'; nixos-rebuild switch --flake /etc/nixos; systemctl is-active --quiet nasty-engine || systemctl start nasty-engine; echo '==> Done.'" "nasty-sync-rebuild"
             if [ -z "''${NASTY_WEBUI_TERMINAL:-}" ]; then
               stamp_nasty_version
@@ -1168,7 +1190,7 @@ in {
               exit 1
             fi
             echo "==> Bumping nasty input to current main HEAD..."
-            nix flake update nasty
+            run_bulk nix flake update nasty
             run_rebuild "set -euo pipefail; cd /etc/nixos; echo '==> Rebuilding system...'; nixos-rebuild switch --flake /etc/nixos; systemctl is-active --quiet nasty-engine || systemctl start nasty-engine; echo '==> Done.'" "nasty-sync-rebuild"
             if [ -z "''${NASTY_WEBUI_TERMINAL:-}" ]; then
               stamp_nasty_version
@@ -1740,6 +1762,11 @@ in {
         Restart = "always";
         RestartSec = 5;
         StateDirectory = "nasty";
+
+        # Keep authentication, RPC dispatch, and status polling responsive
+        # during CPU-saturating migrations. Reset-on-fork also resets pthreads,
+        # including Tokio workers, so known bulk work is demoted explicitly.
+        Nice = -5;
 
         # The engine is a privileged system manager and cannot run under a
         # private mount namespace — that would hide its mounts from

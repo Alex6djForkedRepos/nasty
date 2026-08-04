@@ -387,6 +387,14 @@ pkgs.testers.runNixOSTest {
     )
     machine.wait_for_unit("nasty-engine.service")
     machine.wait_for_unit("sshd.service")
+    machine.succeed("test \"$(systemctl show nasty-engine.service -p Nice --value)\" = -5")
+    machine.succeed(
+        "test \"$(systemctl show nasty-engine.service -p CPUSchedulingResetOnFork --value)\" = no"
+    )
+    machine.succeed(
+        "pid=$(systemctl show nasty-engine.service -p MainPID --value); "
+        "test \"$(ps -L -o ni= -p \"$pid\" | tr -d ' ' | grep -cx -- '-5')\" -gt 1"
+    )
 
     # SMART stays opt-in on ordinary VMs, but the unit must remain startable
     # for guests with passed-through disks or controllers (#734).

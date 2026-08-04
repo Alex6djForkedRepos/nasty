@@ -3784,7 +3784,7 @@ impl FilesystemService {
         }
         args.push(&req.device);
         args.push(mount_point);
-        cmd::run_ok("bcachefs", &args)
+        cmd::run_ok_bulk("bcachefs", &args)
             .await
             .map_err(FilesystemError::CommandFailed)?;
 
@@ -3835,7 +3835,7 @@ impl FilesystemService {
         // Spawn evacuation in background — this can take hours for large devices.
         // bcachefs sets the device state to "evacuating" automatically.
         tokio::spawn(async move {
-            match cmd::run_ok("bcachefs", &["device", "evacuate", &device]).await {
+            match cmd::run_ok_bulk("bcachefs", &["device", "evacuate", &device]).await {
                 Ok(_) => info!("Evacuation of {} in '{}' completed", device, fs_name),
                 Err(e) => warn!("Evacuation of {} in '{}' failed: {}", device, fs_name, e),
             }
@@ -6442,9 +6442,7 @@ async fn stream_scrub_and_collect(
     store: &ScrubStateMap,
 ) -> (ScrubOutcome, String) {
     use tokio::io::AsyncReadExt;
-    use tokio::process::Command;
-
-    let mut child = match Command::new("bcachefs")
+    let mut child = match nasty_common::priority::bulk_command("bcachefs")
         .args(["scrub", mount])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -6652,8 +6650,6 @@ async fn stream_fsck_and_collect(
     repair: bool,
 ) -> (FsckOutcome, String) {
     use tokio::io::AsyncReadExt;
-    use tokio::process::Command;
-
     // `-n` = dry run (report only, change nothing); `-y` = assume yes
     // (auto-repair). `-f` forces a full check even if the superblock
     // looks clean — without it bcachefs may skip a clean-marked fs.
@@ -6661,7 +6657,7 @@ async fn stream_fsck_and_collect(
     let mut args: Vec<&str> = vec!["fsck", mode, "-f"];
     args.extend(devices.iter().map(|d| d.as_str()));
 
-    let mut child = match Command::new("bcachefs")
+    let mut child = match nasty_common::priority::bulk_command("bcachefs")
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

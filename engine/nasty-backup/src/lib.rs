@@ -152,7 +152,7 @@ pub enum BackupTarget {
 /// file we materialize from `profile.trusted_cacert`). Ready to be
 /// combined with the target shape to build rustic-compatible backend
 /// options. Decryption + cacert file writes are async; target
-/// construction must run sync inside `spawn_blocking`, so we resolve
+/// construction must run synchronously on a bulk worker, so we resolve
 /// once outside and pass this struct in.
 #[derive(Debug, Default)]
 struct ResolvedTargetSecrets {
@@ -164,7 +164,7 @@ struct ResolvedTargetSecrets {
     rest_password: Option<String>,
     /// Absolute path of a PEM file containing the operator-supplied
     /// trusted CA cert (`profile.trusted_cacert`). Materialized by
-    /// [`BackupProfile::resolve_runtime`] before the spawn_blocking
+    /// [`BackupProfile::resolve_runtime`] before the bulk-worker
     /// boundary so the sync `to_backend_options` only needs to pass
     /// the path through to rustic_backend's `cacert` option.
     cacert_path: Option<String>,
@@ -587,7 +587,7 @@ impl BackupProfile {
     /// Resolve secrets AND materialize the runtime cacert file (if
     /// the profile has one). Single async entry point that the
     /// init/run/check/snapshots/prune paths call before the
-    /// `spawn_blocking` boundary.
+    /// bulk-worker boundary.
     async fn resolve_runtime(&self) -> Result<ResolvedTargetSecrets, BackupError> {
         let mut resolved = self.target.resolve_secrets(&self.id).await?;
         if let Some(pem) = self
@@ -811,7 +811,7 @@ fn invalidate_last_run_if_definition_changed(update: &mut BackupProfile, existin
 /// to have already resolved target-side secrets via
 /// `target.resolve_secrets(profile_id).await` and passed them in —
 /// rustic's Repository construction is sync, so the decryption has to
-/// happen outside this function before `spawn_blocking`.
+/// happen outside this function before entering the bulk worker.
 fn make_repo(
     profile: &BackupProfile,
     resolved: &ResolvedTargetSecrets,
@@ -1215,7 +1215,7 @@ impl BackupService {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
         let resolved = profile.resolve_runtime().await?;
-        tokio::task::spawn_blocking(move || {
+        nasty_common::priority::spawn_bulk(move || {
             let repo = make_repo(&profile, &resolved)?;
             repo.init(
                 &creds(&password),
@@ -1258,7 +1258,7 @@ impl BackupService {
 
         let run_profile = profile.clone();
         let sources = profile.sources.clone();
-        let backup_result = tokio::task::spawn_blocking(move || {
+        let backup_result = nasty_common::priority::spawn_bulk(move || {
             let repo = make_repo(&profile, &resolved)?;
             let repo = repo
                 .open(&creds(&password))
@@ -1282,10 +1282,11 @@ impl BackupService {
                 result.summary.as_ref().map(|s| s.files_changed),
             ))
         })
-        .await
-        .map_err(|e| BackupError::Failed(format!("spawn: {e}")))?;
+        .await;
 
         *self.running.lock().await = None;
+        let backup_result =
+            backup_result.map_err(|e| BackupError::Failed(format!("spawn: {e}")))?;
         let duration = start.elapsed().as_secs();
 
         let result = match backup_result {
@@ -1342,7 +1343,7 @@ impl BackupService {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
         let resolved = profile.resolve_runtime().await?;
-        tokio::task::spawn_blocking(move || {
+        nasty_common::priority::spawn_bulk(move || {
             let repo = make_repo(&profile, &resolved)?;
             let repo = repo
                 .open(&creds(&password))
@@ -1383,7 +1384,7 @@ impl BackupService {
         let snapshot_id = snapshot_id.to_string();
         let dest_str = dest.to_string_lossy().to_string();
 
-        tokio::task::spawn_blocking(move || {
+        nasty_common::priority::spawn_bulk(move || {
             let repo = make_repo_with_progress(&profile, &resolved, progress)?;
             let repo = repo
                 .open(&creds(&password))
@@ -1442,7 +1443,7 @@ impl BackupService {
         let resolved = profile.resolve_runtime().await?;
         let r = profile.retention.clone();
 
-        tokio::task::spawn_blocking(move || {
+        nasty_common::priority::spawn_bulk(move || {
             let repo = make_repo(&profile, &resolved)?;
             let repo = repo
                 .open(&creds(&password))
@@ -1492,7 +1493,7 @@ impl BackupService {
         let profile = self.get_profile_internal(id).await?;
         let password = resolve_profile_password(&profile).await?;
         let resolved = profile.resolve_runtime().await?;
-        tokio::task::spawn_blocking(move || {
+        nasty_common::priority::spawn_bulk(move || {
             let repo = make_repo(&profile, &resolved)?;
             let repo = repo
                 .open(&creds(&password))

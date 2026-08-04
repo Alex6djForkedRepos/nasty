@@ -295,19 +295,26 @@ impl OpenedGuestArchive {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let producer_cancelled = Arc::clone(&cancelled);
         let runtime = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let result = runtime.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(MAX_ARCHIVE_DURATION_SECS),
-                write_share_zip(writer, self.roots, self.permit, producer_cancelled),
-            ));
+        tokio::spawn(async move {
+            let result = nasty_common::priority::spawn_bounded_bulk(move || {
+                runtime.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(MAX_ARCHIVE_DURATION_SECS),
+                        write_share_zip(writer, self.roots, self.permit, producer_cancelled),
+                    )
+                    .await
+                })
+            })
+            .await;
             match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
                     // The client gets a truncated archive; nothing else we can
                     // do once the response body has started streaming.
                     tracing::warn!("guest share zip stream aborted: {error}");
                 }
-                Err(_) => tracing::warn!("guest share zip stream reached its time limit"),
+                Ok(Err(_)) => tracing::warn!("guest share zip stream reached its time limit"),
+                Err(error) => tracing::warn!("guest share zip worker failed: {error}"),
             }
         });
         GuestArchiveReader { reader, cancelled }
@@ -361,7 +368,6 @@ async fn write_share_zip(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use async_zip::{Compression, ZipEntryBuilder};
     use futures_util::io::AsyncReadExt;
-    use tokio_util::compat::TokioAsyncReadCompatExt;
 
     let mut zip = async_zip::tokio::write::ZipFileWriter::with_tokio(writer);
     let mut entry_count = 0usize;
@@ -404,7 +410,9 @@ async fn write_share_zip(
                         .ok_or_else(|| archive_limit("archive byte limit exceeded"))?;
                     let builder = ZipEntryBuilder::new(name.into(), Compression::Deflate);
                     let mut entry = zip.write_entry_stream(builder).await?;
-                    let mut file = tokio::fs::File::from_std(file).compat().take(size);
+                    // The archive worker is already a dedicated demoted thread;
+                    // keep reads there instead of Tokio's control-plane pool.
+                    let mut file = futures_util::io::AllowStdIo::new(file).take(size);
                     futures_util::io::copy(&mut file, &mut entry).await?;
                     entry.close().await?;
                 }

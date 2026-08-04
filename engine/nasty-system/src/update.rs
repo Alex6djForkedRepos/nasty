@@ -395,6 +395,9 @@ SIGNAL_ROLLBACK_EOF
                     --property=Type=oneshot \
                     --property=StandardOutput=journal \
                     --property=StandardError=journal \
+                    --property=Nice=10 \
+                    --property=IOSchedulingClass=best-effort \
+                    --property=IOSchedulingPriority=7 \
                     --setenv "PATH=$PATH" \
                     --setenv "OLD_SYSTEM=$OLD_SYSTEM" \
                     --setenv "MARKER=$MARKER" \
@@ -584,6 +587,7 @@ async fn start_update_transaction(
         "--setenv",
         &format!("PATH={path}"),
     ]);
+    cmd.args(nasty_common::priority::BULK_SYSTEMD_PROPERTIES);
     if let Some(config) = nix_config.filter(|config| !config.is_empty()) {
         cmd.args(["--setenv", &format!("NIX_CONFIG={config}")]);
     }
@@ -1494,6 +1498,9 @@ impl UpdateService {
                 "--property=Type=oneshot",
                 "--property=StandardOutput=journal",
                 "--property=StandardError=journal",
+                "--property=Nice=10",
+                "--property=IOSchedulingClass=best-effort",
+                "--property=IOSchedulingPriority=7",
                 "--setenv",
                 &format!("PATH={path}"),
                 "--",
@@ -1675,6 +1682,9 @@ echo "==> Switch to generation {gen_id} complete!"
                 "--property=Type=oneshot",
                 "--property=StandardOutput=journal",
                 "--property=StandardError=journal",
+                "--property=Nice=10",
+                "--property=IOSchedulingClass=best-effort",
+                "--property=IOSchedulingPriority=7",
                 "--setenv",
                 &format!("PATH={path}"),
                 "--",
@@ -4203,6 +4213,9 @@ proc /proc proc rw 0 0\n\
         assert!(script.contains("Previous-generation activation continues in $ROLLBACK_UNIT"));
         assert!(script.contains("if $MARKER_SET && $rollback_ok && ! $detached_started; then"));
         assert!(script.contains("Recovery remains suppressed; backups are in $BACKUP"));
+        assert!(script.contains("--property=Nice=10"));
+        assert!(script.contains("--property=IOSchedulingClass=best-effort"));
+        assert!(script.contains("--property=IOSchedulingPriority=7"));
     }
 
     #[test]
