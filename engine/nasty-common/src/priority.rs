@@ -38,7 +38,7 @@ pub fn bulk_command(program: &str) -> Command {
                 .as_std_mut()
                 .pre_exec(set_current_thread_bulk_priority);
         }
-        return command;
+        command
     }
     #[cfg(not(target_os = "linux"))]
     {
