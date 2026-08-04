@@ -857,6 +857,8 @@ export interface MemoryStats {
 	available_bytes: number;
 	swap_total_bytes: number;
 	swap_used_bytes: number;
+	/** Approximate kernel-reported bcachefs btree-node buffers, not total bcachefs RAM. */
+	bcachefs_btree_cache_bytes: number | null;
 }
 
 export interface NetIfStats {

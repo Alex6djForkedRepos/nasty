@@ -422,6 +422,14 @@
 						Swap: {formatBytes(stats.memory.swap_used_bytes)} / {formatBytes(stats.memory.swap_total_bytes)}
 					</div>
 				{/if}
+				{#if stats.memory.bcachefs_btree_cache_bytes != null}
+					<div
+						class="mt-1.5 text-xs text-muted-foreground"
+						title="Kernel-reported btree-node main buffers across mounted bcachefs filesystems. Approximate; included node states vary by module version, and other bcachefs and VFS allocations are excluded."
+					>
+						Btree node cache: {formatBytes(stats.memory.bcachefs_btree_cache_bytes)} ({formatPercent(stats.memory.bcachefs_btree_cache_bytes, stats.memory.total_bytes)})
+					</div>
+				{/if}
 			</CardContent>
 		</Card>
 
@@ -602,5 +610,4 @@
 		{/if}
 	</div>
 {/if}
-
 
