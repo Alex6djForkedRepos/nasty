@@ -5014,7 +5014,11 @@ impl AppsService {
                 })?;
         }
         let owner = format!("{}:{}", req.uid, req.gid);
-        let mut cmd = Command::new("chown");
+        let mut cmd = if req.recursive {
+            nasty_common::priority::bulk_command("chown")
+        } else {
+            Command::new("chown")
+        };
         if req.recursive {
             cmd.arg("-R");
         }
@@ -5733,6 +5737,20 @@ async fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), AppsError> {
     Ok(())
 }
 
+async fn run_bulk_cmd(cmd: &str, args: &[&str]) -> Result<(), AppsError> {
+    let output = nasty_common::priority::bulk_command(cmd)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| AppsError::CommandFailed(format!("{cmd}: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppsError::CommandFailed(format!("{cmd}: {stderr}")));
+    }
+    Ok(())
+}
+
 /// Probe a running container for an available shell.
 /// Returns None if the container has no shell (scratch/distroless images).
 async fn find_container_shell(container: &str) -> Option<&'static str> {
@@ -6155,7 +6173,7 @@ async fn run_appdata_relocation(
     }
     // `cp -a` preserves ownership/modes/xattrs — container uids must
     // survive the move or every app hits permission errors on restart.
-    if let Err(e) = run_cmd("cp", &["-a", &format!("{current}/."), &target_path]).await {
+    if let Err(e) = run_bulk_cmd("cp", &["-a", &format!("{current}/."), &target_path]).await {
         // Drop the partial copy so a retry doesn't hit the no-merge guard.
         let _ = run_cmd("bcachefs", &["subvolume", "delete", &target_path]).await;
         fail(&status, &stopped, format!("copy failed: {e}")).await;

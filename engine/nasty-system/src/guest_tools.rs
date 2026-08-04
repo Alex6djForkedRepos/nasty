@@ -234,6 +234,9 @@ echo "==> VM guest tools applied."
             "--property=Type=oneshot",
             "--property=StandardOutput=journal",
             "--property=StandardError=journal",
+            "--property=Nice=10",
+            "--property=IOSchedulingClass=best-effort",
+            "--property=IOSchedulingPriority=7",
             "--setenv",
         ])
         .arg(format!("PATH={path}"))

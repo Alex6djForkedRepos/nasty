@@ -10,6 +10,15 @@ pub async fn run(program: &str, args: &[&str]) -> std::io::Result<Output> {
     Command::new(program).args(args).output().await
 }
 
+/// Execute a CPU/IO-heavy command below control-plane priority.
+pub async fn run_bulk(program: &str, args: &[&str]) -> std::io::Result<Output> {
+    debug!("exec (bulk): {} {}", program, args.join(" "));
+    nasty_common::priority::bulk_command(program)
+        .args(args)
+        .output()
+        .await
+}
+
 /// Execute a command with data piped to stdin.
 pub async fn run_stdin(program: &str, args: &[&str], stdin_data: &[u8]) -> std::io::Result<Output> {
     debug!("exec (stdin): {} {}", program, args.join(" "));
@@ -49,6 +58,20 @@ pub async fn run_ok_stdin(
 /// Execute a command, returning stdout as String on success or an error message on failure.
 pub async fn run_ok(program: &str, args: &[&str]) -> Result<String, String> {
     let output = run(program, args)
+        .await
+        .map_err(|e| format!("failed to execute {program}: {e}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("{program} exited with {}: {stderr}", output.status))
+    }
+}
+
+/// Execute a bulk command, returning stdout on success or stderr on failure.
+pub async fn run_ok_bulk(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = run_bulk(program, args)
         .await
         .map_err(|e| format!("failed to execute {program}: {e}"))?;
 

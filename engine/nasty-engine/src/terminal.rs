@@ -93,15 +93,20 @@ async fn handle_terminal(
         }
     };
 
-    let mut cmd = if let Some(ref argv) = auth.cmd {
-        let mut c = CommandBuilder::new(&argv[0]);
-        c.args(&argv[1..]);
-        c
+    // Terminal sessions can launch arbitrary sustained work. Demote the shell
+    // before exec so those processes cannot inherit the engine's priority.
+    let mut cmd = CommandBuilder::new("bash");
+    cmd.args([
+        "-c",
+        "env -u POSIXLY_CORRECT renice -n 10 -p $$ >/dev/null && \
+         ionice -c2 -n7 -p $$ && exec \"$@\"",
+        "nasty-terminal",
+    ]);
+    if let Some(ref argv) = auth.cmd {
+        cmd.args(argv);
     } else {
-        let mut c = CommandBuilder::new("bash");
-        c.args(["--rcfile", "/etc/nasty/terminal-rc"]);
-        c
-    };
+        cmd.args(["bash", "--rcfile", "/etc/nasty/terminal-rc"]);
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("HOME", "/root");
     // Marker for any in-PTY script to detect "this shell is hosted

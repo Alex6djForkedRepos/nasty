@@ -1646,7 +1646,7 @@ async fn files_size_handler(
     // sizes the browser already shows. `du` doesn't follow symlinks, `safe_path`
     // confined `dir` to FILES_ROOT, and `--` guards the canonical path from being
     // read as an option. Timeout-bounded so a huge tree can't wedge the request.
-    let du = tokio::process::Command::new("du")
+    let du = nasty_common::priority::bulk_command("du")
         .arg("-sb")
         .arg("--")
         .arg(dir.as_os_str())
@@ -2719,10 +2719,7 @@ async fn files_copy_handler(
     let result = if from_meta.is_dir() {
         copy_dir_recursive(&from, &to).await
     } else {
-        tokio::fs::copy(&from, &to)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        copy_file(&from, &to).await
     };
 
     match result {
@@ -2768,38 +2765,49 @@ async fn files_copy_handler(
 /// is treated by users as "new copy made now," not "snapshot of
 /// the original at this point in time."
 async fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    nasty_common::priority::spawn_bulk(move || copy_dir_recursive_sync(&src, &dst))
+        .await
+        .map_err(|error| format!("spawn bulk copy worker: {error}"))?
+}
+
+async fn copy_file(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    nasty_common::priority::spawn_bulk(move || {
+        std::fs::copy(&src, &dst)
+            .map(|_| ())
+            .map_err(|error| format!("copy {} -> {}: {error}", src.display(), dst.display()))
+    })
+    .await
+    .map_err(|error| format!("spawn bulk copy worker: {error}"))?
+}
+
+fn copy_dir_recursive_sync(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     // (current source path, current destination path) tuples.
     let mut stack: Vec<(std::path::PathBuf, std::path::PathBuf)> =
         vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((src_dir, dst_dir)) = stack.pop() {
-        tokio::fs::create_dir(&dst_dir)
-            .await
-            .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
-        let mut entries = tokio::fs::read_dir(&src_dir)
-            .await
+        std::fs::create_dir(&dst_dir).map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
+        let entries = std::fs::read_dir(&src_dir)
             .map_err(|e| format!("read_dir {}: {e}", src_dir.display()))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| format!("next_entry {}: {e}", src_dir.display()))?
-        {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("next_entry {}: {e}", src_dir.display()))?;
             let entry_src = entry.path();
             let entry_dst = dst_dir.join(entry.file_name());
             let meta = entry
                 .metadata()
-                .await
                 .map_err(|e| format!("metadata {}: {e}", entry_src.display()))?;
             if meta.is_dir() {
                 stack.push((entry_src, entry_dst));
             } else if meta.file_type().is_symlink() {
-                let target = tokio::fs::read_link(&entry_src)
-                    .await
+                let target = std::fs::read_link(&entry_src)
                     .map_err(|e| format!("read_link {}: {e}", entry_src.display()))?;
-                tokio::fs::symlink(&target, &entry_dst)
-                    .await
+                std::os::unix::fs::symlink(&target, &entry_dst)
                     .map_err(|e| format!("symlink {}: {e}", entry_dst.display()))?;
             } else {
-                tokio::fs::copy(&entry_src, &entry_dst).await.map_err(|e| {
+                std::fs::copy(&entry_src, &entry_dst).map_err(|e| {
                     format!(
                         "copy {} -> {}: {e}",
                         entry_src.display(),
@@ -2849,14 +2857,12 @@ fn derive_restore_dest(rel: &str) -> Result<String, String> {
 
 /// Remove whatever currently exists at `p` (file, symlink, or directory)
 /// so a restore can overwrite it. No-op when `p` doesn't exist.
-async fn remove_existing(p: &std::path::Path) -> Result<(), String> {
-    match tokio::fs::symlink_metadata(p).await {
-        Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(p)
-            .await
-            .map_err(|e| format!("rm -r {}: {e}", p.display())),
-        Ok(_) => tokio::fs::remove_file(p)
-            .await
-            .map_err(|e| format!("rm {}: {e}", p.display())),
+fn remove_existing(p: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => {
+            std::fs::remove_dir_all(p).map_err(|e| format!("rm -r {}: {e}", p.display()))
+        }
+        Ok(_) => std::fs::remove_file(p).map_err(|e| format!("rm {}: {e}", p.display())),
         Err(_) => Ok(()),
     }
 }
@@ -2867,40 +2873,41 @@ async fn remove_existing(p: &std::path::Path) -> Result<(), String> {
 /// in the live tree but not the snapshot are left untouched (additive —
 /// no `--delete`).
 async fn restore_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    nasty_common::priority::spawn_bulk(move || restore_dir_recursive_sync(&src, &dst))
+        .await
+        .map_err(|error| format!("spawn bulk restore worker: {error}"))?
+}
+
+fn restore_dir_recursive_sync(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     let mut stack: Vec<(std::path::PathBuf, std::path::PathBuf)> =
         vec![(src.to_path_buf(), dst.to_path_buf())];
     while let Some((src_dir, dst_dir)) = stack.pop() {
-        match tokio::fs::symlink_metadata(&dst_dir).await {
+        match std::fs::symlink_metadata(&dst_dir) {
             Ok(m) if m.is_dir() => {} // merge into the existing directory
             Ok(_) => {
                 // A non-directory is in the way — replace it with a dir.
-                remove_existing(&dst_dir).await?;
-                tokio::fs::create_dir(&dst_dir)
-                    .await
+                remove_existing(&dst_dir)?;
+                std::fs::create_dir(&dst_dir)
                     .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?;
             }
-            Err(_) => tokio::fs::create_dir_all(&dst_dir)
-                .await
+            Err(_) => std::fs::create_dir_all(&dst_dir)
                 .map_err(|e| format!("mkdir {}: {e}", dst_dir.display()))?,
         }
-        let mut entries = tokio::fs::read_dir(&src_dir)
-            .await
+        let entries = std::fs::read_dir(&src_dir)
             .map_err(|e| format!("read_dir {}: {e}", src_dir.display()))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| format!("next_entry {}: {e}", src_dir.display()))?
-        {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("next_entry {}: {e}", src_dir.display()))?;
             let entry_src = entry.path();
             let entry_dst = dst_dir.join(entry.file_name());
             let meta = entry
                 .metadata()
-                .await
                 .map_err(|e| format!("metadata {}: {e}", entry_src.display()))?;
             if meta.is_dir() {
                 stack.push((entry_src, entry_dst));
             } else {
-                restore_leaf(&entry_src, &entry_dst, &meta).await?;
+                restore_leaf_sync(&entry_src, &entry_dst, &meta)?;
             }
         }
     }
@@ -2914,24 +2921,34 @@ async fn restore_leaf(
     dst: &std::path::Path,
     meta: &std::fs::Metadata,
 ) -> Result<(), String> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    let meta = meta.clone();
+    nasty_common::priority::spawn_bulk(move || restore_leaf_sync(&src, &dst, &meta))
+        .await
+        .map_err(|error| format!("spawn bulk restore worker: {error}"))?
+}
+
+fn restore_leaf_sync(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    meta: &std::fs::Metadata,
+) -> Result<(), String> {
     if meta.file_type().is_symlink() {
-        remove_existing(dst).await?;
-        let target = tokio::fs::read_link(src)
-            .await
-            .map_err(|e| format!("read_link {}: {e}", src.display()))?;
-        tokio::fs::symlink(&target, dst)
-            .await
+        remove_existing(dst)?;
+        let target =
+            std::fs::read_link(src).map_err(|e| format!("read_link {}: {e}", src.display()))?;
+        std::os::unix::fs::symlink(&target, dst)
             .map_err(|e| format!("symlink {}: {e}", dst.display()))
     } else {
-        // `tokio::fs::copy` overwrites a regular file, but not a dir/symlink
+        // `std::fs::copy` overwrites a regular file, but not a dir/symlink
         // sitting at the destination — clear those first.
-        if let Ok(m) = tokio::fs::symlink_metadata(dst).await
+        if let Ok(m) = std::fs::symlink_metadata(dst)
             && (m.is_dir() || m.file_type().is_symlink())
         {
-            remove_existing(dst).await?;
+            remove_existing(dst)?;
         }
-        tokio::fs::copy(src, dst)
-            .await
+        std::fs::copy(src, dst)
             .map(|_| ())
             .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))
     }

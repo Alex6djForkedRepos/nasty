@@ -2,6 +2,7 @@ pub mod block_volume;
 pub mod cmd;
 pub mod jsonrpc;
 pub mod metrics_types;
+pub mod priority;
 pub mod secrets;
 pub mod secure_boot;
 pub mod state;
