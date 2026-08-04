@@ -789,6 +789,54 @@ type ListCache = Arc<Mutex<Option<(Instant, Vec<Filesystem>)>>>;
 type ScrubStateMap = Arc<Mutex<HashMap<String, ScrubStatus>>>;
 type MountStateMap = Arc<Mutex<HashMap<String, MountFailure>>>;
 type FsckStateMap = Arc<Mutex<HashMap<String, FsckStatus>>>;
+type LocalOperationSet = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+struct LocalOperationReservation {
+    operations: LocalOperationSet,
+    name: String,
+}
+
+impl LocalOperationReservation {
+    fn acquire(operations: &LocalOperationSet, name: String) -> Option<Self> {
+        let mut active = operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.insert(name.clone()).then(|| Self {
+            operations: operations.clone(),
+            name,
+        })
+    }
+}
+
+impl Drop for LocalOperationReservation {
+    fn drop(&mut self) {
+        self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.name);
+    }
+}
+
+fn operation_is_owned_here(operations: &LocalOperationSet, name: &str) -> bool {
+    operations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(name)
+}
+
+/// A missing child only proves interruption when the operation came from a
+/// previous engine process and the state has not changed since status polling
+/// took its snapshot. The latter check prevents a late poll from overwriting a
+/// completion result recorded while `pgrep` was running.
+fn should_record_interrupted_operation(
+    observed_started_at: Option<i64>,
+    current_running: bool,
+    current_started_at: Option<i64>,
+    owned_here: bool,
+    child_alive: bool,
+) -> bool {
+    !owned_here && !child_alive && current_running && current_started_at == observed_started_at
+}
 
 fn loop_devices_backed_by(output: &str, mount_point: &str) -> Vec<String> {
     let prefix = format!("{}/", mount_point.trim_end_matches('/'));
@@ -1949,6 +1997,12 @@ pub struct FilesystemService {
     /// completion path consumes it to record a `Cancelled` outcome rather
     /// than a misleading `Failed` (#553).
     scrub_cancels: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Scrubs with completion tasks owned by this engine process. A child
+    /// exits before its task drains output and records the result, so status
+    /// polling must not mistake that normal window for an engine restart.
+    local_scrubs: LocalOperationSet,
+    /// Same ownership guard for detached fsck completion tasks.
+    local_fscks: LocalOperationSet,
 }
 
 impl Default for FilesystemService {
@@ -2009,6 +2063,8 @@ impl FilesystemService {
             fsck_state: Arc::new(Mutex::new(fsck)),
             evacuating: Arc::new(Mutex::new(std::collections::HashSet::new())),
             scrub_cancels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            local_scrubs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            local_fscks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -4096,6 +4152,13 @@ impl FilesystemService {
         let fs_name = name.to_string();
         let now = unix_now_secs();
 
+        let ownership = LocalOperationReservation::acquire(&self.local_scrubs, fs_name.clone())
+            .ok_or_else(|| {
+                FilesystemError::CommandFailed(
+                    "a scrub is already running on this filesystem".to_string(),
+                )
+            })?;
+
         // Stamp the in-memory state with started_at *before* we spawn,
         // so a `scrub_status` call landing 50ms later sees `running`.
         // The completion path below clears started_at and fills the
@@ -4185,6 +4248,7 @@ impl FilesystemService {
                 entry.raw = summary;
             }
             persist_scrub_state(&store).await;
+            drop(ownership);
         });
 
         Ok(())
@@ -4255,7 +4319,8 @@ impl FilesystemService {
             })
         };
 
-        if status.running {
+        let owned_here = operation_is_owned_here(&self.local_scrubs, name);
+        if status.running && !owned_here {
             // State says running — verify the child still exists. If
             // the engine restarted mid-scrub the child may have died
             // or been re-parented; either way the recorded `running`
@@ -4277,25 +4342,40 @@ impl FilesystemService {
                     .started_at
                     .map(|s| (end - s).max(0) as u64)
                     .unwrap_or(0);
+                let mut persist = false;
                 let mut state = self.scrub_state.lock().await;
+                // Check ownership while the state entry is locked. A new run
+                // reserves ownership before it can replace this entry.
+                let owned_now = operation_is_owned_here(&self.local_scrubs, name);
                 let entry = state
                     .entry(name.to_string())
                     .or_insert_with(|| status.clone());
-                entry.running = false;
-                entry.started_at = None;
-                entry.progress_percent = None;
-                entry.last_run_at = Some(end);
-                entry.last_duration_secs = Some(duration);
-                entry.last_outcome = Some(ScrubOutcome::Failed);
-                entry.last_output = Some(
-                    "engine restarted while scrub was running — the bcachefs child \
-                     was lost; restart the scrub if you want a fresh full pass."
-                        .into(),
-                );
-                entry.raw = "Last scrub: failed (engine restart)".into();
+                if should_record_interrupted_operation(
+                    status.started_at,
+                    entry.running,
+                    entry.started_at,
+                    owned_now,
+                    alive,
+                ) {
+                    entry.running = false;
+                    entry.started_at = None;
+                    entry.progress_percent = None;
+                    entry.last_run_at = Some(end);
+                    entry.last_duration_secs = Some(duration);
+                    entry.last_outcome = Some(ScrubOutcome::Failed);
+                    entry.last_output = Some(
+                        "engine restarted while scrub was running — the bcachefs child \
+                         was lost; restart the scrub if you want a fresh full pass."
+                            .into(),
+                    );
+                    entry.raw = "Last scrub: failed (engine restart)".into();
+                    persist = true;
+                }
                 status = entry.clone();
                 drop(state);
-                persist_scrub_state(&self.scrub_state).await;
+                if persist {
+                    persist_scrub_state(&self.scrub_state).await;
+                }
             }
         }
 
@@ -4337,6 +4417,12 @@ impl FilesystemService {
 
         let fs_name = name.to_string();
         let now = unix_now_secs();
+        let ownership = LocalOperationReservation::acquire(&self.local_fscks, fs_name.clone())
+            .ok_or_else(|| {
+                FilesystemError::CommandFailed(
+                    "an fsck is already running on this filesystem".to_string(),
+                )
+            })?;
         {
             let mut state = self.fsck_state.lock().await;
             let entry = state.entry(fs_name.clone()).or_default();
@@ -4378,6 +4464,7 @@ impl FilesystemService {
                 entry.last_output = Some(truncated);
             }
             persist_fsck_state(&store).await;
+            drop(ownership);
         });
 
         Ok(())
@@ -4399,7 +4486,8 @@ impl FilesystemService {
             .cloned()
             .unwrap_or_default();
 
-        if status.running {
+        let owned_here = operation_is_owned_here(&self.local_fscks, name);
+        if status.running && !owned_here {
             // fsck runs against the member devices (the FS is unmounted),
             // so the cross-check matches on the filesystem name in the
             // command line isn't reliable; match the bcachefs fsck process
@@ -4419,25 +4507,38 @@ impl FilesystemService {
                     .started_at
                     .map(|s| (end - s).max(0) as u64)
                     .unwrap_or(0);
+                let mut persist = false;
                 let mut state = self.fsck_state.lock().await;
+                let owned_now = operation_is_owned_here(&self.local_fscks, name);
                 let entry = state
                     .entry(name.to_string())
                     .or_insert_with(|| status.clone());
-                entry.running = false;
-                entry.started_at = None;
-                entry.progress_percent = None;
-                entry.last_run_at = Some(end);
-                entry.last_duration_secs = Some(duration);
-                entry.last_repair = Some(status.repair);
-                entry.last_outcome = Some(FsckOutcome::Failed);
-                entry.last_output = Some(
-                    "engine restarted while fsck was running — the bcachefs child was lost; \
-                     start the check again."
-                        .into(),
-                );
+                if should_record_interrupted_operation(
+                    status.started_at,
+                    entry.running,
+                    entry.started_at,
+                    owned_now,
+                    alive,
+                ) {
+                    entry.running = false;
+                    entry.started_at = None;
+                    entry.progress_percent = None;
+                    entry.last_run_at = Some(end);
+                    entry.last_duration_secs = Some(duration);
+                    entry.last_repair = Some(status.repair);
+                    entry.last_outcome = Some(FsckOutcome::Failed);
+                    entry.last_output = Some(
+                        "engine restarted while fsck was running — the bcachefs child was lost; \
+                         start the check again."
+                            .into(),
+                    );
+                    persist = true;
+                }
                 status = entry.clone();
                 drop(state);
-                persist_fsck_state(&self.fsck_state).await;
+                if persist {
+                    persist_fsck_state(&self.fsck_state).await;
+                }
             }
         }
 
@@ -7913,6 +8014,48 @@ weird_future_op: ...
     }
 
     // ── Scrub output classifier ───────────────────────────────
+
+    #[test]
+    fn local_operation_reservation_releases_on_drop() {
+        let operations = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        {
+            let _reservation =
+                LocalOperationReservation::acquire(&operations, "tank".to_string()).unwrap();
+            assert!(operation_is_owned_here(&operations, "tank"));
+            assert!(LocalOperationReservation::acquire(&operations, "tank".to_string()).is_none());
+        }
+        assert!(!operation_is_owned_here(&operations, "tank"));
+    }
+
+    #[test]
+    fn scrub_completion_window_is_not_misclassified_as_restart() {
+        let started_at = Some(1_700_000_000);
+
+        assert!(!should_record_interrupted_operation(
+            started_at, true, started_at, true, false,
+        ));
+        assert!(!should_record_interrupted_operation(
+            started_at, false, None, false, false,
+        ));
+        assert!(!should_record_interrupted_operation(
+            started_at,
+            true,
+            Some(1_700_000_001),
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn stale_operation_from_previous_engine_is_marked_interrupted() {
+        let started_at = Some(1_700_000_000);
+        assert!(should_record_interrupted_operation(
+            started_at, true, started_at, false, false,
+        ));
+        assert!(!should_record_interrupted_operation(
+            started_at, true, started_at, false, true,
+        ));
+    }
 
     #[test]
     fn scrub_clean_run_classifies_as_ok() {
