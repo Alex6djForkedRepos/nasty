@@ -78,7 +78,7 @@ const NAVIGATION: NavEntry[] = [
 		children: [
 			item('filesystems', '/filesystems', 'Filesystems', Database, ['filesystem', 'pool', 'bcachefs', 'format', 'mount', 'unmount', 'create', 'encryption', 'replicas', 'erasure', 'tiering', 'compression', 'scrub', 'fsck', 'check', 'repair', 'balance', 'rebuild', 'defrag', 'add disk', 'remove disk', 'tpm', 'tpm2', 'seal', 'unlock', 'key', 'quota'], { commonRank: 1 }),
 			item('subvolumes', '/subvolumes', 'Subvolumes', Layers, ['subvolume', 'snapshot', 'quota', 'block device', 'dataset', 'clone', 'send', 'receive', 'replication', 'volume', 'zvol', 'lun', 'namespace'], { commonRank: 2 }),
-			item('disks', '/disks', 'Disks', HardDrive, ['disk', 'drive', 'smart', 'health', 'temperature', 'ssd', 'hdd', 'sas', 'nvme', 'topology', 'device', 'wipe', 'format', 'partition', 'serial', 'model', 'firmware', 'pcie', 'endurance', 'wear', 'scan'], { commonRank: 3 }),
+			item('disks', '/disks', 'Disks', HardDrive, ['disk', 'drive', 'smart', 'health', 'temperature', 'ssd', 'hdd', 'sas', 'nvme', 'topology', 'device', 'wipe', 'format', 'partition', 'serial', 'model', 'firmware', 'pcie', 'endurance', 'wear', 'scan', 'scheduler', 'elevator'], { commonRank: 3 }),
 			item('operations', '/operations', 'Operations', Activity, ['operation', 'scrub', 'reconcile', 'balance', 'copygc', 'evacuate', 'progress', 'activity', 'job']),
 			item('files', '/files', 'Files', FolderOpen, ['file', 'browser', 'folder', 'directory', 'upload', 'download', 'rename', 'move', 'copy', 'permissions'], { commonRank: 4 })
 		]

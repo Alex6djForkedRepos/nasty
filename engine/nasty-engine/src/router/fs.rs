@@ -173,6 +173,15 @@ pub(super) async fn try_route(
             },
             Err(e) => invalid(req, e),
         },
+        "device.set_io_scheduler" => {
+            match parse_params::<nasty_storage::io_scheduler::IoSchedulerUpdate>(req) {
+                Ok(update) => match nasty_storage::io_scheduler::set(update).await {
+                    Ok(result) => ok(req, result),
+                    Err(error) => err(req, error),
+                },
+                Err(error) => invalid(req, error),
+            }
+        }
         "device.wipe" => match parse_params::<serde_json::Value>(req) {
             Ok(p) => {
                 let path = p

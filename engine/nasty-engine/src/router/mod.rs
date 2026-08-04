@@ -1819,6 +1819,7 @@ mod tests {
         for m in [
             "fs.tpm.bind",
             "fs.tpm.unbind",
+            "device.set_io_scheduler",
             "fs.create",
             "fs.destroy",
             "fs.mount",

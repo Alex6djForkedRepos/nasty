@@ -21,11 +21,14 @@
 	let expandedDisk = $state<string | null>(null);
 	let isVirtual = $state(false);
 	let pollInterval: ReturnType<typeof setInterval> | null = null;
+	let schedulerValues = $state<Record<string, string>>({});
+	let schedulerPending = $state<Record<string, boolean>>({});
+	let isAdmin = $state(false);
 
 	const client = getClient();
 
 	onMount(async () => {
-		await Promise.all([loadBlockDevices(), loadSmartProtocol(), loadVmStatus()]);
+		await Promise.all([loadBlockDevices(), loadSmartProtocol(), loadVmStatus(), loadIdentity()]);
 		loading = false;
 		pollInterval = setInterval(refresh, 30000);
 	});
@@ -36,8 +39,29 @@
 
 	async function loadBlockDevices() {
 		await withToast(async () => {
-			blockDevices = await client.call<BlockDevice[]>('device.list');
+			const fresh = await client.call<BlockDevice[]>('device.list');
+			blockDevices = fresh;
+			const nextValues = Object.fromEntries(
+				fresh
+					.filter((dev) => dev.io_scheduler)
+					.map((dev) => [dev.path, dev.io_scheduler?.configured ?? ''])
+			);
+			for (const dev of fresh) {
+				if (dev.io_scheduler && schedulerPending[dev.path]) {
+					nextValues[dev.path] = schedulerValues[dev.path] ?? '';
+				}
+			}
+			schedulerValues = nextValues;
 		});
+	}
+
+	async function loadIdentity() {
+		try {
+			const identity = await client.call<{ role: string }>('auth.me');
+			isAdmin = identity.role === 'admin';
+		} catch {
+			isAdmin = false;
+		}
 	}
 
 	async function loadVmStatus() {
@@ -98,6 +122,29 @@
 				: `${dev.path} type set to ${deviceClass.toUpperCase()}`
 		);
 		if (ok !== undefined) await loadBlockDevices();
+	}
+
+	async function setIoScheduler(dev: BlockDevice, scheduler: string) {
+		const previous = schedulerValues[dev.path] ?? dev.io_scheduler?.configured ?? '';
+		schedulerValues[dev.path] = scheduler;
+		schedulerPending[dev.path] = true;
+		try {
+			const ok = await withToast(
+				() => client.call('device.set_io_scheduler', {
+					path: dev.path,
+					scheduler: scheduler || null,
+				}),
+				scheduler
+					? `${dev.path} I/O scheduler set to ${scheduler}`
+					: `${dev.path} I/O scheduler is no longer managed; the active scheduler was left unchanged`
+			);
+			if (ok === undefined) {
+				schedulerValues[dev.path] = previous;
+			}
+		} finally {
+			delete schedulerPending[dev.path];
+			await loadBlockDevices();
+		}
 	}
 
 	// Human note about how durable an override on this disk is.
@@ -279,12 +326,14 @@
 
 	<!-- Devices tab -->
 	{#if activeTab === 'devices'}
-		<table class="w-full text-sm">
+		<div class="overflow-x-auto">
+		<table class="min-w-[900px] w-full text-sm">
 			<thead>
 				<tr>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Device</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Size</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Type</th>
+					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Scheduler</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Filesystem</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Status</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground w-px whitespace-nowrap">Actions</th>
@@ -292,7 +341,10 @@
 			</thead>
 			<tbody>
 				{#each blockDevices as dev}
-					<tr class="border-b border-border {dev.dev_type === 'part' ? 'bg-muted/10' : ''}">
+					<tr
+						class="border-b border-border {dev.dev_type === 'part' ? 'bg-muted/10' : ''} {schedulerPending[dev.path] ? 'pointer-events-none opacity-50' : ''}"
+						aria-busy={schedulerPending[dev.path] || undefined}
+					>
 						<td class="p-3 font-mono text-sm {dev.dev_type === 'part' ? 'pl-8' : ''}">{dev.path}</td>
 						<td class="p-3">{formatBytes(dev.size_bytes)}</td>
 						<td class="p-3">
@@ -306,6 +358,7 @@
 										value={dev.type_source === 'manual' ? dev.device_class : 'auto'}
 										title="Override the detected disk type (for VMs where it's wrong)"
 										onchange={(e) => setDiskType(dev, e.currentTarget.value)}
+										disabled={schedulerPending[dev.path]}
 									>
 										<option value="auto">Auto</option>
 										<option value="ssd">SSD</option>
@@ -320,6 +373,29 @@
 								{/if}
 							</div>
 						</td>
+						<td class="min-w-48 p-3">
+							{#if dev.dev_type === 'disk' && dev.io_scheduler}
+								<select
+									class="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+									value={schedulerValues[dev.path] ?? dev.io_scheduler.configured ?? ''}
+									onchange={(e) => setIoScheduler(dev, e.currentTarget.value)}
+									disabled={schedulerPending[dev.path] || !isAdmin}
+									aria-label={`I/O scheduler for ${dev.path}`}
+									title={isAdmin ? 'Persist an I/O scheduler for this disk' : 'Administrator access is required to change the I/O scheduler'}
+								>
+									<option value="">Unmanaged (leave active unchanged)</option>
+									{#if dev.io_scheduler.configured && !dev.io_scheduler.available.includes(dev.io_scheduler.configured)}
+										<option value={dev.io_scheduler.configured} disabled>{dev.io_scheduler.configured} (unavailable)</option>
+									{/if}
+									{#each dev.io_scheduler.available as scheduler (scheduler)}
+										<option value={scheduler}>{scheduler}</option>
+									{/each}
+								</select>
+								<div class="mt-1 text-xs text-muted-foreground">Active: {dev.io_scheduler.active}</div>
+							{:else}
+								<span class="text-muted-foreground">—</span>
+							{/if}
+						</td>
 						<td class="p-3 font-mono text-xs text-muted-foreground">{dev.fs_type ?? '—'}</td>
 						<td class="p-3">
 							{#if dev.in_use}
@@ -333,13 +409,14 @@
 						</td>
 						<td class="p-3 w-px whitespace-nowrap">
 							{#if !dev.in_use && dev.fs_type}
-								<Button variant="destructive" size="xs" onclick={() => wipe(dev)}>Wipe</Button>
+								<Button variant="destructive" size="xs" onclick={() => wipe(dev)} disabled={schedulerPending[dev.path]}>Wipe</Button>
 							{/if}
 						</td>
 					</tr>
 				{/each}
 			</tbody>
 		</table>
+		</div>
 
 	<!-- SMART Health tab -->
 	{:else if activeTab === 'smart'}

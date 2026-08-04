@@ -6,6 +6,7 @@
 pub mod cmd;
 pub mod disk_type;
 pub mod filesystem;
+pub mod io_scheduler;
 pub mod subvolume;
 
 pub use filesystem::{FilesystemError, FilesystemService};

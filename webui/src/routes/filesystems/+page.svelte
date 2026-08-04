@@ -77,7 +77,6 @@
 	let mountFsck = $state(false);
 	let journalFlushDisabled = $state(false);
 	let journalFlushDelay = $state('');
-	let ioScheduler = $state('');
 
 	// Manual tiering state
 	let manualLabels: Record<string, string> = $state({});
@@ -115,7 +114,6 @@
 	let editFsck = $state(false);
 	let editJournalFlushDisabled = $state(false);
 	let editJournalFlushDelay = $state('');
-	let editIoScheduler = $state('');
 
 	let showCreateAdvanced = $state(false);
 	let showCreateCommands = $state(false);
@@ -696,7 +694,6 @@
 				encoded_extent_max: encodedExtentMax || undefined,
 				version_upgrade: versionUpgrade || undefined,
 				journal_flush_delay: journalFlushDelay ? parseInt(journalFlushDelay) : undefined,
-				io_scheduler: ioScheduler || undefined,
 			}),
 			`Filesystem "${newName}" created`
 		);
@@ -726,7 +723,6 @@
 			mountFsck = false;
 			journalFlushDisabled = false;
 			journalFlushDelay = '';
-			ioScheduler = '';
 			await refresh();
 		}
 	}
@@ -982,7 +978,6 @@
 		editFsck = fs.options.fsck ?? false;
 		editJournalFlushDisabled = fs.options.journal_flush_disabled ?? false;
 		editJournalFlushDelay = fs.options.journal_flush_delay?.toString() ?? '';
-		editIoScheduler = fs.options.io_scheduler ?? '';
 		showEditAdvanced = false;
 	}
 
@@ -1057,7 +1052,6 @@
 				fsck: editFsck || undefined,
 				journal_flush_disabled: editJournalFlushDisabled || undefined,
 				journal_flush_delay: editJournalFlushDelay ? parseInt(editJournalFlushDelay) : undefined,
-				io_scheduler: editIoScheduler || undefined,
 			}, 60_000),
 			`Options updated for "${fsName}"`
 		);
@@ -1911,19 +1905,10 @@
 							Disable journal flush
 						</label>
 					</div>
-					<div class="mt-3 grid grid-cols-2 gap-3">
+					<div class="mt-3 max-w-xs">
 						<div>
 							<Label class="text-xs">Journal flush delay (µs)</Label>
 							<Input type="number" bind:value={journalFlushDelay} placeholder="1000" class="mt-1 h-8 text-xs" />
-						</div>
-						<div>
-							<Label class="text-xs">I/O scheduler</Label>
-							<select bind:value={ioScheduler} class="mt-1 h-8 w-full rounded-md border border-input bg-background px-2 text-xs">
-								<option value="">Default</option>
-								<option value="none">none (recommended for SSDs)</option>
-								<option value="mq-deadline">mq-deadline</option>
-								<option value="kyber">kyber</option>
-							</select>
 						</div>
 					</div>
 					<p class="mt-2 text-xs text-muted-foreground">Checksum and bucket size are set at format time. Mount options can be changed later via Edit Options.</p>
@@ -2334,22 +2319,13 @@
 											<span class="text-xs">Disable journal flush</span>
 										</label>
 									</div>
-									<div class="mt-2 grid grid-cols-2 gap-2">
+									<div class="mt-2 max-w-xs">
 										<div>
 											<Label class="text-[0.65rem]">Journal flush delay (µs)</Label>
 											<Input type="number" bind:value={editJournalFlushDelay} placeholder="1000" class="mt-0.5 h-7 text-xs" />
 										</div>
-										<div>
-											<Label class="text-[0.65rem]">I/O scheduler</Label>
-											<select bind:value={editIoScheduler} class="mt-0.5 h-7 w-full rounded-md border border-input bg-background px-2 text-xs">
-												<option value="">Default</option>
-												<option value="none">none (recommended for SSDs)</option>
-												<option value="mq-deadline">mq-deadline</option>
-												<option value="kyber">kyber</option>
-											</select>
-										</div>
 									</div>
-									<p class="mt-1.5 text-[0.6rem] text-muted-foreground">These require a remount to take effect.</p>
+									<p class="mt-1.5 text-[0.6rem] text-muted-foreground">This requires a remount to take effect.</p>
 								</fieldset>
 							</div>
 						{/if}
@@ -2398,10 +2374,6 @@
 								{#if fs.options.journal_flush_delay}
 									<span class="text-muted-foreground">Journal Flush Delay</span>
 									<span>{fs.options.journal_flush_delay} µs</span>
-								{/if}
-								{#if fs.options.io_scheduler}
-									<span class="text-muted-foreground">I/O Scheduler</span>
-									<span>{fs.options.io_scheduler}</span>
 								{/if}
 							</div>
 
