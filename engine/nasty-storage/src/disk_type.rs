@@ -79,7 +79,8 @@ pub fn choose_stable_id(
     // because VMware reuses a constant serial across SATA disks.
     let hardware = by_id_names
         .iter()
-        .find(|n| n.starts_with("wwn-") || n.starts_with("nvme-eui.") || n.starts_with("scsi-3"));
+        .filter(|n| n.starts_with("wwn-") || n.starts_with("nvme-eui.") || n.starts_with("scsi-3"))
+        .min();
     if let Some(id) = hardware {
         return (id.clone(), "hardware");
     }
@@ -227,6 +228,21 @@ mod tests {
         let (key, kind) = choose_stable_id(&by_id, Some("pci-0000:00:10.0-scsi-0:0:0:0"), "sdd");
         assert_eq!(key, "wwn-0x5000c291082e5f93");
         assert_eq!(kind, "hardware");
+    }
+
+    #[test]
+    fn hardware_identity_is_independent_of_directory_order() {
+        let first = vec![
+            "wwn-0x5000c291082e5f93".to_string(),
+            "scsi-35000c291082e5f93".to_string(),
+        ];
+        let mut reversed = first.clone();
+        reversed.reverse();
+
+        assert_eq!(
+            choose_stable_id(&first, None, "sdd"),
+            choose_stable_id(&reversed, None, "sdd")
+        );
     }
 
     #[test]

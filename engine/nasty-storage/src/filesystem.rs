@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::cmd;
+use crate::io_scheduler::IoSchedulerState;
 
 const NASTY_MOUNT_BASE: &str = "/fs";
 const FS_STATE_PATH: &str = "/var/lib/nasty/fs-state.json";
@@ -320,9 +321,6 @@ pub struct FilesystemOptions {
     /// Journal flush delay in microseconds. Higher values batch more journal writes,
     /// improving throughput under sync-heavy workloads (e.g. NFS commits).
     pub journal_flush_delay: Option<u32>,
-    /// I/O scheduler for member block devices (e.g. `none`, `mq-deadline`, `kyber`).
-    /// `none` is recommended for SSDs; `mq-deadline` is the kernel default.
-    pub io_scheduler: Option<String>,
     /// Maximum concurrent background mover IOs.
     pub move_ios_in_flight: Option<u32>,
     /// Maximum bytes in flight for background mover (e.g. `"8.0M"`).
@@ -452,9 +450,6 @@ pub struct CreateFilesystemRequest {
     /// Journal flush delay in microseconds (default: 1000). Higher values batch
     /// more journal writes, improving throughput under sync-heavy workloads.
     pub journal_flush_delay: Option<u32>,
-    /// I/O scheduler for member block devices (`none`, `mq-deadline`, `kyber`).
-    /// `none` is recommended for SSDs.
-    pub io_scheduler: Option<String>,
 }
 
 fn default_replicas() -> u32 {
@@ -507,8 +502,6 @@ pub struct UpdateFilesystemOptionsRequest {
     pub journal_flush_disabled: Option<bool>,
     /// Journal flush delay in microseconds. Higher values batch more journal writes.
     pub journal_flush_delay: Option<u32>,
-    /// I/O scheduler for member block devices (`none`, `mq-deadline`, `kyber`).
-    pub io_scheduler: Option<String>,
     /// Data checksum algorithm (`none`, `crc32c`, `crc64`, `xxhash`).
     pub data_checksum: Option<String>,
     /// Metadata checksum algorithm (`none`, `crc32c`, `crc64`, `xxhash`).
@@ -1284,13 +1277,6 @@ fn validate_create_request(req: &CreateFilesystemRequest) -> Result<(), Filesyst
     {
         return Err(FilesystemError::InvalidInput(format!(
             "invalid version_upgrade value '{value}'"
-        )));
-    }
-    if let Some(value) = req.io_scheduler.as_deref()
-        && !matches!(value, "none" | "mq-deadline" | "kyber")
-    {
-        return Err(FilesystemError::InvalidInput(format!(
-            "invalid io_scheduler value '{value}'"
         )));
     }
     Ok(())
@@ -2256,8 +2242,7 @@ impl FilesystemService {
 
             // Read per-device labels and fs options for mounted filesystems
             let fs_devices = read_fs_devices(&uuid, devices).await;
-            let mut options = read_fs_options_sysfs(&uuid).await;
-            options.io_scheduler = read_io_scheduler(&fs_devices).await;
+            let options = read_fs_options_sysfs(&uuid).await;
 
             filesystems.push(Filesystem {
                 name,
@@ -2569,7 +2554,6 @@ impl FilesystemService {
             encrypted: if is_encrypted { Some(true) } else { None },
             version_upgrade: req.version_upgrade.clone(),
             journal_flush_delay: req.journal_flush_delay,
-            io_scheduler: req.io_scheduler.clone(),
             ..FsMountOptions::default()
         };
         let mount_opt_str = build_mount_opts(&mount_opts);
@@ -2594,33 +2578,6 @@ impl FilesystemService {
             return Err(FilesystemError::CommandFailed(format!(
                 "mounted filesystem UUID did not match expected UUID {uuid}{suffix}"
             )));
-        }
-
-        // Apply I/O scheduler to member block devices
-        let dev_list: Vec<FilesystemDevice> = req
-            .devices
-            .iter()
-            .map(|d| FilesystemDevice {
-                path: d.path.clone(),
-                label: d.label.clone(),
-                durability: d.durability,
-                state: None,
-                data_allowed: None,
-                has_data: None,
-                discard: None,
-                rotational: None,
-                read_errors: None,
-                write_errors: None,
-                checksum_errors: None,
-                member_index: None,
-                uuid: None,
-                missing: None,
-            })
-            .collect();
-        if let Some(ref sched) = req.io_scheduler
-            && let Err(e) = apply_io_scheduler(&dev_list, sched).await
-        {
-            warn!("Failed to set I/O scheduler: {e}");
         }
 
         // Track mount state with identity info for boot reconciliation
@@ -2932,13 +2889,6 @@ impl FilesystemService {
             return Err(FilesystemError::CommandFailed(message));
         }
 
-        // Apply I/O scheduler to member block devices
-        if let Some(ref sched) = opts.io_scheduler
-            && let Err(e) = apply_io_scheduler(&fs.devices, sched).await
-        {
-            warn!("Failed to set I/O scheduler: {e}");
-        }
-
         // Track mount state with identity info for boot reconciliation.
         // If we successfully unlocked via a stored key, force the
         // persisted `encrypted` flag to true: opts.encrypted may have
@@ -3201,11 +3151,6 @@ impl FilesystemService {
             write_opt(&base, "journal_flush_delay", &v.to_string()).await?;
         }
 
-        // Apply I/O scheduler to member block devices
-        if let Some(ref sched) = req.io_scheduler {
-            apply_io_scheduler(&fs.devices, sched).await?;
-        }
-
         // Mount options require a remount to take effect — but only if they actually changed.
         let state = load_fs_state().await;
         let current = state.get(&req.name).cloned().unwrap_or_default();
@@ -3220,11 +3165,7 @@ impl FilesystemService {
                 && req.journal_flush_delay != current.journal_flush_delay);
         drop(state);
 
-        // Persist state changes (mount opts + io_scheduler)
-        let state_changed = mount_changed
-            || (req.io_scheduler.is_some() && req.io_scheduler != current.io_scheduler);
-
-        if state_changed {
+        if mount_changed {
             let mut state = load_fs_state().await;
             {
                 let opts = state.entry(req.name.clone()).or_default();
@@ -3251,9 +3192,6 @@ impl FilesystemService {
                 }
                 if let Some(v) = req.journal_flush_delay {
                     opts.journal_flush_delay = Some(v);
-                }
-                if let Some(ref v) = req.io_scheduler {
-                    opts.io_scheduler = Some(v.clone());
                 }
             }
             if let Err(e) = save_fs_state(&state).await {
@@ -3353,6 +3291,7 @@ impl FilesystemService {
             serde_json::from_str(&output).unwrap_or(serde_json::Value::Null);
 
         let mut devices = Vec::new();
+        let mut partition_parents = std::collections::HashMap::new();
         if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
             fn classify(name: &str, rota: bool, transport: Option<&str>) -> (bool, String) {
                 if name.starts_with("nvme") {
@@ -3405,6 +3344,9 @@ impl FilesystemService {
                 out: &mut Vec<BlockDevice>,
                 resolver: &crate::disk_type::IdentityResolver,
                 overrides: &std::collections::HashMap<String, String>,
+                scheduler_states: &std::collections::HashMap<String, IoSchedulerState>,
+                parent_disk: Option<&str>,
+                partition_parents: &mut std::collections::HashMap<String, String>,
             ) {
                 for dev in devs {
                     let name = dev.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -3452,6 +3394,11 @@ impl FilesystemService {
 
                     if dev_type == "disk" || dev_type == "part" {
                         let path = format!("/dev/{name}");
+                        if dev_type == "part"
+                            && let Some(parent) = parent_disk
+                        {
+                            partition_parents.insert(path.clone(), format!("/dev/{parent}"));
+                        }
                         let in_fs = fs_devices.contains(&path);
                         let actually_mounted = mounted_devices.contains(&path);
 
@@ -3459,6 +3406,7 @@ impl FilesystemService {
                         // disks only — partitions inherit nothing here.
                         let (mut stable_id, mut id_kind) = (None, None);
                         let mut type_source = "detected".to_string();
+                        let mut io_scheduler = None;
                         if dev_type == "disk" {
                             let (key, kind) = resolver.resolve(name);
                             if let Some(class) = overrides.get(&key)
@@ -3471,6 +3419,7 @@ impl FilesystemService {
                             }
                             stable_id = Some(key);
                             id_kind = Some(kind.to_string());
+                            io_scheduler = scheduler_states.get(name).cloned();
                         }
 
                         out.push(BlockDevice {
@@ -3490,10 +3439,16 @@ impl FilesystemService {
                             stable_id,
                             id_kind,
                             type_source,
+                            io_scheduler,
                         });
                     }
 
                     if let Some(children) = dev.get("children").and_then(|v| v.as_array()) {
+                        let child_parent = if dev_type == "disk" {
+                            Some(name)
+                        } else {
+                            parent_disk
+                        };
                         collect_devices(
                             children,
                             fs_devices,
@@ -3501,6 +3456,9 @@ impl FilesystemService {
                             out,
                             resolver,
                             overrides,
+                            scheduler_states,
+                            child_parent,
+                            partition_parents,
                         );
                     }
                 }
@@ -3508,6 +3466,22 @@ impl FilesystemService {
             // Identity (by-id/by-path) + persisted type overrides are read
             // once per listing, then applied per whole-disk inside the walk.
             let resolver = crate::disk_type::IdentityResolver::new().await;
+            fn disk_names(devs: &[serde_json::Value], names: &mut Vec<String>) {
+                for dev in devs {
+                    if dev.get("type").and_then(|value| value.as_str()) == Some("disk")
+                        && let Some(name) = dev.get("name").and_then(|value| value.as_str())
+                    {
+                        names.push(name.to_string());
+                    }
+                    if let Some(children) = dev.get("children").and_then(|value| value.as_array()) {
+                        disk_names(children, names);
+                    }
+                }
+            }
+            let mut whole_disk_names = Vec::new();
+            disk_names(blockdevices, &mut whole_disk_names);
+            let scheduler_states =
+                crate::io_scheduler::states_for_device_names(&resolver, &whole_disk_names).await;
             let overrides = crate::disk_type::load().await;
             collect_devices(
                 blockdevices,
@@ -3516,50 +3490,39 @@ impl FilesystemService {
                 &mut devices,
                 &resolver,
                 &overrides,
+                &scheduler_states,
+                None,
+                &mut partition_parents,
             );
-        }
 
-        // Mark parent disks as in_use if any of their partitions are in_use.
-        let in_use_paths: std::collections::HashSet<String> = devices
-            .iter()
-            .filter(|d| d.in_use && d.dev_type == "part")
-            .map(|d| d.path.clone())
-            .collect();
-        for dev in &mut devices {
-            if dev.dev_type == "disk"
-                && !dev.in_use
-                && in_use_paths.iter().any(|p| p.starts_with(&dev.path))
-            {
-                dev.in_use = true;
+            // Parentage comes from lsblk's device tree. Device names may end
+            // in digits, so prefix trimming is not a valid partition parser.
+            let in_use_parents: std::collections::HashSet<&str> = devices
+                .iter()
+                .filter(|device| device.in_use && device.dev_type == "part")
+                .filter_map(|device| partition_parents.get(&device.path).map(String::as_str))
+                .collect();
+            for device in &mut devices {
+                if device.dev_type == "disk" && in_use_parents.contains(device.path.as_str()) {
+                    device.in_use = true;
+                }
             }
         }
 
         // Detect unpartitioned free space on disks with existing partitions.
         // Use sgdisk to find the largest free gap; if > 1 GiB, add a virtual "free" entry.
         // Skip boot devices (mmcblk/eMMC) — they should never be offered as storage.
-        let partitioned_disks: Vec<String> = devices
-            .iter()
-            .filter(|d| d.dev_type == "part")
-            .filter(|d| !d.path.contains("mmcblk"))
-            .filter_map(|d| {
-                // /dev/sda1 -> /dev/sda, /dev/nvme0n1p1 -> /dev/nvme0n1
-                let name = d.path.trim_start_matches("/dev/");
-                // Strip trailing partition number
-                if name.contains("nvme") || name.contains("loop") || name.contains("mmcblk") {
-                    name.rsplit_once('p')
-                        .map(|(base, _)| format!("/dev/{base}"))
-                } else {
-                    let base = name.trim_end_matches(|c: char| c.is_ascii_digit());
-                    Some(format!("/dev/{base}"))
-                }
-            })
+        let partitioned_disks: Vec<String> = partition_parents
+            .values()
+            .filter(|path| !path.contains("mmcblk"))
             // A disk that is itself a filesystem member (whole-disk
             // bcachefs) can't host a new partition, and probing it with
             // sgdisk only produces GPT lectures — the member superblock
             // sits where a partition table would be. Partition nodes on
             // such a disk are stale kernel state from a pre-wipe table
             // (#488).
-            .filter(|parent| !used_devices.contains(parent))
+            .filter(|parent| !used_devices.contains(*parent))
+            .cloned()
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -3624,6 +3587,7 @@ impl FilesystemService {
                             stable_id: None,
                             id_kind: None,
                             type_source,
+                            io_scheduler: None,
                         });
                     }
                 }
@@ -4903,6 +4867,10 @@ pub struct BlockDevice {
     /// when an operator override is in effect (#552).
     #[serde(default = "default_type_source")]
     pub type_source: String,
+    /// Kernel I/O scheduler state for physical whole disks. Partitions and
+    /// synthetic free-space rows do not own a queue and return `None`.
+    #[serde(default)]
+    pub io_scheduler: Option<IoSchedulerState>,
 }
 
 fn default_type_source() -> String {
@@ -5407,7 +5375,6 @@ async fn read_fs_options_sysfs(uuid: &str) -> FilesystemOptions {
         fsck: None,
         journal_flush_disabled: None,
         journal_flush_delay: read_opt_u32(&base, "journal_flush_delay").await,
-        io_scheduler: None, // read per-device, not from bcachefs sysfs
         move_ios_in_flight: read_opt_u32(&base, "move_ios_in_flight").await,
         move_bytes_in_flight: read_opt(&base, "move_bytes_in_flight").await,
     }
@@ -5793,8 +5760,14 @@ struct FsMountOptions {
     journal_flush_disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_flush_delay: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    io_scheduler: Option<String>,
+    /// Retained only so unresolved scheduler migration data survives an
+    /// unrelated filesystem-state rewrite.
+    #[serde(
+        default,
+        rename = "io_scheduler",
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_io_scheduler: Option<String>,
 }
 
 /// Filesystem state: maps fs name → mount options.
@@ -5820,7 +5793,7 @@ async fn save_fs_mounted_with_opts(fs_name: &str, mut opts: FsMountOptions) {
 /// Mark a filesystem as unmounted without losing its tuned mount
 /// options. Sets `mounted: Some(false)` so `restore_mounts` skips it
 /// at next boot; preserves `encrypted`, `compression`, `journal_*`,
-/// `io_scheduler`, etc. so the next manual `mount` doesn't start
+/// etc. so the next manual `mount` doesn't start
 /// from defaults. Pre-fix this function removed the entry entirely,
 /// which silently wiped the operator's config (and produced the
 /// "encrypted=None at boot → systemd-ask-password deadlock" reported
@@ -6841,45 +6814,6 @@ fn build_mount_opts(opts: &FsMountOptions) -> String {
     parts.join(",")
 }
 
-/// Extract the short device name from a path (e.g. `/dev/sda` → `sda`).
-fn block_dev_name(path: &str) -> Option<&str> {
-    path.rsplit('/').next()
-}
-
-/// Apply an I/O scheduler to all member block devices of a filesystem.
-async fn apply_io_scheduler(
-    devices: &[FilesystemDevice],
-    scheduler: &str,
-) -> Result<(), FilesystemError> {
-    for dev in devices {
-        let Some(name) = block_dev_name(&dev.path) else {
-            continue;
-        };
-        let sysfs_path = format!("/sys/block/{name}/queue/scheduler");
-        if let Err(e) = tokio::fs::write(&sysfs_path, scheduler).await {
-            // Not fatal — device may be a partition or missing sysfs entry
-            warn!("Failed to set I/O scheduler on {name}: {e}");
-        } else {
-            info!("Set I/O scheduler to '{scheduler}' on {name}");
-        }
-    }
-    Ok(())
-}
-
-/// Read the active I/O scheduler from the first member device.
-/// Returns the bracketed value from `/sys/block/{dev}/queue/scheduler`.
-async fn read_io_scheduler(devices: &[FilesystemDevice]) -> Option<String> {
-    let dev = devices.first()?;
-    let name = block_dev_name(&dev.path)?;
-    let sysfs_path = format!("/sys/block/{name}/queue/scheduler");
-    let content = tokio::fs::read_to_string(&sysfs_path).await.ok()?;
-    // Format: "none [mq-deadline] kyber" — extract the bracketed one
-    content
-        .split_whitespace()
-        .find(|s| s.starts_with('['))
-        .map(|s| s.trim_matches(|c| c == '[' || c == ']').to_string())
-}
-
 async fn is_mountpoint(path: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
     if tokio::fs::read_to_string("/proc/self/mountinfo")
@@ -7012,7 +6946,6 @@ mod tests {
             encoded_extent_max: None,
             version_upgrade: None,
             journal_flush_delay: None,
-            io_scheduler: None,
         }
     }
 
@@ -7469,11 +7402,27 @@ mod tests {
         assert_eq!(opts.devices.len(), 3);
     }
 
+    #[test]
+    fn unresolved_legacy_scheduler_survives_state_roundtrip() {
+        let legacy = r#"{
+            "devices": ["/dev/missing"],
+            "io_scheduler": "bfq"
+        }"#;
+        let opts: FsMountOptions = serde_json::from_str(legacy).expect("legacy state parses");
+        assert_eq!(opts.legacy_io_scheduler.as_deref(), Some("bfq"));
+
+        let json = serde_json::to_string(&opts).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["io_scheduler"],
+            "bfq"
+        );
+    }
+
     /// Round-trip an unmount→mount cycle in pure data form: an FS
     /// with tuned options must keep them across a `mounted = false`
     /// pause and survive serde re-serialization. Regression for
-    /// "unmount silently wiped my compression/journal_flush_delay/
-    /// io_scheduler config" — pre-fix `save_fs_unmounted` did a
+    /// "unmount silently wiped my compression/journal_flush_delay config" —
+    /// pre-fix `save_fs_unmounted` did a
     /// flat `state.remove(name)`.
     #[test]
     fn unmount_preserves_tuned_options_across_state_roundtrip() {
@@ -7483,7 +7432,6 @@ mod tests {
             mounted: Some(true),
             encrypted: Some(true),
             journal_flush_delay: Some(1000),
-            io_scheduler: Some("none".into()),
             ..FsMountOptions::default()
         };
 
@@ -7500,7 +7448,6 @@ mod tests {
         assert_eq!(restored.mounted, Some(false));
         assert_eq!(restored.encrypted, Some(true)); // the regression we're fencing
         assert_eq!(restored.journal_flush_delay, Some(1000));
-        assert_eq!(restored.io_scheduler.as_deref(), Some("none"));
         assert_eq!(restored.devices, vec!["/dev/sda", "/dev/sdb"]);
     }
 

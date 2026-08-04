@@ -488,7 +488,6 @@ export interface FilesystemOptions {
 	fsck: boolean | null;
 	journal_flush_disabled: boolean | null;
 	journal_flush_delay: number | null;
-	io_scheduler: string | null;
 	move_ios_in_flight: number | null;
 	move_bytes_in_flight: string | null;
 }
@@ -552,6 +551,12 @@ export interface FsckStatus {
 	last_output?: string | null;
 }
 
+export interface DeviceIoScheduler {
+	active: string;
+	available: string[];
+	configured: string | null;
+}
+
 export interface BlockDevice {
 	path: string;
 	size_bytes: number;
@@ -582,6 +587,7 @@ export interface BlockDevice {
 	id_kind?: string;
 	/** "detected" (from lsblk/sysfs) | "manual" (operator override). */
 	type_source: string;
+	io_scheduler: DeviceIoScheduler | null;
 }
 
 export type TieringProfileId = 'single' | 'write_cache' | 'full_tiering' | 'none' | 'manual';

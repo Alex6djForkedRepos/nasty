@@ -69,6 +69,12 @@ describe('navigation model', () => {
 		]));
 	});
 
+	test('finds Disks by I/O scheduler terminology', () => {
+		const entries = resolveNavigation({ kvmAvailable: true });
+		expect(searchNavigation(entries, 'scheduler')).toEqual(new Set(['/disks']));
+		expect(searchNavigation(entries, 'elevator')).toEqual(new Set(['/disks']));
+	});
+
 	test('search cannot expose capability-gated entries', () => {
 		const entries = resolveNavigation({ kvmAvailable: false });
 		expect(searchNavigation(entries, 'virtual machine')).toEqual(new Set());

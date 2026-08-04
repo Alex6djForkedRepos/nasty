@@ -249,6 +249,8 @@ async fn main() -> anyhow::Result<()> {
         // Ok/Failed in place, no popping-into-existence reflow.
         // Keep this list in sync with the `run_phase` calls below.
         boot_status: boot_status::BootStatusTracker::new(&[
+            "io_scheduler.migrate_legacy",
+            "io_scheduler.restore",
             "filesystems.restore_mounts",
             "subvolumes.restore_block_devices",
             "nvmeof.remap_device_paths",
@@ -278,10 +280,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Restore state from previous session:
-    // 1. Mount filesystems tracked in fs-state.json
-    // 2. Re-attach loop devices for block subvolumes
-    // 3. Start enabled protocols (services + kernel modules)
-    // 4. Restore NVMe-oF configfs (volatile, needs modules from step 3)
+    // 1. Migrate and restore physical-device I/O scheduler overrides
+    // 2. Mount filesystems tracked in fs-state.json
+    // 3. Re-attach loop devices for block subvolumes
+    // 4. Start enabled protocols (services + kernel modules)
+    // 5. Restore NVMe-oF configfs (volatile, needs modules from step 4)
     //
     // Every restoration step gets a wall-clock budget via `run_phase`
     // so a single misbehaving subsystem (a hung mount, a slow Tailscale
@@ -298,6 +301,23 @@ async fn main() -> anyhow::Result<()> {
     // seconds and the ceilings are never reached.
     use std::time::Duration;
     let secs = Duration::from_secs;
+
+    state
+        .boot_status
+        .run_phase(
+            "io_scheduler.migrate_legacy",
+            secs(45),
+            nasty_storage::io_scheduler::migrate_legacy(),
+        )
+        .await;
+    state
+        .boot_status
+        .run_phase(
+            "io_scheduler.restore",
+            secs(30),
+            nasty_storage::io_scheduler::restore(),
+        )
+        .await;
 
     let mount_failures = state
         .boot_status

@@ -42,6 +42,7 @@ use nasty_storage::filesystem::{
     DeviceAddRequest, DeviceSetLabelRequest, DeviceSetStateRequest, Filesystem, FsUsage,
     FsckStatus, ReconcileStatus, ScrubStatus, TpmBindStatus, UpdateFilesystemOptionsRequest,
 };
+use nasty_storage::io_scheduler::{IoSchedulerResult, IoSchedulerUpdate};
 use nasty_storage::subvolume::{
     CloneSnapshotRequest, CloneSubvolumeRequest, CreateSnapshotRequest, CreateSubvolumeRequest,
     DeleteSnapshotRequest, DeleteSubvolumeRequest, FindByPropertyRequest, RemovePropertiesRequest,
@@ -514,6 +515,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<DiskTypeUpdate>(generator)),
                     result: None,
+                },
+                Method {
+                    name: "device.set_io_scheduler",
+                    desc: "Set and persist the I/O scheduler on the physical whole disk owning a queue, or stop managing it without changing the active scheduler. Device aliases and partitions are resolved through sysfs.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<IoSchedulerUpdate>(generator)),
+                    result: Some(gen_schema::<IoSchedulerResult>(generator)),
                 },
             ],
         ),
