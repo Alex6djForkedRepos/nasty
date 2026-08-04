@@ -134,6 +134,7 @@ pub fn memory_stats() -> MemoryStats {
         available_bytes: available,
         swap_total_bytes: swap_total,
         swap_used_bytes: swap_total.saturating_sub(swap_free),
+        bcachefs_btree_cache_bytes: None,
     }
 }
 

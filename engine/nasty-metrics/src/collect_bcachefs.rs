@@ -496,6 +496,15 @@ pub fn collect_all() -> Vec<BcachefsMetrics> {
     all
 }
 
+/// Sum the kernel-reported btree-node cache across filesystems. `None` means
+/// no mounted filesystem exposed the gauge on this kernel.
+pub fn total_btree_cache_bytes(metrics: &[BcachefsMetrics]) -> Option<u64> {
+    metrics
+        .iter()
+        .filter_map(|fs| fs.background.btree_cache_size_bytes)
+        .reduce(u64::saturating_add)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn read_sysfs_str(path: &Path) -> Option<String> {
@@ -523,7 +532,8 @@ fn parse_human_bytes(s: &str) -> Option<u64> {
         return Some(v);
     }
 
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K') {
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k'))
+    {
         (n, 1024u64)
     } else if let Some(n) = s.strip_suffix('M') {
         (n, 1024 * 1024)
@@ -538,12 +548,36 @@ fn parse_human_bytes(s: &str) -> Option<u64> {
     num_str
         .parse::<f64>()
         .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|v| (v * multiplier as f64) as u64)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CompressionEntry, parse_bcachefs_mount_line, parse_compression_line};
+    use super::{
+        BcachefsMetrics, CompressionEntry, parse_bcachefs_mount_line, parse_compression_line,
+        parse_human_bytes, total_btree_cache_bytes,
+    };
+
+    #[test]
+    fn parses_kernel_lowercase_kibibyte_suffix() {
+        assert_eq!(parse_human_bytes("256k"), Some(256 * 1024));
+    }
+
+    #[test]
+    fn totals_available_btree_cache_gauges() {
+        let mut first = BcachefsMetrics::default();
+        first.background.btree_cache_size_bytes = Some(1024);
+        let mut second = BcachefsMetrics::default();
+        second.background.btree_cache_size_bytes = Some(2048);
+        let missing = BcachefsMetrics::default();
+
+        assert_eq!(
+            total_btree_cache_bytes(&[first, second, missing]),
+            Some(3072)
+        );
+        assert_eq!(total_btree_cache_bytes(&[]), None);
+    }
 
     #[test]
     fn parse_compression_lz4_row() {

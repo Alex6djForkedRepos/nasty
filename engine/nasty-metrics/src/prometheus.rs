@@ -501,7 +501,7 @@ fn render_bcachefs_background(out: &mut String, fs: &BcachefsMetrics) {
         gauge(
             out,
             "nasty_bcachefs_btree_cache_size_bytes",
-            "Btree cache memory usage",
+            "Kernel-reported btree-node main-buffer bytes; approximate and not total bcachefs memory",
             &labels,
             bytes as f64,
         );

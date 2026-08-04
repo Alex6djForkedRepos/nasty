@@ -67,6 +67,9 @@ pub struct MemoryStats {
     pub swap_total_bytes: u64,
     /// Swap space currently in use.
     pub swap_used_bytes: u64,
+    /// Kernel-reported bcachefs btree-node main buffers across mounted
+    /// filesystems. This is approximate and not total bcachefs RAM.
+    pub bcachefs_btree_cache_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

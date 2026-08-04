@@ -1186,6 +1186,7 @@ mod tests {
                 available_bytes: 0,
                 swap_total_bytes: 0,
                 swap_used_bytes: 0,
+                bcachefs_btree_cache_bytes: None,
             },
             network: vec![],
             disk_io: vec![],

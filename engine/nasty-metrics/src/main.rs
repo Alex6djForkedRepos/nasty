@@ -99,8 +99,10 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> Json<SystemStats> {
-    let stats = state.stats.read().await;
-    Json(stats.clone())
+    let mut stats = state.stats.read().await.clone();
+    let bcachefs = state.bcachefs.read().await;
+    stats.memory.bcachefs_btree_cache_bytes = collect_bcachefs::total_btree_cache_bytes(&bcachefs);
+    Json(stats)
 }
 
 async fn disks_handler(State(state): State<Arc<AppState>>) -> Json<Vec<DiskHealth>> {
