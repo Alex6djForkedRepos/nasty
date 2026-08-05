@@ -2,9 +2,9 @@
   description = "NASty local system configuration";
 
   inputs = {
-    # Three inputs, split into two control regimes:
+    # Four inputs, split into two control regimes:
     #
-    # `nasty` and `bcachefs-tools` are both pinned in the wrapper, so
+    # `nasty`, `bcachefs-tools`, and `tailscale-nixpkgs` are pinned in the wrapper, so
     # the operator owns them — pick a nasty ref to track, pick a
     # bcachefs-tools tag to run. Each is editable by hand or via the
     # WebUI's Upstream advanced section.
@@ -75,6 +75,13 @@
     # userspace tools and DKMS module that the appliance installs.
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
 
+    # Tailscale cannot self-update on NixOS because its executable lives in
+    # the immutable Nix store. Track only its package on an independent,
+    # cached nixpkgs input so the Update page can advance Tailscale without
+    # moving the appliance's system nixpkgs or waiting for a NASty release.
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
+
     # NOTE: lanzaboote is intentionally NOT declared as a top-level
     # input here. Secure Boot is per-box opt-in: when the operator
     # begins the enrollment ceremony from the Hardware page, the
@@ -116,6 +123,7 @@
             nasty-webui = nasty.packages.${system}.webui;
             nasty-version = nasty-version;
             nasty-bcachefs-tools = nasty.packages.${system}.bcachefs-tools;
+            nasty-tailscale = inputs.tailscale-nixpkgs.legacyPackages.${system}.tailscale;
             inherit nastySystemFlakeSnapshot lanzaboote;
           };
           modules = [

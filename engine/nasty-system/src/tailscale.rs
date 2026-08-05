@@ -178,6 +178,15 @@ async fn start_tailscale(auth_key: Option<&str>) -> Result<(), String> {
     match result {
         Ok(Ok(stdout)) => {
             info!("tailscale up succeeded (stdout: {})", stdout.trim());
+            // NixOS owns the executable through an atomic system generation.
+            // Disable Tailscale's persisted native updater preference so the
+            // control plane never schedules an unsupported in-place update.
+            if let Err(e) = run_cmd("tailscale", &[&socket_arg, "set", "--auto-update=false"]).await
+            {
+                let _ = run_cmd("tailscale", &[&socket_arg, "down"]).await;
+                let _ = run_cmd("systemctl", &["stop", SYSTEMD_UNIT]).await;
+                return Err(format!("failed to disable native Tailscale updates: {e}"));
+            }
             // Verify the connection actually worked by checking status
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let (connected, ip, _, _) = query_status().await;

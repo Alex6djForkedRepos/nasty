@@ -212,6 +212,7 @@
 	function versionLabel(name: string): string {
 		switch (name) {
 			case 'bcachefs-tools': return 'bcachefs-tools';
+			case 'tailscale-nixpkgs': return 'Tailscale package source';
 			case 'nasty': return 'nasty';
 			default: return name;
 		}
@@ -219,7 +220,8 @@
 
 	/**
 	 * Pull the human-meaningful ref out of a `github:owner/repo/ref` URL.
-	 * For bcachefs-tools this lands on a tag (`v1.38.3`); for nasty on
+	 * For bcachefs-tools this lands on a tag (`v1.38.3`); for nasty and
+	 * the Tailscale package source it is usually a tracked branch;
 	 * either a tag or branch depending on channel. Fallback: the
 	 * trailing path segment, or the raw URL if we can't parse it (e.g.
 	 * git+https forks). nixpkgs isn't surfaced by the engine in
@@ -480,11 +482,10 @@
 				inputs: versionRows.map((row) => ({
 					name: row.name,
 					url: row.url.trim(),
-					// Refresh every wrapper input, not just `nasty`. Without
-					// this the kernel + bcachefs-tools stay pinned to whatever
-					// flake.lock had at install time even as `main` brings in
-					// upstream bumps — see #175 for the parallel apply() fix.
-					update: true
+					// Development upgrades keep the deliberately independent
+					// Tailscale channel pinned. Its row in Upstream is the only
+					// place that opts into refreshing that package source.
+					update: row.name !== 'tailscale-nixpkgs'
 				}))
 			}),
 			'Development build update started'
@@ -873,6 +874,11 @@
 												<span>Update</span>
 											</label>
 										</div>
+										{#if row.name === 'tailscale-nixpkgs'}
+											<p class="mt-2 text-xs text-muted-foreground">
+												Tailscale cannot self-update on NixOS. Refreshing this input installs the latest cached package through an atomic system generation.
+											</p>
+										{/if}
 									</div>
 								{/each}
 							</div>

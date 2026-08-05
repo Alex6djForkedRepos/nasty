@@ -4,6 +4,11 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
+    # Tailscale advances independently from the appliance's system nixpkgs.
+    # Only the Tailscale package is consumed from this input; the rest of the
+    # system remains on the tested nixpkgs pin above.
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
     # ── bcachefs override (optional) ──────────────────────────────
     # Pinned to v1.39.0 release tag.
     # To revert to pure nixpkgs: comment out these two lines.
@@ -32,7 +37,7 @@
     lanzaboote.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, bcachefs-tools, lanzaboote, ... }: let
+  outputs = { self, nixpkgs, tailscale-nixpkgs, bcachefs-tools, lanzaboote, ... }: let
     # Helper to build packages for a given system.
     #
     # The overlay wraps `fetchurl` so every curl invocation sends an
@@ -228,6 +233,7 @@
       nasty-engine = mkEngine system;
       nasty-webui = mkWebui system;
       nasty-bcachefs-tools = mkBcachefsTools system;
+      nasty-tailscale = tailscale-nixpkgs.legacyPackages.${system}.tailscale;
       installerNastyRef = "v${nasty-version}";
       installerSystemFlakeNix = builtins.replaceStrings
         [ "@NASTY_VERSION@" "@LOCAL_SYSTEM@" ]
@@ -264,7 +270,7 @@
       # Full NASty appliance configuration
       nasty = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nastySystemFlakeSnapshot lanzaboote; };
+        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nasty-tailscale nastySystemFlakeSnapshot lanzaboote; };
         modules = [
           ./nixos/modules/bcachefs.nix
           ./nixos/modules/linuxquota.nix
@@ -276,7 +282,7 @@
 
       nasty-rootfs = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nastySystemFlakeSnapshot lanzaboote; };
+        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nasty-tailscale nastySystemFlakeSnapshot lanzaboote; };
         modules = [
           ./nixos/modules/bcachefs.nix
           ./nixos/modules/linuxquota.nix
@@ -344,7 +350,7 @@
       # QEMU VM for testing
       nasty-vm = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nastySystemFlakeSnapshot lanzaboote; };
+        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nasty-tailscale nastySystemFlakeSnapshot lanzaboote; };
         modules = [
           ./nixos/modules/bcachefs.nix
           ./nixos/modules/linuxquota.nix
@@ -358,7 +364,7 @@
       # Cloud/CI disk image (Oracle Cloud compatible)
       nasty-cloud = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nastySystemFlakeSnapshot lanzaboote; };
+        specialArgs = { inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nasty-tailscale nastySystemFlakeSnapshot lanzaboote; };
         modules = [
           "${nixpkgs}/nixos/modules/virtualisation/oci-image.nix"
           ./nixos/modules/bcachefs.nix
@@ -376,6 +382,7 @@
       engine = mkEngine "x86_64-linux";
       webui = mkWebui "x86_64-linux";
       bcachefs-tools = mkBcachefsTools "x86_64-linux";
+      tailscale = tailscale-nixpkgs.legacyPackages.x86_64-linux.tailscale;
       nasty-rootfs = (mkNixosConfigs "x86_64-linux").nasty-rootfs.config.system.build.toplevel;
       nasty-cloud-image = (mkNixosConfigs "x86_64-linux").nasty-cloud.config.system.build.OCIImage;
       default = mkEngine "x86_64-linux";
@@ -385,6 +392,7 @@
       engine = mkEngine "aarch64-linux";
       webui = mkWebui "aarch64-linux";
       bcachefs-tools = mkBcachefsTools "aarch64-linux";
+      tailscale = tailscale-nixpkgs.legacyPackages.aarch64-linux.tailscale;
       nasty-rootfs = (mkNixosConfigs "aarch64-linux").nasty-rootfs.config.system.build.toplevel;
       nasty-cloud-image = (mkNixosConfigs "aarch64-linux").nasty-cloud.config.system.build.OCIImage;
       default = mkEngine "aarch64-linux";
@@ -425,6 +433,14 @@
           (mkNixosConfigs "x86_64-linux").nasty.config.systemd.services.target.restartIfChanged;
       in pkgs.runCommand "iscsi-engine-owned-lifecycle" {} ''
         test "${nixpkgs.lib.boolToString restartIfChanged}" = false
+        touch "$out"
+      '';
+      tailscale-independent-package = let
+        config = (mkNixosConfigs "x86_64-linux").nasty.config;
+        expected = tailscale-nixpkgs.legacyPackages.x86_64-linux.tailscale;
+      in pkgs.runCommand "tailscale-independent-package" {} ''
+        test "${config.services.nasty.tailscale.package}" = "${expected}"
+        test "${nixpkgs.lib.boolToString config.systemd.services.nasty-tailscale.stopIfChanged}" = false
         touch "$out"
       '';
       bcachefs-smoke = import ./nixos/tests/bcachefs-smoke.nix {

@@ -276,7 +276,7 @@
 				{
 					term: 'Tailscale',
 					summary: 'Mesh VPN for reaching NASty from anywhere.',
-					detail: 'Tailscale builds a private network between your devices over WireGuard. Once you log in from NASty\'s Settings page, your NAS gets a stable Tailscale IP and a *.ts.net hostname reachable from any of your other Tailscale-enabled machines — phone, laptop, server — without exposing it to the public internet. Useful for offsite backups and remote access.',
+					detail: 'Tailscale builds a private network between your devices over WireGuard. Once you connect from NASty\'s VPN page, your NAS gets a stable Tailscale IP and a *.ts.net hostname reachable from any of your other Tailscale-enabled machines — phone, laptop, server — without exposing it to the public internet. Useful for offsite backups and remote access. Tailscale package updates are applied atomically from System → Update because native self-updates are unsupported on NixOS.',
 				},
 				{
 					term: 'UPS / NUT',
