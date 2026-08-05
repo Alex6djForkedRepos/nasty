@@ -82,8 +82,11 @@ pub(super) async fn try_route(
                     return Some(ok(req, cached.clone()));
                 }
             }
-            let status = build_system_status(state).await;
-            *state.status_cache.lock().await = Some((std::time::Instant::now(), status.clone()));
+            let (status, revision) = build_system_status(state).await;
+            let mut cache = state.status_cache.lock().await;
+            if revision == state.alerts.revision() {
+                *cache = Some((std::time::Instant::now(), status.clone()));
+            }
             ok(req, status)
         }
         "system.operations.list" => ok(req, build_operations(state).await),
@@ -937,16 +940,16 @@ pub(super) async fn try_route(
 /// Aggregate the sidebar status band (#528): current alert counts (reusing the
 /// shared alert evaluation) plus a scan of every filesystem for in-progress
 /// array operations (device evacuation, running scrub, active reconcile).
-async fn build_system_status(state: &AppState) -> nasty_system::SystemStatus {
+async fn build_system_status(state: &AppState) -> (nasty_system::SystemStatus, u64) {
     use nasty_system::alerts::AlertSeverity;
 
     // Alert side: reuse the canonical evaluation, then split by severity.
-    let alerts = super::evaluate_active_alerts(state).await;
+    let (alerts, alert_revision) = super::evaluate_active_alerts(state).await;
     let mut critical_count = 0u32;
     let mut warning_count = 0u32;
     let mut top_critical: Option<String> = None;
     let mut top_warning: Option<String> = None;
-    for a in &alerts {
+    for a in alerts.iter().filter(|alert| !alert.acknowledged) {
         match a.severity {
             AlertSeverity::Critical => {
                 critical_count += 1;
@@ -1008,12 +1011,15 @@ async fn build_system_status(state: &AppState) -> nasty_system::SystemStatus {
         }
     }
 
-    nasty_system::SystemStatus::from_parts(
-        critical_count,
-        warning_count,
-        top_critical,
-        top_warning,
-        operations,
+    (
+        nasty_system::SystemStatus::from_parts(
+            critical_count,
+            warning_count,
+            top_critical,
+            top_warning,
+            operations,
+        ),
+        alert_revision,
     )
 }
 

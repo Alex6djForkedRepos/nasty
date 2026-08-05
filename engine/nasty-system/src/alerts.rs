@@ -1,7 +1,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::ops::Deref;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 const STATE_PATH: &str = "/var/lib/nasty/alerts.json";
 const STATE_DIR: &str = "/var/lib/nasty";
@@ -24,7 +26,7 @@ pub struct AlertRule {
     pub severity: AlertSeverity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AlertMetric {
     FsUsagePercent,
@@ -76,7 +78,7 @@ pub enum AlertSeverity {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ActiveAlert {
     /// ID of the rule that triggered this alert.
     pub rule_id: String,
@@ -96,13 +98,55 @@ pub struct ActiveAlert {
     pub source: String,
 }
 
+/// One continuous occurrence of an alert condition. A condition that resolves
+/// and later fires again receives a new instance ID and must be acknowledged
+/// separately.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AlertOccurrence {
+    #[serde(flatten)]
+    pub alert: ActiveAlert,
+    pub instance_id: String,
+    pub acknowledged: bool,
+    pub acknowledged_at: Option<String>,
+    pub acknowledged_by: Option<String>,
+}
+
+impl Deref for AlertOccurrence {
+    type Target = ActiveAlert;
+
+    fn deref(&self) -> &Self::Target {
+        &self.alert
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct AlertAcknowledgement {
+    pub instance_id: String,
+    pub acknowledged_at: String,
+    pub acknowledged_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AlertInstanceState {
+    instance_id: String,
+    alert: ActiveAlert,
+    acknowledged_at: Option<String>,
+    acknowledged_by: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct AlertState {
     rules: Vec<AlertRule>,
+    #[serde(default)]
+    active_instances: Vec<AlertInstanceState>,
+    #[serde(skip)]
+    dirty: bool,
 }
 
 pub struct AlertService {
     state: Arc<RwLock<AlertState>>,
+    evaluation_lock: Arc<Mutex<()>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl AlertService {
@@ -130,6 +174,8 @@ impl AlertService {
 
         Self {
             state: Arc::new(RwLock::new(state)),
+            evaluation_lock: Arc::new(Mutex::new(())),
+            revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -152,6 +198,8 @@ impl AlertService {
         };
         state.rules.push(rule.clone());
         save_state(&state).await.map_err(|e| e.to_string())?;
+        state.dirty = false;
+        self.revision.fetch_add(1, Ordering::AcqRel);
         Ok(rule)
     }
 
@@ -182,6 +230,8 @@ impl AlertService {
 
         let rule = rule.clone();
         save_state(&state).await.map_err(|e| e.to_string())?;
+        state.dirty = false;
+        self.revision.fetch_add(1, Ordering::AcqRel);
         Ok(rule)
     }
 
@@ -193,6 +243,8 @@ impl AlertService {
             return Err("rule not found".into());
         }
         save_state(&state).await.map_err(|e| e.to_string())?;
+        state.dirty = false;
+        self.revision.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -206,21 +258,204 @@ impl AlertService {
         disk_health: &[DiskHealthSummary],
         bcachefs_health: &[BcachefsHealth],
         kernel_errors: &KernelErrorAlert,
-    ) -> Vec<ActiveAlert> {
+    ) -> (Vec<ActiveAlert>, Vec<AlertMetric>) {
         let state = self.state.read().await;
-        evaluate_rules(
+        let disk_free = DiskFreeSpace {
+            root_free_gb: root_free_gb(),
+            boot_free_mb: boot_free_mb(),
+        };
+        let mut unavailable = Vec::new();
+        if disk_free.root_free_gb.is_none() {
+            unavailable.push(AlertMetric::RootDiskFreeGb);
+        }
+        if disk_free.boot_free_mb.is_none() {
+            unavailable.push(AlertMetric::BootDiskFreeMb);
+        }
+        let alerts = evaluate_rules(
             &state.rules,
             stats,
             filesystems,
             disk_health,
             bcachefs_health,
             kernel_errors,
-            DiskFreeSpace {
-                root_free_gb: root_free_gb(),
-                boot_free_mb: boot_free_mb(),
-            },
-        )
+            disk_free,
+        );
+        (alerts, unavailable)
     }
+
+    /// Serialize evaluation and acknowledgement so neither can overwrite the
+    /// other's occurrence state.
+    pub async fn lock_evaluation(&self) -> OwnedMutexGuard<()> {
+        self.evaluation_lock.clone().lock_owned().await
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    pub async fn is_active_unacknowledged(&self, instance_id: &str) -> bool {
+        self.state
+            .read()
+            .await
+            .active_instances
+            .iter()
+            .any(|instance| {
+                instance.instance_id == instance_id && instance.acknowledged_at.is_none()
+            })
+    }
+
+    pub async fn reconcile_active(
+        &self,
+        alerts: Vec<ActiveAlert>,
+        is_observed: impl Fn(&ActiveAlert) -> bool,
+    ) -> Vec<AlertOccurrence> {
+        let mut state = self.state.write().await;
+        let enabled_rule_ids: std::collections::HashSet<_> = state
+            .rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .map(|rule| rule.id.as_str())
+            .collect();
+        let is_enabled =
+            |rule_id: &str| rule_id == "mount-failure" || enabled_rule_ids.contains(rule_id);
+        let existing: Vec<_> = state
+            .active_instances
+            .iter()
+            .filter(|instance| is_enabled(&instance.alert.rule_id))
+            .cloned()
+            .collect();
+        let alerts = alerts
+            .into_iter()
+            .filter(|alert| is_enabled(&alert.rule_id))
+            .collect();
+        let (instances, occurrences) = reconcile_instances(&existing, alerts, is_observed);
+        let lifecycle_changed = !same_instance_lifecycle(&instances, &state.active_instances);
+        state.active_instances = instances;
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        if lifecycle_changed {
+            state.dirty = true;
+        }
+        if state.dirty {
+            if let Err(e) = save_state(&state).await {
+                tracing::warn!("failed to persist alert occurrence state: {e}");
+            } else {
+                state.dirty = false;
+            }
+        }
+        occurrences
+    }
+
+    pub async fn acknowledge(
+        &self,
+        instance_id: &str,
+        username: &str,
+    ) -> Result<AlertAcknowledgement, String> {
+        let mut state = self.state.write().await;
+        let mut candidate = state.clone();
+        let acknowledgement = mark_acknowledged(
+            &mut candidate.active_instances,
+            instance_id,
+            username,
+            &chrono::Utc::now().to_rfc3339(),
+        )?;
+        save_state(&candidate).await.map_err(|e| e.to_string())?;
+        candidate.dirty = false;
+        *state = candidate;
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        Ok(acknowledgement)
+    }
+}
+
+fn reconcile_instances(
+    existing: &[AlertInstanceState],
+    alerts: Vec<ActiveAlert>,
+    is_observed: impl Fn(&ActiveAlert) -> bool,
+) -> (Vec<AlertInstanceState>, Vec<AlertOccurrence>) {
+    let mut instances = Vec::with_capacity(alerts.len());
+    let mut occurrences = Vec::with_capacity(alerts.len());
+    let mut remaining = existing.to_vec();
+
+    for alert in alerts {
+        let mut instance = remaining
+            .iter()
+            .position(|instance| {
+                instance.alert.rule_id == alert.rule_id && instance.alert.source == alert.source
+            })
+            .map(|position| remaining.remove(position))
+            .unwrap_or_else(|| AlertInstanceState {
+                instance_id: uuid_v4(),
+                alert: alert.clone(),
+                acknowledged_at: None,
+                acknowledged_by: None,
+            });
+        instance.alert = alert.clone();
+        occurrences.push(occurrence_with_alert(&instance, alert));
+        instances.push(instance);
+    }
+
+    // Absence only proves resolution when this occurrence's own signal was
+    // observed. Keep unrelated or per-resource telemetry gaps last-known-good.
+    for instance in remaining {
+        if !is_observed(&instance.alert) {
+            occurrences.push(occurrence_from(&instance));
+            instances.push(instance);
+        }
+    }
+
+    (instances, occurrences)
+}
+
+fn same_instance_lifecycle(left: &[AlertInstanceState], right: &[AlertInstanceState]) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|left| {
+            right.iter().any(|right| {
+                left.instance_id == right.instance_id
+                    && left.alert.rule_id == right.alert.rule_id
+                    && left.alert.source == right.alert.source
+                    && left.acknowledged_at == right.acknowledged_at
+                    && left.acknowledged_by == right.acknowledged_by
+            })
+        })
+}
+
+fn occurrence_from(instance: &AlertInstanceState) -> AlertOccurrence {
+    occurrence_with_alert(instance, instance.alert.clone())
+}
+
+fn occurrence_with_alert(instance: &AlertInstanceState, alert: ActiveAlert) -> AlertOccurrence {
+    AlertOccurrence {
+        alert,
+        instance_id: instance.instance_id.clone(),
+        acknowledged: instance.acknowledged_at.is_some(),
+        acknowledged_at: instance.acknowledged_at.clone(),
+        acknowledged_by: instance.acknowledged_by.clone(),
+    }
+}
+
+fn mark_acknowledged(
+    instances: &mut [AlertInstanceState],
+    instance_id: &str,
+    username: &str,
+    acknowledged_at: &str,
+) -> Result<AlertAcknowledgement, String> {
+    let instance = instances
+        .iter_mut()
+        .find(|instance| instance.instance_id == instance_id)
+        .ok_or_else(|| "alert is no longer active".to_string())?;
+
+    let at = instance
+        .acknowledged_at
+        .get_or_insert_with(|| acknowledged_at.to_string())
+        .clone();
+    let by = instance
+        .acknowledged_by
+        .get_or_insert_with(|| username.to_string())
+        .clone();
+    Ok(AlertAcknowledgement {
+        instance_id: instance.instance_id.clone(),
+        acknowledged_at: at,
+        acknowledged_by: by,
+    })
 }
 
 /// Free-space readings for the alert metrics that need them. Bundled
@@ -1066,35 +1301,7 @@ fn default_rules() -> Vec<AlertRule> {
 }
 
 fn uuid_v4() -> String {
-    let mut bytes = [0u8; 16];
-    // Use /dev/urandom for random bytes
-    if let Ok(data) = std::fs::read("/dev/urandom") {
-        for (i, b) in data.iter().take(16).enumerate() {
-            bytes[i] = *b;
-        }
-    }
-    // Set version and variant bits
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15],
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 async fn load_state() -> AlertState {
@@ -1102,9 +1309,16 @@ async fn load_state() -> AlertState {
 }
 
 async fn save_state(state: &AlertState) -> Result<(), std::io::Error> {
+    use tokio::io::AsyncWriteExt;
+
     tokio::fs::create_dir_all(STATE_DIR).await?;
-    let json = serde_json::to_string_pretty(state).unwrap();
-    tokio::fs::write(STATE_PATH, json).await?;
+    let json = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
+    let tmp_path = format!("{STATE_PATH}.tmp");
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+    file.write_all(&json).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(tmp_path, STATE_PATH).await?;
     Ok(())
 }
 
@@ -1113,6 +1327,129 @@ mod tests {
     use super::*;
     use crate::SystemStats;
     use nasty_common::metrics_types::{CpuStats, MemoryStats};
+
+    fn test_alert(value: f64) -> ActiveAlert {
+        ActiveAlert {
+            rule_id: "smart-attribute".into(),
+            rule_name: "SMART attribute warning".into(),
+            severity: AlertSeverity::Warning,
+            metric: AlertMetric::SmartAttribute,
+            message: "SMART attribute is non-zero".into(),
+            current_value: value,
+            threshold: 0.0,
+            source: "/dev/sda#5".into(),
+        }
+    }
+
+    #[test]
+    fn legacy_alert_state_deserializes_without_occurrences() {
+        let state: AlertState = serde_json::from_str(r#"{"rules":[]}"#).unwrap();
+        assert!(state.active_instances.is_empty());
+    }
+
+    #[test]
+    fn acknowledgement_survives_value_changes_and_resets_after_resolution() {
+        let (mut instances, first) = reconcile_instances(&[], vec![test_alert(1.0)], |_| true);
+        let first_id = first[0].instance_id.clone();
+        mark_acknowledged(
+            &mut instances,
+            &first_id,
+            "operator",
+            "2026-08-05T00:00:00Z",
+        )
+        .unwrap();
+
+        let (instances, continuing) =
+            reconcile_instances(&instances, vec![test_alert(2.0)], |_| true);
+        assert_eq!(continuing[0].instance_id, first_id);
+        assert!(continuing[0].acknowledged);
+        assert_eq!(continuing[0].acknowledged_by.as_deref(), Some("operator"));
+        assert_eq!(continuing[0].current_value, 2.0);
+
+        let (instances, resolved) = reconcile_instances(&instances, Vec::new(), |_| true);
+        assert!(instances.is_empty());
+        assert!(resolved.is_empty());
+
+        let (_, recurrence) = reconcile_instances(&instances, vec![test_alert(3.0)], |_| true);
+        assert_ne!(recurrence[0].instance_id, first_id);
+        assert!(!recurrence[0].acknowledged);
+    }
+
+    #[test]
+    fn acknowledgement_is_idempotent_and_rejects_stale_ids() {
+        let (mut instances, occurrences) =
+            reconcile_instances(&[], vec![test_alert(1.0)], |_| true);
+        let id = &occurrences[0].instance_id;
+        let first = mark_acknowledged(&mut instances, id, "alice", "first").unwrap();
+        let second = mark_acknowledged(&mut instances, id, "bob", "second").unwrap();
+        assert_eq!(first.acknowledged_at, "first");
+        assert_eq!(second.acknowledged_at, "first");
+        assert_eq!(second.acknowledged_by, "alice");
+        assert!(mark_acknowledged(&mut instances, "stale", "alice", "now").is_err());
+    }
+
+    #[test]
+    fn incomplete_evaluation_preserves_missing_occurrences() {
+        let (mut instances, occurrences) =
+            reconcile_instances(&[], vec![test_alert(1.0)], |_| true);
+        let id = occurrences[0].instance_id.clone();
+        mark_acknowledged(&mut instances, &id, "alice", "now").unwrap();
+
+        let (preserved, visible) = reconcile_instances(&instances, Vec::new(), |_| false);
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(visible[0].instance_id, id);
+        assert!(visible[0].acknowledged);
+    }
+
+    #[test]
+    fn incomplete_family_does_not_prevent_unrelated_resolution() {
+        let mut cpu = test_alert(90.0);
+        cpu.rule_id = "cpu-high".into();
+        cpu.metric = AlertMetric::CpuLoadPercent;
+        cpu.source = "system".into();
+        let (instances, _) = reconcile_instances(&[], vec![test_alert(1.0), cpu], |_| true);
+
+        let (preserved, visible) = reconcile_instances(&instances, Vec::new(), |alert| {
+            alert.metric != AlertMetric::SmartAttribute
+        });
+
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(visible[0].source, "/dev/sda#5");
+    }
+
+    #[test]
+    fn incomplete_resource_does_not_prevent_peer_resolution() {
+        let mut other_disk = test_alert(2.0);
+        other_disk.source = "/dev/sdb#5".into();
+        let (instances, _) = reconcile_instances(&[], vec![test_alert(1.0), other_disk], |_| true);
+
+        let (preserved, visible) = reconcile_instances(&instances, Vec::new(), |alert| {
+            !alert.source.starts_with("/dev/sda#")
+        });
+
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(visible[0].source, "/dev/sda#5");
+    }
+
+    #[test]
+    fn persisted_acknowledgement_survives_reload() {
+        let (mut instances, occurrences) =
+            reconcile_instances(&[], vec![test_alert(1.0)], |_| true);
+        mark_acknowledged(&mut instances, &occurrences[0].instance_id, "alice", "now").unwrap();
+        let state = AlertState {
+            rules: Vec::new(),
+            active_instances: instances,
+            dirty: false,
+        };
+
+        let loaded: AlertState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        let (_, visible) =
+            reconcile_instances(&loaded.active_instances, vec![test_alert(2.0)], |_| true);
+
+        assert!(visible[0].acknowledged);
+        assert_eq!(visible[0].acknowledged_by.as_deref(), Some("alice"));
+    }
 
     // ── reconcile stall sampling (#487) ────────────────────────
 

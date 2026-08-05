@@ -185,6 +185,7 @@ fn is_operator_allowed(method: &str) -> bool {
                 // was listening. Same coupling as share CRUD.
                 | "service.protocol.enable"
                 | "service.protocol.disable"
+                | "alert.acknowledge"
                 // VM disk-image import. Operator already has
                 // `vm.create` etc.; without import they can't
                 // populate the disk to boot from.
@@ -382,7 +383,7 @@ fn collection_for_method(method: &str) -> Option<&'static str> {
         m if m.starts_with("system.tuning.") && !is_read_only(m) => Some("tuning"),
         m if m.starts_with("system.nut.") && !is_read_only(m) => Some("nut"),
         m if m.starts_with("system.tailscale.") && !is_read_only(m) => Some("tailscale"),
-        m if m.starts_with("alert.rules.") && !is_read_only(m) => Some("alert"),
+        m if m.starts_with("alert.") && !is_read_only(m) => Some("alert"),
         _ => None,
     }
 }
@@ -1175,7 +1176,88 @@ pub(super) async fn vm_clone(
 /// silence everything else.
 pub(crate) async fn evaluate_active_alerts(
     state: &AppState,
-) -> Vec<nasty_system::alerts::ActiveAlert> {
+) -> (Vec<nasty_system::alerts::AlertOccurrence>, u64) {
+    let _guard = state.alerts.lock_evaluation().await;
+    let alerts = evaluate_active_alerts_inner(state).await;
+    (alerts, state.alerts.revision())
+}
+
+pub(crate) async fn acknowledge_active_alert(
+    state: &AppState,
+    instance_id: &str,
+    username: &str,
+) -> Result<nasty_system::alerts::AlertAcknowledgement, String> {
+    let _guard = state.alerts.lock_evaluation().await;
+    let active = evaluate_active_alerts_inner(state).await;
+    if !active.iter().any(|alert| alert.instance_id == instance_id) {
+        return Err("alert is no longer active".into());
+    }
+    state.alerts.acknowledge(instance_id, username).await
+}
+
+#[derive(Default)]
+struct AlertCoverage {
+    unavailable_metrics: std::collections::HashSet<nasty_system::alerts::AlertMetric>,
+    unavailable_sources: std::collections::HashSet<(nasty_system::alerts::AlertMetric, String)>,
+    observed_smart_attributes: std::collections::HashMap<String, std::collections::HashSet<u32>>,
+}
+
+impl AlertCoverage {
+    fn mark_metric(&mut self, metric: nasty_system::alerts::AlertMetric) {
+        self.unavailable_metrics.insert(metric);
+    }
+
+    fn mark_source(
+        &mut self,
+        metric: nasty_system::alerts::AlertMetric,
+        source: impl Into<String>,
+    ) {
+        self.unavailable_sources.insert((metric, source.into()));
+    }
+
+    fn observe_smart_attributes(
+        &mut self,
+        source: String,
+        attribute_ids: impl Iterator<Item = u32>,
+    ) {
+        self.observed_smart_attributes
+            .insert(source, attribute_ids.collect());
+    }
+
+    fn is_observed(&self, alert: &nasty_system::alerts::ActiveAlert) -> bool {
+        if self.unavailable_metrics.contains(&alert.metric) {
+            return false;
+        }
+        let source = if alert.metric == nasty_system::alerts::AlertMetric::SmartAttribute {
+            alert
+                .source
+                .rsplit_once('#')
+                .map_or(alert.source.as_str(), |(device, _)| device)
+        } else {
+            &alert.source
+        };
+        if self
+            .unavailable_sources
+            .contains(&(alert.metric.clone(), source.to_string()))
+        {
+            return false;
+        }
+        if alert.metric == nasty_system::alerts::AlertMetric::SmartAttribute
+            && let Some(observed) = self.observed_smart_attributes.get(source)
+        {
+            return alert
+                .source
+                .rsplit_once('#')
+                .and_then(|(_, id)| id.parse().ok())
+                .is_some_and(|id| observed.contains(&id));
+        }
+        true
+    }
+}
+
+pub(crate) async fn evaluate_active_alerts_inner(
+    state: &AppState,
+) -> Vec<nasty_system::alerts::AlertOccurrence> {
     use nasty_system::alerts;
 
     // System stats — required for CPU/memory/temp rules. If the metrics
@@ -1188,13 +1270,26 @@ pub(crate) async fn evaluate_active_alerts(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("alert evaluation: stats fetch failed: {e}");
-                return Vec::new();
+                return state.alerts.reconcile_active(Vec::new(), |_| false).await;
             }
         };
+
+    let mut coverage = AlertCoverage::default();
 
     let filesystems = match state.filesystems.list().await {
         Ok(v) => v,
         Err(e) => {
+            for metric in [
+                alerts::AlertMetric::FsUsagePercent,
+                alerts::AlertMetric::BcachefsDegraded,
+                alerts::AlertMetric::BcachefsDeviceError,
+                alerts::AlertMetric::BcachefsDeviceState,
+                alerts::AlertMetric::BcachefsIOErrors,
+                alerts::AlertMetric::BcachefsScrubErrors,
+                alerts::AlertMetric::BcachefsReconcileStalled,
+            ] {
+                coverage.mark_metric(metric);
+            }
             tracing::warn!(
                 "alert evaluation: filesystems.list() failed: {e} — \
                  fs-level alerts will be skipped this cycle"
@@ -1207,12 +1302,49 @@ pub(crate) async fn evaluate_active_alerts(
         .is_enabled(nasty_system::protocol::Protocol::Smart)
         .await
     {
-        fetch_metrics_json(&state.metrics_client, "/api/disks")
-            .await
-            .unwrap_or_default()
+        match fetch_metrics_json(&state.metrics_client, "/api/disks").await {
+            Ok(disks) => disks,
+            Err(e) => {
+                for metric in [
+                    alerts::AlertMetric::DiskTemperature,
+                    alerts::AlertMetric::SmartHealth,
+                    alerts::AlertMetric::SmartAttribute,
+                ] {
+                    coverage.mark_metric(metric);
+                }
+                tracing::warn!(
+                    "alert evaluation: disk metrics fetch failed: {e} — \
+                     SMART alerts will retain their last known state"
+                );
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
+
+    for disk in &disk_health {
+        let label = match &disk.transport {
+            Some(transport) => format!("{} [{}]", disk.device, transport),
+            None => disk.device.clone(),
+        };
+        if disk.temperature_c.is_none() {
+            coverage.mark_source(alerts::AlertMetric::DiskTemperature, label.clone());
+        }
+        if disk.smart_status == "UNAVAILABLE" {
+            coverage.mark_source(alerts::AlertMetric::SmartHealth, label.clone());
+            coverage.mark_source(alerts::AlertMetric::SmartAttribute, label);
+        } else if disk.rotational.is_none()
+            || (disk.rotational == Some(true) && disk.attributes.is_empty())
+        {
+            coverage.mark_source(alerts::AlertMetric::SmartAttribute, label);
+        } else if disk.rotational == Some(true) {
+            coverage.observe_smart_attributes(
+                label,
+                disk.attributes.iter().map(|attribute| attribute.id),
+            );
+        }
+    }
 
     let fs_usage_list: Vec<alerts::FsUsage> = filesystems
         .iter()
@@ -1271,6 +1403,13 @@ pub(crate) async fn evaluate_active_alerts(
                 fs_service.scrub_status(&fs.name),
                 fs_service.reconcile_status(&fs.name),
             );
+            let mut unavailable = Vec::new();
+            if !io_error_count.1 {
+                unavailable.push(alerts::AlertMetric::BcachefsIOErrors);
+            }
+            if scrub_result.is_err() {
+                unavailable.push(alerts::AlertMetric::BcachefsScrubErrors);
+            }
 
             let scrub_errors = match scrub_result {
                 Ok(s) => s.raw.to_lowercase().contains("error"),
@@ -1287,36 +1426,72 @@ pub(crate) async fn evaluate_active_alerts(
                     } else {
                         ReconcileProgressSample::Unavailable
                     };
+                    if sample.pending.is_some()
+                        && !sample.active
+                        && progress == ReconcileProgressSample::Unavailable
+                    {
+                        unavailable.push(alerts::AlertMetric::BcachefsReconcileStalled);
+                    }
                     reconcile_stall_check(&fs.name, &sample, progress)
                 }
-                Ok(_) | Err(_) => {
+                Ok(_) => {
+                    clear_reconcile_tracker(&fs.name);
+                    false
+                }
+                Err(_) => {
+                    unavailable.push(alerts::AlertMetric::BcachefsReconcileStalled);
                     clear_reconcile_tracker(&fs.name);
                     false
                 }
             };
 
-            alerts::BcachefsHealth {
-                fs_name: fs.name.clone(),
-                degraded,
-                devices,
-                io_error_count,
-                scrub_errors,
-                reconcile_stalled,
-            }
+            (
+                alerts::BcachefsHealth {
+                    fs_name: fs.name.clone(),
+                    degraded,
+                    devices,
+                    io_error_count: io_error_count.0,
+                    scrub_errors,
+                    reconcile_stalled,
+                },
+                unavailable,
+            )
         });
     }
     let mut bcachefs_health = Vec::new();
     while let Some(result) = health_tasks.join_next().await {
-        if let Ok(health) = result {
+        if let Ok((health, unavailable)) = result {
+            for metric in unavailable {
+                coverage.mark_source(metric, health.fs_name.clone());
+            }
             bcachefs_health.push(health);
+        } else {
+            for metric in [
+                alerts::AlertMetric::BcachefsDegraded,
+                alerts::AlertMetric::BcachefsDeviceError,
+                alerts::AlertMetric::BcachefsDeviceState,
+                alerts::AlertMetric::BcachefsIOErrors,
+                alerts::AlertMetric::BcachefsScrubErrors,
+                alerts::AlertMetric::BcachefsReconcileStalled,
+            ] {
+                coverage.mark_metric(metric);
+            }
         }
     }
 
     // Kernel error counters from the metrics service.
     let kernel_summary: nasty_common::metrics_types::KernelErrorSummary =
-        fetch_metrics_json(&state.metrics_client, "/api/kernel_errors")
-            .await
-            .unwrap_or_default();
+        match fetch_metrics_json(&state.metrics_client, "/api/kernel_errors").await {
+            Ok(summary) => summary,
+            Err(e) => {
+                coverage.mark_metric(alerts::AlertMetric::KernelErrors);
+                tracing::warn!(
+                    "alert evaluation: kernel metrics fetch failed: {e} — \
+                     kernel alerts will retain their last known state"
+                );
+                Default::default()
+            }
+        };
     let kernel_alert = alerts::KernelErrorAlert {
         total_count: kernel_summary.total_count,
         categories: kernel_summary
@@ -1326,7 +1501,7 @@ pub(crate) async fn evaluate_active_alerts(
             .collect(),
     };
 
-    let mut active = state
+    let (mut active, unavailable_disk_metrics) = state
         .alerts
         .evaluate(
             &stats,
@@ -1336,6 +1511,9 @@ pub(crate) async fn evaluate_active_alerts(
             &kernel_alert,
         )
         .await;
+    for metric in unavailable_disk_metrics {
+        coverage.mark_metric(metric);
+    }
 
     // Mount failures recorded at boot stay live until the engine is
     // restarted. Enrich the alert with current state: a locked
@@ -1349,6 +1527,9 @@ pub(crate) async fn evaluate_active_alerts(
         let current_fses = match state.filesystems.list().await {
             Ok(v) => v,
             Err(e) => {
+                for name in mount_failures.iter() {
+                    coverage.mark_source(alerts::AlertMetric::BcachefsDegraded, name.clone());
+                }
                 tracing::warn!(
                     "mount-failure alert enrichment: filesystems.list() failed: {e} — \
                      using empty fs set, alerts may show stale state"
@@ -1388,8 +1569,12 @@ pub(crate) async fn evaluate_active_alerts(
             });
         }
     }
+    drop(mount_failures);
 
-    active
+    state
+        .alerts
+        .reconcile_active(active, |alert| coverage.is_observed(alert))
+        .await
 }
 
 /// How long reconcile must have pending work with no pending-counter or
@@ -1556,28 +1741,55 @@ fn clear_reconcile_tracker(fs_name: &str) {
     RECONCILE_STALL_TRACKER.lock().unwrap().remove(fs_name);
 }
 
-/// Read bcachefs error counters from sysfs. Returns total read+write error count.
-pub(super) async fn read_bcachefs_error_count(uuid: &str) -> u64 {
+/// Read bcachefs error counters from sysfs. The completeness flag prevents a
+/// partial zero from resolving an alert while retaining any confirmed errors.
+pub(super) async fn read_bcachefs_error_count(uuid: &str) -> (u64, bool) {
     let counters_dir = format!("/sys/fs/bcachefs/{uuid}/counters");
     let mut total = 0u64;
+    let mut complete = true;
     for name in ["io_read_errors", "io_write_errors", "io_checksum_errors"] {
         let path = format!("{counters_dir}/{name}");
-        if let Ok(val) = tokio::fs::read_to_string(&path).await
-            && let Ok(n) = val.trim().parse::<u64>()
-        {
-            total += n;
+        match tokio::fs::read_to_string(&path).await {
+            Ok(value) => match value.trim().parse::<u64>() {
+                Ok(value) => total += value,
+                Err(_) => complete = false,
+            },
+            Err(_) => complete = false,
         }
     }
-    total
+    (total, complete)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ReconcileProgress, ReconcileProgressSample, clear_reconcile_tracker, is_operator_allowed,
-        is_read_only, is_universally_allowed, is_user_allowed, reconcile_progress,
-        reconcile_stall_check_at,
+        AlertCoverage, ReconcileProgress, ReconcileProgressSample, clear_reconcile_tracker,
+        is_operator_allowed, is_read_only, is_universally_allowed, is_user_allowed,
+        reconcile_progress, reconcile_stall_check_at,
     };
+
+    fn smart_attribute_alert(source: &str) -> nasty_system::alerts::ActiveAlert {
+        nasty_system::alerts::ActiveAlert {
+            rule_id: "smart-attribute".into(),
+            rule_name: "SMART attribute warning".into(),
+            severity: nasty_system::alerts::AlertSeverity::Warning,
+            metric: nasty_system::alerts::AlertMetric::SmartAttribute,
+            message: "SMART attribute is non-zero".into(),
+            current_value: 1.0,
+            threshold: 0.0,
+            source: source.into(),
+        }
+    }
+
+    #[test]
+    fn smart_attribute_resolution_requires_the_specific_attribute() {
+        let mut coverage = AlertCoverage::default();
+        coverage.observe_smart_attributes("/dev/sda".into(), [5, 197].into_iter());
+
+        assert!(coverage.is_observed(&smart_attribute_alert("/dev/sda#5")));
+        assert!(!coverage.is_observed(&smart_attribute_alert("/dev/sda#198")));
+        assert!(coverage.is_observed(&smart_attribute_alert("/dev/sdb#198")));
+    }
 
     #[test]
     fn reconcile_progress_uses_only_reconcile_movement_counters() {

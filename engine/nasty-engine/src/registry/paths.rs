@@ -186,6 +186,7 @@ mod tests {
         assert_eq!(translate("auth.logout").0, HttpVerb::Post);
         assert_eq!(translate("system.update.apply").0, HttpVerb::Post);
         assert_eq!(translate("system.update.rollback").0, HttpVerb::Post);
+        assert_eq!(translate("alert.acknowledge").0, HttpVerb::Post);
         assert_eq!(
             translate("system.version.upgrade_tagged_release").0,
             HttpVerb::Post

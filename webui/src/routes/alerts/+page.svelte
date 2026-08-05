@@ -5,7 +5,7 @@
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
 	import { tempUnit, cToF, tempUnitLabel } from '$lib/temperature.svelte';
-	import type { AlertRule, ActiveAlert, AlertMetric, AlertCondition, AlertSeverity } from '$lib/types';
+	import type { AlertRule, ActiveAlert, AlertAcknowledgement, AlertMetric, AlertCondition, AlertSeverity, AuthMe, UserRole } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
@@ -17,6 +17,11 @@
 	let activeAlerts: ActiveAlert[] = $state([]);
 	let loading = $state(true);
 	let showCreate = $state(false);
+	let role = $state<UserRole>('readonly');
+	let acknowledging = $state<string | null>(null);
+	let refreshTimer: ReturnType<typeof setInterval> | undefined;
+	const canAcknowledge = $derived(role === 'admin' || role === 'operator');
+	const canManageRules = $derived(role === 'admin');
 
 	let newName = $state('');
 	let createTried = $state(false);
@@ -37,6 +42,7 @@
 		memory_usage_percent: 'Memory Usage (%)',
 		disk_temperature: `Disk Temperature (${tempUnitLabel(tempUnit.current)})`,
 		smart_health: 'SMART Health Failure',
+		smart_attribute: 'SMART Critical Attribute',
 		swap_usage_percent: 'Swap Usage (%)',
 		bcachefs_degraded: 'bcachefs Degraded Mode',
 		bcachefs_device_error: 'bcachefs Device Errors',
@@ -88,17 +94,58 @@
 		client.onEvent(handleEvent);
 		await refresh();
 		loading = false;
+		refreshTimer = setInterval(refreshActiveAlerts, 15_000);
 	});
 
-	onDestroy(() => client.offEvent(handleEvent));
+	onDestroy(() => {
+		client.offEvent(handleEvent);
+		if (refreshTimer) clearInterval(refreshTimer);
+	});
 
 	async function refresh() {
 		await withToast(async () => {
-			[rules, activeAlerts] = await Promise.all([
+			const [nextRules, nextAlerts, me] = await Promise.all([
 				client.call<AlertRule[]>('alert.rules.list'),
 				client.call<ActiveAlert[]>('system.alerts'),
+				client.call<AuthMe>('auth.me'),
 			]);
+			rules = nextRules;
+			activeAlerts = nextAlerts;
+			role = me.role;
 		});
+	}
+
+	async function refreshActiveAlerts() {
+		try {
+			activeAlerts = await client.call<ActiveAlert[]>('system.alerts');
+		} catch {
+			// Keep the last known rows during a transient polling failure.
+		}
+	}
+
+	async function acknowledgeAlert(alert: ActiveAlert) {
+		if (!await confirm(
+			'Acknowledge this alert?',
+			'This occurrence will be hidden until its condition clears. A later recurrence will alert again.',
+			{ confirmLabel: 'Acknowledge' }
+		)) return;
+
+		acknowledging = alert.instance_id;
+		try {
+			const acknowledged = await withToast(
+				() => client.call<AlertAcknowledgement>('alert.acknowledge', {
+					instance_id: alert.instance_id,
+				}),
+				'Alert acknowledged'
+			);
+			if (acknowledged !== undefined) {
+				activeAlerts = activeAlerts.filter((item) => item.instance_id !== alert.instance_id);
+			} else {
+				await refreshActiveAlerts();
+			}
+		} finally {
+			acknowledging = null;
+		}
 	}
 
 	async function createRule() {
@@ -154,7 +201,10 @@
 {#if activeAlerts.length > 0}
 	<div class="mb-6">
 		<h2 class="mb-3 text-base font-semibold">Active Alerts ({activeAlerts.length})</h2>
-		{#each activeAlerts as alert}
+		<p class="mb-3 text-sm text-muted-foreground">
+			Active alerts are conditions that currently match and have not been acknowledged.
+		</p>
+		{#each activeAlerts as alert (alert.instance_id)}
 			<div class="mb-2 flex items-center gap-3 rounded-lg border px-4 py-2.5 text-sm {
 				alert.severity === 'critical' ? 'border-red-800 bg-red-950 text-red-200' : 'border-amber-800 bg-amber-950 text-amber-200'
 			}">
@@ -163,6 +213,16 @@
 				}">{alert.severity}</span>
 				<span class="flex-1">{alert.message}</span>
 				<span class="font-mono text-xs opacity-70">{alert.source}</span>
+				{#if canAcknowledge}
+					<Button
+						variant="secondary"
+						size="xs"
+						disabled={acknowledging === alert.instance_id}
+						onclick={() => acknowledgeAlert(alert)}
+					>
+						{acknowledging === alert.instance_id ? 'Acknowledging...' : 'Acknowledge'}
+					</Button>
+				{/if}
 			</div>
 		{/each}
 	</div>
@@ -172,11 +232,13 @@
 	</div>
 {/if}
 
-<div class="mb-4 flex items-center gap-3">
-	<Button size="sm" onclick={() => showCreate = !showCreate}>
-		{showCreate ? 'Cancel' : 'Create Rule'}
-	</Button>
-</div>
+{#if canManageRules}
+	<div class="mb-4 flex items-center gap-3">
+		<Button size="sm" onclick={() => showCreate = !showCreate}>
+			{showCreate ? 'Cancel' : 'Create Rule'}
+		</Button>
+	</div>
+{/if}
 
 {#if showCreate}
 	<Card class="mb-6 max-w-lg">
@@ -258,12 +320,16 @@
 						</Badge>
 					</td>
 					<td class="p-3">
-						<div class="flex gap-2">
-							<Button variant="secondary" size="xs" onclick={() => toggleRule(rule)}>
-								{rule.enabled ? 'Disable' : 'Enable'}
-							</Button>
-							<Button variant="destructive" size="xs" onclick={() => deleteRule(rule.id)}>Delete</Button>
-						</div>
+						{#if canManageRules}
+							<div class="flex gap-2">
+								<Button variant="secondary" size="xs" onclick={() => toggleRule(rule)}>
+									{rule.enabled ? 'Disable' : 'Enable'}
+								</Button>
+								<Button variant="destructive" size="xs" onclick={() => deleteRule(rule.id)}>Delete</Button>
+							</div>
+						{:else}
+							<span class="text-muted-foreground">—</span>
+						{/if}
 					</td>
 				</tr>
 			{/each}

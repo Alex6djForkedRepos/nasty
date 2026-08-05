@@ -35,12 +35,32 @@ pub(super) async fn try_route(
                 }
             }
 
-            let alerts = evaluate_active_alerts(state).await;
+            let (evaluated, revision) = evaluate_active_alerts(state).await;
+            let alerts: Vec<_> = evaluated
+                .into_iter()
+                .filter(|alert| !alert.acknowledged)
+                .collect();
             let value = serde_json::to_value(&alerts).unwrap_or_default();
-            *state.alerts_cache.lock().await = Some((std::time::Instant::now(), value));
+            let mut cache = state.alerts_cache.lock().await;
+            if revision == state.alerts.revision() {
+                *cache = Some((std::time::Instant::now(), value));
+            }
 
             ok(req, alerts)
         }
+        "alert.acknowledge" => match require_str(req, "instance_id") {
+            Ok(instance_id) => {
+                match acknowledge_active_alert(state, instance_id, &session.username).await {
+                    Ok(acknowledgement) => {
+                        *state.alerts_cache.lock().await = None;
+                        *state.status_cache.lock().await = None;
+                        ok(req, acknowledgement)
+                    }
+                    Err(e) => err(req, e),
+                }
+            }
+            Err(r) => r,
+        },
         "alert.rules.list" => ok(req, state.alerts.list_rules().await),
         "alert.rules.create" => match parse_params(req) {
             Ok(rule) => match state.alerts.create_rule(rule).await {
