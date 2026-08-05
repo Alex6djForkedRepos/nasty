@@ -4588,7 +4588,7 @@ enum AlertLifecycle {
 /// systems can close the same incident they opened).
 async fn dispatch_alert_event(
     config: &nasty_system::notifications::NotificationConfig,
-    alert: &nasty_system::alerts::ActiveAlert,
+    alert: &nasty_system::alerts::AlertOccurrence,
     lifecycle: AlertLifecycle,
 ) {
     use nasty_system::notifications;
@@ -4609,14 +4609,9 @@ async fn dispatch_alert_event(
         "{}\n\nSource: {}\nValue: {:.1}\nThreshold: {:.1}{}",
         alert.message, alert.source, alert.current_value, alert.threshold, body_suffix
     );
-    // Stable event id derived from rule + source + the value the
-    // alert had when it fired. Crucially the resolved event reuses
-    // the same id (we use the original alert's current_value, not
-    // whatever the metric reads now) so receivers can pair the two.
-    let event_id = format!(
-        "alert-{}-{}-{}",
-        alert.rule_id, alert.source, alert.current_value as i64
-    );
+    // The persisted occurrence ID remains stable as values change and is
+    // replaced when a resolved condition later fires again.
+    let event_id = format!("alert-{}", alert.instance_id);
     let mut data = serde_json::to_value(alert).unwrap_or(serde_json::Value::Null);
     // Embed lifecycle in `data.lifecycle` too — some receivers route
     // on a single nested field rather than the top-level event_type.
@@ -4644,11 +4639,11 @@ async fn dispatch_alert_event(
 
 fn spawn_alert_notifier(state: Arc<AppState>) {
     let h = tokio::spawn(async move {
-        use nasty_system::alerts::ActiveAlert;
+        use nasty_system::alerts::AlertOccurrence;
         use nasty_system::notifications;
         use std::collections::HashMap;
 
-        // Keyed map (rule_id, source) → the ActiveAlert as it was when
+        // Keyed map instance ID → the alert occurrence as it was when
         // we first dispatched the alert.fired event. We keep the whole
         // alert (not just the key) so when the alert resolves we can
         // emit alert.resolved carrying the same payload — receivers
@@ -4659,7 +4654,7 @@ fn spawn_alert_notifier(state: Arc<AppState>) {
         // event. Persisting outbox state across restarts is out of
         // scope; the same limitation already applies to fired events
         // (currently-active alerts re-fire after a restart).
-        let mut previously_active: HashMap<(String, String), ActiveAlert> = HashMap::new();
+        let mut notified_active: HashMap<String, AlertOccurrence> = HashMap::new();
 
         // Wait for the metrics service and the rest of the system to come up
         // before the first evaluation; first-boot stats are noisy.
@@ -4673,51 +4668,70 @@ fn spawn_alert_notifier(state: Arc<AppState>) {
             // the notifier silently skipped every cycle when no admin had a
             // browser open. A drive failing at 3am went unalerted until someone
             // opened the dashboard the next morning.
-            let active = crate::router::evaluate_active_alerts(&state).await;
+            let (active, alert_revision) = crate::router::evaluate_active_alerts(&state).await;
 
             // Refresh the RPC cache as a side effect so the next WebUI poll
             // returns instantly with up-to-date data.
-            if let Ok(value) = serde_json::to_value(&active) {
-                *state.alerts_cache.lock().await = Some((std::time::Instant::now(), value));
+            let visible: Vec<_> = active.iter().filter(|alert| !alert.acknowledged).collect();
+            if let Ok(value) = serde_json::to_value(&visible) {
+                let mut cache = state.alerts_cache.lock().await;
+                if alert_revision == state.alerts.revision() {
+                    *cache = Some((std::time::Instant::now(), value));
+                }
             }
 
-            let current: HashMap<(String, String), ActiveAlert> = active
+            let current: HashMap<String, AlertOccurrence> = active
                 .iter()
-                .map(|a| ((a.rule_id.clone(), a.source.clone()), a.clone()))
+                .map(|alert| (alert.instance_id.clone(), alert.clone()))
                 .collect();
 
-            // Newly-fired = in `current` but not in `previously_active`.
-            let new_alerts: Vec<&ActiveAlert> = current
-                .iter()
-                .filter(|(k, _)| !previously_active.contains_key(k))
-                .map(|(_, a)| a)
+            // Only track incidents for which alert.fired was actually sent.
+            // Acknowledged occurrences and cycles with no enabled channel must
+            // not later emit an orphan alert.resolved event.
+            let new_alerts: Vec<AlertOccurrence> = current
+                .values()
+                .filter(|alert| {
+                    !alert.acknowledged && !notified_active.contains_key(&alert.instance_id)
+                })
+                .cloned()
                 .collect();
 
-            // Resolved = in `previously_active` but not in `current`.
+            // Resolved = previously notified but no longer active.
             // Emit with the original alert payload so the receiver
             // sees the same `source`, `rule_id`, etc. it opened the
             // incident with — typical pattern for monitoring systems
             // (PagerDuty / Opsgenie / Alertmanager) that key incident
             // close events on the original payload.
-            let resolved_alerts: Vec<&ActiveAlert> = previously_active
-                .iter()
-                .filter(|(k, _)| !current.contains_key(k))
-                .map(|(_, a)| a)
+            let resolved_alerts: Vec<AlertOccurrence> = notified_active
+                .values()
+                .filter(|alert| !current.contains_key(&alert.instance_id))
+                .cloned()
                 .collect();
 
             if !new_alerts.is_empty() || !resolved_alerts.is_empty() {
                 let config = notifications::NotificationConfig::load();
-                if config.channels.iter().any(|ch| ch.enabled) {
+                let notifications_enabled = config.channels.iter().any(|ch| ch.enabled);
+                let mut fired = Vec::new();
+                if notifications_enabled {
                     for alert in &new_alerts {
-                        dispatch_alert_event(&config, alert, AlertLifecycle::Fired).await;
+                        if state
+                            .alerts
+                            .is_active_unacknowledged(&alert.instance_id)
+                            .await
+                        {
+                            dispatch_alert_event(&config, alert, AlertLifecycle::Fired).await;
+                            fired.push(alert.clone());
+                        }
                     }
                     for alert in &resolved_alerts {
                         dispatch_alert_event(&config, alert, AlertLifecycle::Resolved).await;
                     }
                 }
+                notified_active.retain(|id, _| current.contains_key(id));
+                for alert in fired {
+                    notified_active.insert(alert.instance_id.clone(), alert);
+                }
             }
-
-            previously_active = current;
         }
     });
     // Observer spawn — alert evaluation is supposed to run forever; if

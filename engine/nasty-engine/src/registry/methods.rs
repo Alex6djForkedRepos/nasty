@@ -49,7 +49,7 @@ use nasty_storage::subvolume::{
     ResizeSubvolumeRequest, RollbackResult, RollbackSnapshotRequest, SetPropertiesRequest,
     Snapshot, Subvolume, UpdateSubvolumeRequest,
 };
-use nasty_system::alerts::{ActiveAlert, AlertRule, AlertRuleUpdate};
+use nasty_system::alerts::{AlertAcknowledgement, AlertOccurrence, AlertRule, AlertRuleUpdate};
 use nasty_system::dc::{DcPrincipal, DcStatus, DemoteRequest, ProvisionRequest};
 use nasty_system::domain::{DomainPrincipal, DomainStatus, JoinDomainRequest, LeaveDomainRequest};
 use nasty_system::firewall::FirewallStatus;
@@ -273,7 +273,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     desc: "Evaluate alert rules against current system state and return any active alerts.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
-                    result: Some(gen_schema::<Vec<ActiveAlert>>(generator)),
+                    result: Some(gen_schema::<Vec<AlertOccurrence>>(generator)),
                 },
                 Method {
                     name: "system.reboot",
@@ -459,6 +459,16 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
         (
             "Alert Rules",
             vec![
+                Method {
+                    name: "alert.acknowledge",
+                    desc: "Acknowledge one active alert occurrence until its condition resolves.",
+                    role: MethodRole::Operator,
+                    params: MethodParams::AdHoc(ad_hoc_one(
+                        "instance_id",
+                        "Opaque active alert occurrence identifier.",
+                    )),
+                    result: Some(gen_schema::<AlertAcknowledgement>(generator)),
+                },
                 Method {
                     name: "alert.rules.list",
                     desc: "List all alert rules.",
