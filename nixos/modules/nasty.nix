@@ -1,9 +1,12 @@
-args@{ config, lib, pkgs, nasty-engine ? null, nasty-webui ? null, nasty-version ? "dev", nasty-bcachefs-tools ? pkgs.bcachefs-tools, nasty-tailscale ? pkgs.tailscale, ... }:
+args@{ config, lib, pkgs, nasty-engine ? null, nasty-webui ? null, nasty-version ? "dev", nasty-bcachefs-tools ? pkgs.bcachefs-tools, ... }:
 
 let
   cfg = config.services.nasty;
   inherit (lib) mkEnableOption mkOption mkIf types;
   nastySystemFlakeSnapshot = args.nastySystemFlakeSnapshot or null;
+  # Old wrapper flakes do not pass this specialArg. Keep the fallback out of
+  # the module argument list so NixOS does not require it before defaults run.
+  nasty-tailscale = args.nasty-tailscale or pkgs.tailscale;
 
   # Boot-time fail-closed policy. The engine atomically replaces this table
   # with its complete dynamic rules before restoring network-facing services.
