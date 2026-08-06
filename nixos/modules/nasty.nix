@@ -1,4 +1,4 @@
-args@{ config, lib, pkgs, nasty-engine ? null, nasty-webui ? null, nasty-version ? "dev", nasty-bcachefs-tools ? pkgs.bcachefs-tools, ... }:
+args@{ config, lib, pkgs, nasty-engine ? null, nasty-webui ? null, nasty-version ? "dev", nasty-bcachefs-tools ? pkgs.bcachefs-tools, nasty-tailscale ? pkgs.tailscale, ... }:
 
 let
   cfg = config.services.nasty;
@@ -233,7 +233,15 @@ in {
     nut.enable = mkEnableOption "NUT (Network UPS Tools) for NASty";
 
     # VPN — not enabled by default (requires Tailscale auth key)
-    tailscale.enable = mkEnableOption "Tailscale VPN for NASty";
+    tailscale = {
+      enable = mkEnableOption "Tailscale VPN for NASty";
+      package = mkOption {
+        type = types.package;
+        default = nasty-tailscale;
+        defaultText = lib.literalExpression "nasty-tailscale";
+        description = "Tailscale package used by the CLI and engine-managed daemon";
+      };
+    };
 
     # ── Secure Boot (opt-in, per box) ──────────────────────────
     # Lanzaboote-backed UEFI Secure Boot. Off by default everywhere;
@@ -1534,7 +1542,7 @@ in {
       ++ lib.optionals cfg.iscsi.enable [ targetcli-fixed ]
       ++ lib.optionals cfg.nvmeof.enable [ nvme-cli ]
       ++ lib.optionals cfg.nut.enable [ pkgs.nut ]
-      ++ lib.optionals cfg.tailscale.enable [ tailscale ];
+      ++ lib.optionals cfg.tailscale.enable [ cfg.tailscale.package ];
 
     # ── State directory ────────────────────────────────────────
 
@@ -1724,7 +1732,7 @@ in {
         ++ lib.optionals cfg.iscsi.enable [ targetcli-fixed ]
         ++ lib.optionals cfg.nvmeof.enable [ nvme-cli ]
         ++ lib.optionals cfg.nut.enable [ pkgs.nut ]
-        ++ lib.optionals cfg.tailscale.enable [ tailscale ];
+        ++ lib.optionals cfg.tailscale.enable [ cfg.tailscale.package ];
 
       environment = {
         RUST_LOG = cfg.engine.logLevel;
@@ -2527,6 +2535,7 @@ in {
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = []; # Engine manages lifecycle via systemctl start/stop
+      stopIfChanged = false; # Keep the tailnet path up until activation restarts the daemon.
       # Same restart-cap rationale as nasty-engine — a corrupt
       # tailscaled.state file or an upstream API contract change
       # would otherwise tight-loop and burn CPU.
@@ -2535,7 +2544,7 @@ in {
         StartLimitBurst = 5;
       };
       serviceConfig = {
-        ExecStart = "${pkgs.tailscale}/bin/tailscaled --state=/var/lib/nasty/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock";
+        ExecStart = "${cfg.tailscale.package}/bin/tailscaled --state=/var/lib/nasty/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock";
         RuntimeDirectory = "tailscale";
         StateDirectory = "nasty/tailscale";
         Restart = "on-failure";

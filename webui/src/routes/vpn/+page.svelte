@@ -26,6 +26,10 @@
 	<div>
 		<h3 class="text-lg font-semibold mb-1">Tailscale VPN</h3>
 		<p class="text-sm text-muted-foreground">Connect your NASty to a Tailscale network for secure remote access.</p>
+		<p class="mt-2 text-xs text-muted-foreground">
+			Tailscale is managed by NixOS, so updates from the Tailscale admin console are not supported.
+			Refresh <a href="/update#version" class="underline">Tailscale package source</a> under System → Update → Upstream instead.
+		</p>
 	</div>
 
 	{#if !tsStatus}

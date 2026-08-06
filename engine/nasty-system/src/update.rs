@@ -44,7 +44,7 @@ const DEFAULT_NASTY_REF: &str = "main";
 /// would only invite false expectations. Same reasoning applies to
 /// the engine's `version_info` payload: returning a row for nixpkgs
 /// would imply operator agency that doesn't exist.
-const VERSION_INPUT_NAMES: [&str; 2] = ["bcachefs-tools", "nasty"];
+const VERSION_INPUT_NAMES: [&str; 3] = ["bcachefs-tools", "tailscale-nixpkgs", "nasty"];
 const SYSTEM_FLAKE_TEMPLATE_PATH: &str = "nixos/system-flake/flake.nix.template";
 
 /// Snapshot of the wrapper-flake template this engine binary was
@@ -334,9 +334,31 @@ test -n "$OLD_GENERATION"
 LIVE_MUTATED=false
 PROFILE_MUTATED=false
 MARKER_SET=false
+TAILSCALE_REQUIRED=false
+TAILSCALE_IP_BEFORE=""
 
 _proxy_conf() {
     readlink -f /run/current-system/etc/caddy/Caddyfile 2>/dev/null || true
+}
+
+tailscale_has_previous_ip() {
+    $TAILSCALE_REQUIRED || return 0
+    local status
+    systemctl is-active --quiet nasty-tailscale.service || return 1
+    status=$(tailscale --socket=/run/tailscale/tailscaled.sock status --json 2>/dev/null) || return 1
+    jq -e --arg ip "$TAILSCALE_IP_BEFORE" \
+        '.BackendState == "Running" and (.Self.TailscaleIPs // [] | index($ip) != null)' \
+        <<<"$status" >/dev/null 2>&1
+}
+
+wait_for_previous_tailscale() {
+    $TAILSCALE_REQUIRED || return 0
+    echo "==> Waiting for the previous Tailscale connection to recover..."
+    for _ in $(seq 1 60); do
+        tailscale_has_previous_ip && return 0
+        sleep 2
+    done
+    return 1
 }
 
 cleanup() {
@@ -382,6 +404,25 @@ rollback_transaction() {
 set -euo pipefail
 export PATH="/run/current-system/sw/bin:$PATH"
 NIXOS_INSTALL_BOOTLOADER=0 "$OLD_SYSTEM/bin/switch-to-configuration" switch
+if $TAILSCALE_REQUIRED; then
+    echo "==> Waiting for the previous Tailscale connection to recover..."
+    TAILSCALE_RESTORED=false
+    for _ in $(seq 1 60); do
+        TAILSCALE_STATUS=$(tailscale --socket=/run/tailscale/tailscaled.sock status --json 2>/dev/null || true)
+        if systemctl is-active --quiet nasty-tailscale.service \
+            && jq -e --arg ip "$TAILSCALE_IP_BEFORE" \
+                '.BackendState == "Running" and (.Self.TailscaleIPs // [] | index($ip) != null)' \
+                <<<"$TAILSCALE_STATUS" >/dev/null 2>&1; then
+            TAILSCALE_RESTORED=true
+            break
+        fi
+        sleep 2
+    done
+    if ! $TAILSCALE_RESTORED; then
+        echo "==> CRITICAL: previous Tailscale connection did not recover." >&2
+        exit 1
+    fi
+fi
 rm -f "$MARKER"
 rm -rf "$WORK_DIR"
 rm -f -- "$UPDATE_SCRIPT"
@@ -403,6 +444,8 @@ SIGNAL_ROLLBACK_EOF
                     --setenv "MARKER=$MARKER" \
                     --setenv "WORK_DIR=$WORK_DIR" \
                     --setenv "UPDATE_SCRIPT=$0" \
+                    --setenv "TAILSCALE_REQUIRED=$TAILSCALE_REQUIRED" \
+                    --setenv "TAILSCALE_IP_BEFORE=$TAILSCALE_IP_BEFORE" \
                     -- bash "$SIGNAL_ROLLBACK"; then
                     detached_started=true
                 else
@@ -412,6 +455,9 @@ SIGNAL_ROLLBACK_EOF
         else
             NIXOS_INSTALL_BOOTLOADER=0 "$OLD_SYSTEM/bin/switch-to-configuration" switch \
                 || rollback_ok=false
+            if $rollback_ok && ! wait_for_previous_tailscale; then
+                rollback_ok=false
+            fi
         fi
     fi
     if $MARKER_SET && $rollback_ok && ! $detached_started; then
@@ -452,6 +498,24 @@ printf '%s' '@CANDIDATE@' | base64 -d > "$STAGE/flake.nix"
 
 _PROXY_CONF_BEFORE=$(_proxy_conf)
 WEBUI_BEFORE=$([ -n "$_PROXY_CONF_BEFORE" ] && grep 'nasty-webui' "$_PROXY_CONF_BEFORE" 2>/dev/null | head -1 || true)
+if systemctl is-active --quiet nasty-tailscale.service; then
+    TAILSCALE_STATUS_BEFORE=""
+    for _ in $(seq 1 5); do
+        if TAILSCALE_STATUS_BEFORE=$(tailscale --socket=/run/tailscale/tailscaled.sock status --json 2>/dev/null); then
+            break
+        fi
+        sleep 1
+    done
+    # An active daemon with unreadable state is indeterminate, not disconnected.
+    # Abort before mutating the live generation rather than risking remote lockout.
+    jq -e 'type == "object" and (.BackendState | type == "string")' \
+        <<<"$TAILSCALE_STATUS_BEFORE" >/dev/null
+    if jq -e '.BackendState == "Running"' <<<"$TAILSCALE_STATUS_BEFORE" >/dev/null 2>&1; then
+        TAILSCALE_IP_BEFORE=$(jq -r '.Self.TailscaleIPs[0] // empty' <<<"$TAILSCALE_STATUS_BEFORE")
+        test -n "$TAILSCALE_IP_BEFORE"
+        TAILSCALE_REQUIRED=true
+    fi
+fi
 echo "false" > @WEBUI_CHANGED@
 
 @BD_SETUP@
@@ -498,9 +562,9 @@ echo "==> Activating verified system closure..."
 NIXOS_INSTALL_BOOTLOADER=0 "$RESULT/bin/switch-to-configuration" switch
 
 if [ -n "$EXPECTED_COMMIT" ]; then
-    echo "==> Waiting for the engine and Caddy to serve commit $EXPECTED_COMMIT..."
+    echo "==> Waiting for the engine, Caddy, and active Tailscale connection to serve commit $EXPECTED_COMMIT..."
 else
-    echo "==> Waiting for the engine and Caddy to become healthy..."
+    echo "==> Waiting for the engine, Caddy, and active Tailscale connection to become healthy..."
 fi
 HEALTHY=false
 for _ in $(seq 1 60); do
@@ -514,9 +578,12 @@ for _ in $(seq 1 60); do
             CADDY_OK=false
         fi
     fi
+    TAILSCALE_OK=true
+    tailscale_has_previous_ip || TAILSCALE_OK=false
     if systemctl is-active --quiet nasty-engine.service \
         && jq -e --arg commit "$EXPECTED_COMMIT" '.status == "ok" and ($commit == "" or .commit == $commit)' <<<"$ENGINE_HEALTH" >/dev/null 2>&1 \
-        && $CADDY_OK; then
+        && $CADDY_OK \
+        && $TAILSCALE_OK; then
         HEALTHY=true
         break
     fi
@@ -833,8 +900,8 @@ impl UpdateService {
     /// Read the exact upstream input URLs and locked revs from the live
     /// `/etc/nixos` flake on the installed system.
     ///
-    /// Only the inputs the operator can edit are returned: `nasty`
-    /// and `bcachefs-tools`. nixpkgs is excluded — it always follows
+    /// Only the inputs the operator can edit are returned: `nasty`,
+    /// `bcachefs-tools`, and `tailscale-nixpkgs`. System nixpkgs is excluded — it always follows
     /// nasty (canonical 0.0.9 shape), so there's no operator-facing
     /// choice to surface; including it would imply agency that
     /// doesn't exist.
@@ -862,6 +929,9 @@ impl UpdateService {
                     return Err(UpdateError::CommandFailed(format!(
                         "missing nasty.url in {NIXOS_FLAKE_DIR}/flake.nix"
                     )));
+                }
+                None if *name == *"tailscale-nixpkgs" => {
+                    embedded_default_input_url("tailscale-nixpkgs")?
                 }
                 None => format!("follows:nasty/{name}"),
             };
@@ -938,6 +1008,11 @@ impl UpdateService {
         }
 
         let (current_flake, wrapper_migrated) = self.wrapper_flake_candidate().await?;
+        let current_urls = flake_input_urls(&current_flake)?;
+        let tailscale_url = current_urls
+            .get("tailscale-nixpkgs")
+            .cloned()
+            .unwrap_or(embedded_default_input_url("tailscale-nixpkgs")?);
         let release_status = self.version_tagged_release_status().await?;
         if release_status.current_is_latest_standard_url && !wrapper_migrated {
             return Err(UpdateError::CommandFailed(
@@ -981,16 +1056,19 @@ impl UpdateService {
         } else {
             current_flake.clone()
         };
-        let next_flake = rewrite_flake_input_urls(
-            &next_flake,
-            &HashMap::from([
-                (String::from("nasty"), release_status.latest_url.clone()),
-                (
-                    String::from("bcachefs-tools"),
-                    format!("github:koverstreet/bcachefs-tools/{bcachefs_ref}"),
-                ),
-            ]),
-        )?;
+        let mut replacements = HashMap::from([
+            (String::from("nasty"), release_status.latest_url.clone()),
+            (
+                String::from("bcachefs-tools"),
+                format!("github:koverstreet/bcachefs-tools/{bcachefs_ref}"),
+            ),
+        ]);
+        // Deliberate downgrades to a pre-#744 release have no independent
+        // Tailscale input to preserve. Newer templates keep the operator pin.
+        if flake_input_urls(&next_flake)?.contains_key("tailscale-nixpkgs") {
+            replacements.insert(String::from("tailscale-nixpkgs"), tailscale_url);
+        }
+        let next_flake = rewrite_flake_input_urls(&next_flake, &replacements)?;
 
         // Best-effort cleanup of any prior unit state. `try_run` logs spawn
         // failures and non-zero exits at warn! — a missing-unit "exited 5"
@@ -1415,25 +1493,22 @@ impl UpdateService {
                 } else {
                     current_flake.clone()
                 };
-                // Preserve operator's existing bcachefs-tools pin
-                // across rebootstrap. Without this, a template-hash
-                // change (e.g., a maintainer-side bcachefs default
-                // bump) would silently overwrite the operator's
-                // custom pin with the template's new default. The
-                // request's bcachefs URL is what the operator
-                // actually wants (the WebUI populates it from
-                // version_info, which read the current wrapper);
-                // ensure it's in the rewrite map even when the
-                // request URL matches current state (so url_changes
-                // is empty for it).
+                // Preserve operator-owned package pins across rebootstrap.
+                // They must survive unrelated template changes and nasty
+                // release switches even when their URLs did not change.
                 let mut flake_replacements: HashMap<String, String> = url_changes
                     .iter()
                     .map(|(name, url)| (name.clone(), url.clone()))
                     .collect();
-                if let Some(bcachefs_input) = requested.get("bcachefs-tools") {
-                    flake_replacements
-                        .entry(String::from("bcachefs-tools"))
-                        .or_insert_with(|| bcachefs_input.url.clone());
+                let base_urls = flake_input_urls(&base)?;
+                for name in ["bcachefs-tools", "tailscale-nixpkgs"] {
+                    if base_urls.contains_key(name)
+                        && let Some(input) = requested.get(name)
+                    {
+                        flake_replacements
+                            .entry(name.to_string())
+                            .or_insert_with(|| input.url.clone());
+                    }
                 }
                 if flake_replacements.is_empty() {
                     base
@@ -2036,6 +2111,17 @@ pub(crate) fn embedded_default_bcachefs_tools_ref() -> Result<String, UpdateErro
         })
 }
 
+fn embedded_default_input_url(name: &str) -> Result<String, UpdateError> {
+    parse_flake_input_urls(EMBEDDED_NASTY_FLAKE)?
+        .get(name)
+        .map(|input| input.url.clone())
+        .ok_or_else(|| {
+            UpdateError::CommandFailed(format!(
+                "embedded nasty flake.nix has no {name}.url to extract default from"
+            ))
+        })
+}
+
 /// Render the wrapper-flake template, normalizing the nasty version
 /// to a leading-`v` semver tag. Used by the install-time bootstrap
 /// path (and a few legacy callers) that pass the engine's Cargo
@@ -2104,7 +2190,9 @@ fn render_system_flake_template_with_ref(
 /// `nixpkgs.follows = "nasty/nixpkgs"` (no `.url`) AND
 /// `bcachefs-tools.url = "..."` (no top-level `.follows`) AND
 /// `bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs"` AND
-/// `nasty.inputs.bcachefs-tools.follows = "bcachefs-tools"` AND lanzaboote's
+/// `nasty.inputs.bcachefs-tools.follows = "bcachefs-tools"` AND
+/// `tailscale-nixpkgs.url = "..."` AND
+/// `nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs"` AND lanzaboote's
 /// presence matches the SB overlay's presence (declared iff
 /// `secure-boot.nix` exists on disk, since lanzaboote is engine-
 /// injected per-box at enrollment).
@@ -2141,6 +2229,15 @@ fn wrapper_is_canonical_shape(content: &str, overlay_present: bool) -> bool {
         return false;
     }
     if !has_flake_string_attr(content, "bcachefs-tools.inputs.nixpkgs.follows", "nixpkgs") {
+        return false;
+    }
+    if !urls.contains_key("tailscale-nixpkgs")
+        || !has_flake_string_attr(
+            content,
+            "nasty.inputs.tailscale-nixpkgs.follows",
+            "tailscale-nixpkgs",
+        )
+    {
         return false;
     }
     // Lanzaboote must be present iff the SB overlay is on disk.
@@ -2187,7 +2284,7 @@ fn has_flake_string_attr(content: &str, attr: &str, expected: &str) -> bool {
 
 /// Re-render the wrapper-flake into the canonical 0.0.9 shape by
 /// reusing the embedded template. Preserves the operator's chosen
-/// `nasty` ref and `bcachefs-tools` ref. No-op when the wrapper is
+/// `nasty`, `bcachefs-tools`, and Tailscale package refs. No-op when the wrapper is
 /// already canonical.
 ///
 /// `bcachefs-tools` ref resolution priority:
@@ -2267,12 +2364,19 @@ async fn migrate_wrapper_to_canonical_shape(
     // upgrade_tagged_release and version_switch.
     let rendered =
         render_system_flake_template_with_ref(EMBEDDED_WRAPPER_TEMPLATE, &nasty_ref, local_system)?;
-    let after_bcachefs = rewrite_flake_input_urls(
+    let tailscale_url = urls
+        .get("tailscale-nixpkgs")
+        .map(|input| input.url.clone())
+        .unwrap_or(embedded_default_input_url("tailscale-nixpkgs")?);
+    let after_package_pins = rewrite_flake_input_urls(
         &rendered,
-        &HashMap::from([(
-            String::from("bcachefs-tools"),
-            format!("github:koverstreet/bcachefs-tools/{bcachefs_ref}"),
-        )]),
+        &HashMap::from([
+            (
+                String::from("bcachefs-tools"),
+                format!("github:koverstreet/bcachefs-tools/{bcachefs_ref}"),
+            ),
+            (String::from("tailscale-nixpkgs"), tailscale_url),
+        ]),
     )?;
     // Lanzaboote reconciliation: the wrapper template no longer
     // declares lanzaboote unconditionally (per-box opt-in — engine
@@ -2285,9 +2389,9 @@ async fn migrate_wrapper_to_canonical_shape(
     // has no lanzaboote line to preserve). So the symmetric "strip
     // when no overlay" branch is implicit in the render itself.
     if overlay_present {
-        inject_lanzaboote_input(&after_bcachefs)
+        inject_lanzaboote_input(&after_package_pins)
     } else {
-        Ok(after_bcachefs)
+        Ok(after_package_pins)
     }
 }
 
@@ -3739,9 +3843,25 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         assert!(super::wrapper_is_canonical_shape(canonical, false));
+    }
+
+    #[test]
+    fn wrapper_is_canonical_shape_rejects_missing_tailscale_pin() {
+        let old_shape = r#"{
+  inputs = {
+    nasty.url = "github:nasty-project/nasty/v0.0.15";
+    nixpkgs.follows = "nasty/nixpkgs";
+    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.39.0";
+    bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
+    nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+  };
+}"#;
+        assert!(!super::wrapper_is_canonical_shape(old_shape, false));
     }
 
     #[test]
@@ -3755,6 +3875,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
     lanzaboote.url = "github:nix-community/lanzaboote/v1.0.0";
     lanzaboote.inputs.nixpkgs.follows = "nasty/nixpkgs";
   };
@@ -3774,6 +3896,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
     lanzaboote.url = "github:nix-community/lanzaboote/v1.0.0";
   };
 }"#;
@@ -3791,6 +3915,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         assert!(!super::wrapper_is_canonical_shape(drift, true));
@@ -3817,6 +3943,8 @@ outputs = { nixpkgs, nasty, ... }: {
     nasty.url = "github:nasty-project/nasty/v0.0.14";
     nixpkgs.follows = "nasty/nixpkgs";
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.8";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         assert!(!super::wrapper_is_canonical_shape(old_shape, false));
@@ -3832,6 +3960,8 @@ outputs = { nixpkgs, nasty, ... }: {
     nasty.url = "github:nasty-project/nasty/v0.0.9";
     nixpkgs.follows = "nasty/nixpkgs";
     bcachefs-tools.follows = "nasty/bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         assert!(!super::wrapper_is_canonical_shape(follows_both, false));
@@ -3858,6 +3988,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         let out = super::inject_lanzaboote_input(wrapper).expect("inject");
@@ -3897,6 +4029,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         assert_eq!(super::strip_lanzaboote_input(wrapper), wrapper);
@@ -3911,6 +4045,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         let injected = super::inject_lanzaboote_input(wrapper).expect("inject");
@@ -3930,6 +4066,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         assert!(!super::wrapper_is_canonical_shape(pre, true));
@@ -3938,7 +4076,7 @@ outputs = { nixpkgs, nasty, ... }: {
     }
 
     #[tokio::test]
-    async fn migrate_wrapper_preserves_legacy_bcachefs_ref() {
+    async fn migrate_wrapper_preserves_operator_package_pins() {
         // Legacy/pre-#304 wrapper that had its OWN bcachefs.url pinned
         // to a specific rev — possibly the operator's preferred
         // version, possibly just the original install default. Either
@@ -3949,6 +4087,7 @@ outputs = { nixpkgs, nasty, ... }: {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.37.2";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/custom-tailscale-pin";
     nasty.url = "github:nasty-project/nasty/main";
     nasty.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -3977,6 +4116,13 @@ outputs = { nixpkgs, nasty, ... }: {
         assert!(migrated.contains(r#"nixpkgs.follows = "nasty/nixpkgs""#));
         assert!(migrated.contains(r#"nasty.inputs.bcachefs-tools.follows = "bcachefs-tools""#));
         assert!(migrated.contains(r#"bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs""#));
+        assert!(
+            migrated
+                .contains(r#"tailscale-nixpkgs.url = "github:NixOS/nixpkgs/custom-tailscale-pin""#)
+        );
+        assert!(
+            migrated.contains(r#"nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs""#)
+        );
     }
 
     #[tokio::test]
@@ -3988,6 +4134,8 @@ outputs = { nixpkgs, nasty, ... }: {
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.3";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
     nasty.inputs.bcachefs-tools.follows = "bcachefs-tools";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nasty.inputs.tailscale-nixpkgs.follows = "tailscale-nixpkgs";
   };
 }"#;
         let out = super::migrate_wrapper_to_canonical_shape(canonical, "x86_64-linux", false)
@@ -4078,6 +4226,14 @@ outputs = { nixpkgs, nasty, ... }: {
         assert!(
             r.starts_with('v') && r.contains('.'),
             "embedded default ref should look like a semver tag, got: {r}"
+        );
+    }
+
+    #[test]
+    fn embedded_default_tailscale_source_parses_from_nasty_flake() {
+        assert_eq!(
+            super::embedded_default_input_url("tailscale-nixpkgs").unwrap(),
+            "github:NixOS/nixpkgs/nixos-unstable"
         );
     }
 
@@ -4237,6 +4393,14 @@ proc /proc proc rw 0 0\n\
         assert_eq!(script.matches(".commit == $commit").count(), 2);
         assert!(script.contains("source \"$RESULT/etc/nasty/update-health\""));
         assert!(script.contains("if $CADDY_REQUIRED; then"));
+        assert!(script.contains("if $TAILSCALE_REQUIRED; then"));
+        assert!(script.contains("for _ in $(seq 1 5); do"));
+        assert!(script.contains("An active daemon with unreadable state is indeterminate"));
+        assert!(script.contains(".BackendState == \"Running\""));
+        assert!(script.contains("index($ip) != null"));
+        assert!(script.contains("wait_for_previous_tailscale"));
+        assert!(script.contains("--setenv \"TAILSCALE_IP_BEFORE=$TAILSCALE_IP_BEFORE\""));
+        assert!(script.contains("previous Tailscale connection did not recover"));
         assert!(script.contains(super::UPDATE_TRANSACTION_MARKER));
     }
 
@@ -4286,6 +4450,7 @@ proc /proc proc rw 0 0\n\
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.38.2";
+    tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nasty.url = "github:nasty-project/nasty/v0.0.5";
   };
   outputs = { self, nixpkgs, ... }: {};
@@ -4293,7 +4458,7 @@ proc /proc proc rw 0 0\n\
     }
 
     #[test]
-    fn parse_flake_input_urls_extracts_all_three_inputs() {
+    fn parse_flake_input_urls_extracts_all_four_inputs() {
         let parsed = parse_flake_input_urls(sample_flake()).expect("parses");
         assert_eq!(
             parsed.get("nixpkgs").map(|p| p.url.as_str()),
@@ -4302,6 +4467,10 @@ proc /proc proc rw 0 0\n\
         assert_eq!(
             parsed.get("bcachefs-tools").map(|p| p.url.as_str()),
             Some("github:koverstreet/bcachefs-tools/v1.38.2")
+        );
+        assert_eq!(
+            parsed.get("tailscale-nixpkgs").map(|p| p.url.as_str()),
+            Some("github:NixOS/nixpkgs/nixos-unstable")
         );
         assert_eq!(
             parsed.get("nasty").map(|p| p.url.as_str()),
@@ -4377,9 +4546,9 @@ proc /proc proc rw 0 0\n\
         // Other inputs untouched.
         assert!(rewritten.contains("github:NixOS/nixpkgs/nixos-unstable"));
         assert!(rewritten.contains("github:koverstreet/bcachefs-tools/v1.38.2"));
-        // File still parses with the same three inputs.
+        // File still parses with the same four inputs.
         let reparsed = parse_flake_input_urls(&rewritten).expect("still parses");
-        assert_eq!(reparsed.len(), 3);
+        assert_eq!(reparsed.len(), 4);
     }
 
     #[test]
