@@ -438,9 +438,11 @@
       tailscale-independent-package = let
         config = (mkNixosConfigs "x86_64-linux").nasty.config;
         expected = tailscale-nixpkgs.legacyPackages.x86_64-linux.tailscale;
+        moduleArgs = builtins.functionArgs (import ./nixos/modules/nasty.nix);
       in pkgs.runCommand "tailscale-independent-package" {} ''
         test "${config.services.nasty.tailscale.package}" = "${expected}"
         test "${nixpkgs.lib.boolToString config.systemd.services.nasty-tailscale.stopIfChanged}" = false
+        test "${nixpkgs.lib.boolToString (moduleArgs ? nasty-tailscale)}" = false
         touch "$out"
       '';
       bcachefs-smoke = import ./nixos/tests/bcachefs-smoke.nix {
