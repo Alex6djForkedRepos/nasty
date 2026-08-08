@@ -934,7 +934,7 @@ fn ip_section_dict(ip: &NmIpSettings, family: Family) -> HashMap<String, OwnedVa
         s.insert("gateway".into(), into_value(gw.clone()));
     }
     // NM's DBus types for DNS are family-specific and not strings:
-    //   ipv4.dns  → `au`   array of u32 in network byte order
+    //   ipv4.dns  → `au`   array of in_addr_t; native u32 bytes are network order
     //   ipv6.dns  → `aay`  array of 16-byte arrays
     // Sending the string-array shape (as) gets rejected as
     //   "InvalidProperty: ipv4.dns: can't set property of type 'au'
@@ -958,7 +958,7 @@ fn ip_section_dict(ip: &NmIpSettings, family: Family) -> HashMap<String, OwnedVa
                     .dns
                     .iter()
                     .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
-                    .map(|a| u32::from_be_bytes(a.octets()))
+                    .map(|a| u32::from_ne_bytes(a.octets()))
                     .collect();
                 if !packed.is_empty() {
                     s.insert("dns".into(), into_value(packed));
@@ -2187,15 +2187,15 @@ mod tests {
 
     #[test]
     fn dict_emits_dns_on_ipv4_section_as_packed_uint32() {
-        // Regression test for the discussion #159 bug: NM's
+        // Regression test for discussion #159 and issue #750: NM's
         // `ipv4.dns` is type `au` (array of u32 in network byte
         // order), NOT `as`.  Sending a string array gets rejected
         // with "InvalidProperty: ipv4.dns: can't set property of
         // type 'au' from value of type 'as'" which then prevents
         // every other connection in the apply from going through.
         //
-        // 10.10.11.1 in network byte order packs to
-        //   ((10<<24) | (10<<16) | (11<<8) | 1) = 0x0A0A0B01
+        // NM stores each u32 directly as an in_addr_t, so its native-memory
+        // bytes must preserve the address octets in network order.
         let layered = LayeredConfig {
             links: vec![link_phys("eth0")],
             dns: vec!["10.10.11.1".into()],
@@ -2204,7 +2204,8 @@ mod tests {
         let dict = to_settings_dict(&to_nm_profiles(&layered)[0]);
         let ipv4 = dict.get("ipv4").expect("ipv4 section");
         let dns: Vec<u32> = ipv4["dns"].try_clone().unwrap().try_into().unwrap();
-        assert_eq!(dns, vec![0x0A_0A_0B_01]);
+        assert_eq!(dns.len(), 1);
+        assert_eq!(dns[0].to_ne_bytes(), [10, 10, 11, 1]);
         // No leakage into ipv6 (no v6 entries in input).
         let ipv6 = dict.get("ipv6").expect("ipv6 section");
         assert!(!ipv6.contains_key("dns"), "ipv6 must not carry v4 DNS");
