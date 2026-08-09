@@ -17,7 +17,7 @@
 	import { confirmDangerous } from '$lib/confirm-dangerous.svelte';
 	import { unlockFs } from '$lib/unlock-fs.svelte';
 	import { summarizeDependents } from '$lib/fs-dependents';
-	import type { Filesystem, FilesystemDevice, BlockDevice, DeviceState, ScrubStatus, FsckStatus, ReconcileStatus, TieringProfile, TieringProfileId, FsDependents, TpmBindStatus, DiskHealth } from '$lib/types';
+	import type { Filesystem, UnavailableFilesystem, FilesystemDevice, BlockDevice, DeviceState, ScrubStatus, FsckStatus, ReconcileStatus, TieringProfile, TieringProfileId, FsDependents, TpmBindStatus, DiskHealth } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import SortTh from '$lib/components/SortTh.svelte';
 	import { Card, CardContent } from '$lib/components/ui/card';
@@ -27,6 +27,7 @@
 	import { RefreshCw, Pencil } from '@lucide/svelte';
 
 	let filesystems: Filesystem[] = $state([]);
+	let unavailableFilesystems: UnavailableFilesystem[] = $state([]);
 	let devices: BlockDevice[] = $state([]);
 	/** SMART health per disk (system.disks), joined by path to give an
 	 * add-device candidate its health summary before it joins an fs. */
@@ -361,10 +362,14 @@
 	});
 
 	async function refresh() {
-		await withToast(async () => {
-			filesystems = await client.call<Filesystem[]>('fs.list');
-			devices = await client.call<BlockDevice[]>('device.list');
-		});
+		const [liveResult, unavailableResult, deviceResult] = await Promise.all([
+			withToast(() => client.call<Filesystem[]>('fs.list')),
+			withToast(() => client.call<UnavailableFilesystem[]>('fs.unavailable.list')),
+			withToast(() => client.call<BlockDevice[]>('device.list')),
+		]);
+		if (liveResult) filesystems = liveResult;
+		if (unavailableResult) unavailableFilesystems = unavailableResult;
+		if (deviceResult) devices = deviceResult;
 		// Drop pending-evacuation markers once the live state confirms
 		// them (or the device vanished, or the marker went stale — an
 		// evacuation that finished instantly never shows `evacuating`).
@@ -766,6 +771,38 @@
 		await withToast(
 			() => client.call('fs.destroy', { name, confirm_name: name }),
 			`Filesystem "${name}" destroyed`
+		);
+		await refresh();
+	}
+
+	async function forgetFs(fs: UnavailableFilesystem) {
+		let dependents: string | null = null;
+		try {
+			dependents = summarizeDependents(
+				await client.call<FsDependents>('fs.dependents', { name: fs.name }),
+			);
+		} catch { /* The backend still validates dependents before forgetting. */ }
+
+		let message = `This removes only NASty's saved configuration for "${fs.name}" and stops its auto-mount attempts and alerts. It does not erase or modify any disks. If the member disks are reconnected, they retain their bcachefs data.`;
+		if (dependents) {
+			message += `\n\nNASty reports these dependents; the backend will block forgetting while they remain:\n\n${dependents}`;
+		}
+		message += `\n\nType the filesystem name to confirm.`;
+
+		if (!await confirmDangerous(
+			`Forget Filesystem "${fs.name}"`,
+			message,
+			fs.name,
+			{ confirmLabel: 'Forget filesystem' },
+		)) return;
+
+		await withToast(
+			() => client.call('fs.forget', {
+				name: fs.name,
+				expected_uuid: fs.uuid,
+				confirm_name: fs.name,
+			}),
+			`Filesystem "${fs.name}" forgotten`,
 		);
 		await refresh();
 	}
@@ -1942,12 +1979,61 @@
 
 {#if loading}
 	<p class="text-muted-foreground">Loading...</p>
-{:else if filesystems.length === 0}
+{:else if filesystems.length === 0 && unavailableFilesystems.length === 0}
 	<div class="flex flex-col items-center justify-center py-12 text-center">
 		<p class="text-muted-foreground">No filesystems configured yet.</p>
 		<p class="mt-1 text-sm text-muted-foreground">Use the <strong>Create Filesystem</strong> button above to get started.</p>
 	</div>
 {:else}
+	{#each unavailableFilesystems as fs (fs.uuid)}
+		<Card class="mb-4 border-destructive/40 bg-destructive/[0.03]">
+			<CardContent class="pt-4">
+				<div class="flex flex-wrap items-start justify-between gap-3">
+					<div class="min-w-0">
+						<div class="flex flex-wrap items-center gap-2">
+							<strong class="text-lg">{fs.name}</strong>
+							<Badge variant="destructive">Unavailable</Badge>
+						</div>
+						<p class="mt-1 text-sm text-muted-foreground">No member of this saved filesystem is currently discoverable.</p>
+					</div>
+					<Button variant="destructive" size="xs" onclick={() => forgetFs(fs)}>Forget</Button>
+				</div>
+
+				<dl class="mt-3 grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
+					<div class="min-w-0 sm:col-span-2">
+						<dt class="text-xs font-medium uppercase tracking-wide text-muted-foreground">UUID</dt>
+						<dd class="mt-0.5 break-all font-mono text-xs">{fs.uuid}</dd>
+					</div>
+					<div class="min-w-0">
+						<dt class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Last-known members</dt>
+						<dd class="mt-1">
+							{#if fs.devices.length}
+								<ul class="space-y-0.5">
+									{#each fs.devices as path}
+										<li class="break-all font-mono text-xs">{path}</li>
+									{/each}
+								</ul>
+							{:else}
+								<span class="text-xs text-muted-foreground">No paths recorded</span>
+							{/if}
+						</dd>
+					</div>
+					<div>
+						<dt class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Auto-mount configured</dt>
+						<dd class="mt-0.5">{fs.auto_mount ? 'Yes' : 'No'}</dd>
+					</div>
+				</dl>
+
+				{#if fs.last_mount_error?.message}
+					<div class="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm">
+						<span class="font-medium text-destructive">Last mount failure:</span>
+						<span class="ml-1">{fs.last_mount_error.message}</span>
+					</div>
+				{/if}
+			</CardContent>
+		</Card>
+	{/each}
+
 	{#each filesystems as fs (fs.uuid)}
 		<Card class="mb-4">
 			<CardContent class="pt-4">

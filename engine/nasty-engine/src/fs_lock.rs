@@ -54,6 +54,12 @@ const VM_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// here in the engine layer where `AppState` is.
 pub async fn lock_with_dependents(state: &AppState, fs_name: &str) -> Result<Filesystem, String> {
     let deps = find_dependents(state, fs_name).await;
+    if !deps.state_errors.is_empty() {
+        return Err(format!(
+            "lock aborted because dependent state could not be verified: {}",
+            deps.state_errors.join("; ")
+        ));
+    }
 
     // Apps first: docker stop is blocking, runs Docker's stop-then-kill
     // timeout, returns when the container is actually stopped. Errors

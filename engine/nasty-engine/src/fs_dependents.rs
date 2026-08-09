@@ -33,6 +33,7 @@ pub struct FsDependents {
     pub filesystem: String,
     pub mounted: bool,
     pub subvolumes: Vec<String>,
+    pub apps_storage: bool,
     pub apps: Vec<String>,
     pub vms: Vec<String>,
     pub backup_jobs: Vec<String>,
@@ -41,6 +42,20 @@ pub struct FsDependents {
     pub iscsi_targets: Vec<String>,
     pub nvmeof_subsystems: Vec<String>,
     pub state_errors: Vec<String>,
+}
+
+impl FsDependents {
+    pub fn has_dependents(&self) -> bool {
+        !self.subvolumes.is_empty()
+            || self.apps_storage
+            || !self.apps.is_empty()
+            || !self.vms.is_empty()
+            || !self.backup_jobs.is_empty()
+            || !self.nfs_shares.is_empty()
+            || !self.smb_shares.is_empty()
+            || !self.iscsi_targets.is_empty()
+            || !self.nvmeof_subsystems.is_empty()
+    }
 }
 
 /// True if `path` falls under `/fs/<fs_name>/` (the canonical NASty
@@ -52,9 +67,20 @@ fn path_belongs_to_fs(path: &str, fs_name: &str) -> bool {
 }
 
 /// Build the dependents view by querying every service that can hold
-/// a filesystem reference. Best-effort: a service that errors out
-/// contributes an empty list rather than failing the whole query.
+/// a filesystem reference. State read failures are reported separately so
+/// destructive callers can fail closed.
 pub async fn find_dependents(state: &AppState, fs_name: &str) -> FsDependents {
+    find_dependents_with_uuid(state, fs_name, None).await
+}
+
+/// UUID-aware variant used when the filesystem itself is unavailable. Stable
+/// block-export identities remain inspectable even when no subvolume can be
+/// discovered from the missing mount.
+pub async fn find_dependents_with_uuid(
+    state: &AppState,
+    fs_name: &str,
+    filesystem_uuid: Option<&str>,
+) -> FsDependents {
     let mut out = FsDependents {
         filesystem: fs_name.to_string(),
         ..Default::default()
@@ -68,11 +94,14 @@ pub async fn find_dependents(state: &AppState, fs_name: &str) -> FsDependents {
     }
 
     // Subvolumes are the cheapest hop: we already filter by fs.
-    let subvols = state
-        .subvolumes
-        .list_all(Some(fs_name), None)
-        .await
-        .unwrap_or_default();
+    let subvols = match state.subvolumes.list_all(Some(fs_name), None).await {
+        Ok(subvolumes) => subvolumes,
+        Err(error) => {
+            out.state_errors
+                .push(format!("subvolume state failed to load: {error}"));
+            Vec::new()
+        }
+    };
     // Block devices owned by subvolumes on this FS — used to detect
     // VM disks / iSCSI backstores / NVMe-oF namespaces that reference
     // them by `/dev/loopN` rather than path.
@@ -91,67 +120,122 @@ pub async fn find_dependents(state: &AppState, fs_name: &str) -> FsDependents {
     // all live under the apps storage path). Per-app bind mounts
     // outside that base are a refinement we can add later — they're
     // surfaced via app inspect, not the lightweight `list()`.
-    let apps_status = state.apps.status().await;
-    if apps_status
-        .storage_path
-        .as_deref()
-        .is_some_and(|p| path_belongs_to_fs(p, fs_name))
-        && let Ok(apps) = state.apps.list().await
-    {
-        out.apps = apps.into_iter().map(|a| a.name).collect();
+    match nasty_apps::AppsService::load_config_strict() {
+        Ok(config)
+            if [
+                config.storage_path.as_deref(),
+                config.appdata_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|path| path_belongs_to_fs(path, fs_name)) =>
+        {
+            out.apps_storage = true;
+            match state.apps.list().await {
+                Ok(apps) => out.apps = apps.into_iter().map(|app| app.name).collect(),
+                Err(error) => out
+                    .state_errors
+                    .push(format!("app state failed to load: {error}")),
+            }
+        }
+        Ok(_) => {}
+        Err(error) => out
+            .state_errors
+            .push(format!("app config failed to load: {error}")),
     }
 
     // VMs: disk path either under /fs/<X>/... directly, or a loop
     // device that's the block_device of a subvolume on this FS.
-    if let Ok(vms) = state.vms.list().await {
-        for vm in vms {
-            let touches_fs = vm
-                .config
-                .disks
-                .iter()
-                .any(|d| path_belongs_to_fs(&d.path, fs_name) || block_devs.contains(&d.path));
-            if touches_fs {
-                out.vms.push(vm.config.name);
+    match state.vms.list().await {
+        Ok(vms) => {
+            for vm in vms {
+                let touches_fs = vm.config.disks.iter().any(|disk| {
+                    path_belongs_to_fs(&disk.path, fs_name)
+                        || disk
+                            .source
+                            .as_deref()
+                            .is_some_and(|source| path_belongs_to_fs(source, fs_name))
+                        || block_devs.contains(&disk.path)
+                });
+                if touches_fs {
+                    out.vms.push(vm.config.name);
+                }
             }
         }
+        Err(error) => out
+            .state_errors
+            .push(format!("VM state failed to load: {error}")),
     }
 
     // Backup jobs: any source under /fs/<X>/. A job pointing only
     // somewhere else (e.g. a subset of a different FS) is left alone.
-    let profiles = state.backups.list_profiles().await;
-    for p in profiles {
-        if p.sources.iter().any(|src| path_belongs_to_fs(src, fs_name)) {
-            out.backup_jobs.push(p.name);
+    match state.backups.list_profiles_strict().await {
+        Ok(profiles) => {
+            for profile in profiles {
+                if profile
+                    .sources
+                    .iter()
+                    .any(|source| path_belongs_to_fs(source, fs_name))
+                {
+                    out.backup_jobs.push(profile.name);
+                }
+            }
         }
+        Err(error) => out
+            .state_errors
+            .push(format!("backup state failed to load: {error}")),
     }
 
     // Shares: NFS/SMB use a single `path`; iSCSI/NVMe-oF use device
     // paths that are usually loop devices for block subvolumes.
-    if let Ok(shares) = state.nfs.list().await {
-        out.nfs_shares = shares
-            .into_iter()
-            .filter(|s| path_belongs_to_fs(&s.path, fs_name))
-            .map(|s| s.id)
-            .collect();
+    match state.nfs.list_strict().await {
+        Ok(shares) => {
+            out.nfs_shares = shares
+                .into_iter()
+                .filter(|s| path_belongs_to_fs(&s.path, fs_name))
+                .map(|s| s.id)
+                .collect();
+        }
+        Err(error) => out
+            .state_errors
+            .push(format!("NFS state failed to load: {error}")),
     }
-    if let Ok(shares) = state.smb.list().await {
-        out.smb_shares = shares
-            .into_iter()
-            .filter(|s| path_belongs_to_fs(&s.path, fs_name))
-            .map(|s| s.name)
-            .collect();
+    match state.smb.list_strict().await {
+        Ok(shares) => {
+            out.smb_shares = shares
+                .into_iter()
+                .filter(|s| path_belongs_to_fs(&s.path, fs_name))
+                .map(|s| s.name)
+                .collect();
+        }
+        Err(error) => out
+            .state_errors
+            .push(format!("SMB state failed to load: {error}")),
     }
     match state.iscsi.list().await {
         Ok(targets) => {
+            for target in &targets {
+                if target
+                    .luns
+                    .iter()
+                    .any(|lun| lun.backing_volume_unresolved && lun.backing_volume.is_none())
+                {
+                    out.state_errors.push(format!(
+                        "iSCSI target '{}' has unresolved legacy block-volume ownership",
+                        target.iqn
+                    ));
+                }
+            }
             out.iscsi_targets = targets
                 .into_iter()
                 .filter(|t| {
                     t.luns.iter().any(|l| {
                         path_belongs_to_fs(&l.backstore_path, fs_name)
                             || block_devs.contains(&l.backstore_path)
-                            || l.backing_volume
-                                .as_ref()
-                                .is_some_and(|identity| block_ids.contains(identity))
+                            || l.backing_volume.as_ref().is_some_and(|identity| {
+                                block_ids.contains(identity)
+                                    || filesystem_uuid == Some(identity.filesystem_uuid.as_str())
+                            })
                     })
                 })
                 .map(|t| t.iqn)
@@ -163,15 +247,26 @@ pub async fn find_dependents(state: &AppState, fs_name: &str) -> FsDependents {
     }
     match state.nvmeof.list().await {
         Ok(subs) => {
+            for subsystem in &subs {
+                if subsystem.namespaces.iter().any(|namespace| {
+                    namespace.backing_volume_unresolved && namespace.backing_volume.is_none()
+                }) {
+                    out.state_errors.push(format!(
+                        "NVMe-oF subsystem '{}' has unresolved legacy block-volume ownership",
+                        subsystem.nqn
+                    ));
+                }
+            }
             out.nvmeof_subsystems = subs
                 .into_iter()
                 .filter(|s| {
                     s.namespaces.iter().any(|n| {
                         path_belongs_to_fs(&n.device_path, fs_name)
                             || block_devs.contains(&n.device_path)
-                            || n.backing_volume
-                                .as_ref()
-                                .is_some_and(|identity| block_ids.contains(identity))
+                            || n.backing_volume.as_ref().is_some_and(|identity| {
+                                block_ids.contains(identity)
+                                    || filesystem_uuid == Some(identity.filesystem_uuid.as_str())
+                            })
                     })
                 })
                 .map(|s| s.nqn)
@@ -233,5 +328,17 @@ mod tests {
         // Other roots untouched.
         assert!(!path_belongs_to_fs("/var/lib/nasty", "tank"));
         assert!(!path_belongs_to_fs("", "tank"));
+    }
+
+    #[test]
+    fn dependency_presence_is_separate_from_state_errors() {
+        let mut dependents = FsDependents {
+            state_errors: vec!["unreadable".to_string()],
+            ..Default::default()
+        };
+        assert!(!dependents.has_dependents());
+
+        dependents.nvmeof_subsystems.push("nqn.test".to_string());
+        assert!(dependents.has_dependents());
     }
 }

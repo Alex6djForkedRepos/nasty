@@ -2034,6 +2034,7 @@ mod tests {
             "device.set_io_scheduler",
             "fs.create",
             "fs.destroy",
+            "fs.forget",
             "fs.mount",
             "fs.unmount",
             "fs.unlock",

@@ -368,6 +368,7 @@ export interface FsDependents {
 	filesystem: string;
 	mounted: boolean;
 	subvolumes: string[];
+	apps_storage: boolean;
 	apps: string[];
 	vms: string[];
 	backup_jobs: string[];
@@ -436,6 +437,16 @@ export interface Filesystem {
 	used_bytes: number;
 	available_bytes: number;
 	options: FilesystemOptions;
+	last_mount_error?: MountFailure | null;
+}
+
+/** Persisted filesystem registration whose member disks are not currently
+ * discoverable, returned by `fs.unavailable.list`. */
+export interface UnavailableFilesystem {
+	name: string;
+	uuid: string;
+	devices: string[];
+	auto_mount: boolean;
 	last_mount_error?: MountFailure | null;
 }
 
