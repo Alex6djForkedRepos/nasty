@@ -636,30 +636,26 @@ async fn deploy_compose(
         return;
     }
 
-    // Pick the ingress host port: caller's choice if it's actually a
-    // published TCP port on the resulting app, else the first TCP port.
-    // UDP can't serve HTTP — Caddy's reverse_proxy (like every HTTP
-    // proxy) is TCP-only — so we never auto-assign a UDP port even
-    // if the compose only publishes UDP. The user can still reach the
-    // container directly on the LAN in that edge case.
-    if let Ok(app) = state.apps.get(&req.name).await {
-        let tcp = |p: &nasty_apps::MappedPort| p.protocol.eq_ignore_ascii_case("tcp");
-        let chosen = req
-            .ingress_host_port
-            .and_then(|hp| app.ports.iter().find(|p| p.host_port == hp && tcp(p)))
-            .or_else(|| app.ports.iter().find(|p| tcp(p)));
-        if let Some(p) = chosen {
-            let _ = state
-                .apps
-                .ingress_set(nasty_apps::SetIngressRequest {
-                    name: req.name.clone(),
-                    host_port: p.host_port,
-                    // Compose-deploy auto-ingress always uses path-prefix;
-                    // subdomain is an explicit opt-in via apps.ingress.set.
-                    subdomain: None,
-                })
-                .await;
-        }
+    // Fresh installs start in path-prefix mode. Updates preserve the saved
+    // hostname and retarget it to the requested, pinned, or first TCP port.
+    if let Err(error) = state
+        .apps
+        .refresh_compose_ingress_after_deploy(&req.name, req.ingress_host_port, is_update)
+        .await
+    {
+        warn!(
+            app = %req.name,
+            %error,
+            "compose deployment succeeded but ingress refresh failed"
+        );
+        let _ = socket
+            .send(Message::Text(
+                DeployMessage::log(&format!(
+                    "WARNING: app deployment succeeded, but ingress could not be refreshed: {error}"
+                ))
+                .into(),
+            ))
+            .await;
     }
 
     if let Err(e) = crate::router::apps::sync_published_firewall_ports(state).await {

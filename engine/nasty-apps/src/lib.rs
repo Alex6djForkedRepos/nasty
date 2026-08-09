@@ -1402,16 +1402,75 @@ async fn load_ingress_host_port(app_name: &str) -> Option<u16> {
         .and_then(|n| u16::try_from(n).ok())
 }
 
-/// Decide which published port the reverse-proxy ingress should forward
-/// to. A `pinned` port (operator's choice) wins as long as it's still
-/// published; otherwise fall back to the first/lowest TCP port. Pure so
-/// the "pin survives, but a stale pin degrades gracefully" logic is
-/// unit-testable without a manifest.
-fn resolve_ingress_port(pinned: Option<u16>, ports: &[MappedPort]) -> Option<u16> {
-    if let Some(p) = pinned
-        && ports.iter().any(|x| x.host_port == p)
-    {
-        return Some(p);
+fn parse_ingress_preferences(
+    manifest: &serde_json::Value,
+) -> Result<(Option<String>, Option<u16>), AppsError> {
+    let map = manifest
+        .as_object()
+        .ok_or_else(|| AppsError::CommandFailed("manifest is not an object".into()))?;
+    let subdomain = match map.get("ingress_subdomain") {
+        Some(serde_json::Value::String(value)) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        Some(_) => {
+            return Err(AppsError::CommandFailed(
+                "manifest ingress_subdomain is not a string".into(),
+            ));
+        }
+        None => None,
+    };
+    let host_port = match map.get("ingress_host_port") {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| {
+                    AppsError::CommandFailed(
+                        "manifest ingress_host_port is not a valid port".into(),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+    Ok((subdomain, host_port))
+}
+
+/// Load ingress preferences without treating unreadable state as path mode.
+/// Compose updates use this strict path so corrupt metadata cannot silently
+/// erase an existing custom hostname.
+async fn load_ingress_preferences_strict(
+    app_name: &str,
+) -> Result<(Option<String>, Option<u16>), AppsError> {
+    let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
+    let content = match tokio::fs::read_to_string(&manifest_path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(error) => {
+            return Err(AppsError::CommandFailed(format!(
+                "manifest read failed: {error}"
+            )));
+        }
+    };
+    let manifest = serde_json::from_str(&content)
+        .map_err(|error| AppsError::CommandFailed(format!("manifest parse failed: {error}")))?;
+    parse_ingress_preferences(&manifest)
+}
+
+/// Decide which published TCP port ingress should forward to. A valid request
+/// wins, followed by the persisted operator choice, then the first TCP port.
+fn resolve_ingress_port(
+    requested: Option<u16>,
+    pinned: Option<u16>,
+    ports: &[MappedPort],
+) -> Option<u16> {
+    for candidate in [requested, pinned].into_iter().flatten() {
+        if ports
+            .iter()
+            .any(|port| port.host_port == candidate && port.protocol.eq_ignore_ascii_case("tcp"))
+        {
+            return Some(candidate);
+        }
     }
     ports
         .iter()
@@ -4301,21 +4360,14 @@ impl AppsService {
             return Err(AppsError::DockerFailed(stderr.to_string()));
         }
 
-        // Auto-create ingress for the first exposed TCP port. See the
-        // matching comment in `install()` for why UDP is skipped.
-        if let Ok(app) = self.get(&req.name).await
-            && let Some(first_port) = app
-                .ports
-                .iter()
-                .find(|p| p.protocol.eq_ignore_ascii_case("tcp"))
+        if let Err(error) = self
+            .refresh_compose_ingress_after_deploy(&req.name, None, false)
+            .await
         {
-            let _ = self
-                .ingress_set(SetIngressRequest {
-                    name: req.name.clone(),
-                    host_port: first_port.host_port,
-                    subdomain: None,
-                })
-                .await;
+            warn!(
+                "Failed to auto-create ingress for compose app '{}': {error}",
+                req.name
+            );
         }
 
         info!("Installed compose app '{}'", req.name);
@@ -4385,6 +4437,16 @@ impl AppsService {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(AppsError::DockerFailed(stderr.to_string()));
+        }
+
+        if let Err(error) = self
+            .refresh_compose_ingress_after_deploy(&req.name, None, true)
+            .await
+        {
+            warn!(
+                "Failed to refresh ingress for updated compose app '{}': {error}",
+                req.name
+            );
         }
 
         info!("Updated compose app '{}'", req.name);
@@ -4594,6 +4656,57 @@ impl AppsService {
     // engine doesn't keep its own source-of-truth file; what Caddy
     // has IS the truth.  See `engine/nasty-apps/src/caddy.rs`.
 
+    /// Refresh a compose app's route after `docker compose up`. Updates retain
+    /// the persisted hostname and port preference; fresh installs deliberately
+    /// start in path-prefix mode and cannot inherit stale sidecar metadata.
+    pub async fn refresh_compose_ingress_after_deploy(
+        &self,
+        name: &str,
+        requested_host_port: Option<u16>,
+        is_update: bool,
+    ) -> Result<Option<AppIngress>, AppsError> {
+        validate_app_name(name)?;
+        let app = self.get(name).await?;
+        let (subdomain, pinned_host_port) = if is_update {
+            load_ingress_preferences_strict(name).await?
+        } else {
+            // A newly installed app must not inherit ingress preferences from
+            // a sidecar left behind by an older app with the same name.
+            save_ingress_subdomain(name, None).await?;
+            save_ingress_host_port(name, None).await?;
+            (None, None)
+        };
+        let Some(host_port) =
+            resolve_ingress_port(requested_host_port, pinned_host_port, &app.ports)
+        else {
+            // Keep update preferences for recovery if TCP is restored, but
+            // never leave Caddy forwarding the hostname to a stale port.
+            CaddyApi::new()
+                .remove_app_route(name)
+                .await
+                .map_err(AppsError::CommandFailed)?;
+            return Ok(None);
+        };
+        if is_update
+            && let Some(existing) = self
+                .ingress_list()
+                .await?
+                .into_iter()
+                .find(|ingress| ingress.name == name)
+            && existing.host_port == host_port
+            && existing.subdomain == subdomain
+        {
+            return Ok(Some(existing));
+        }
+        self.ingress_set(SetIngressRequest {
+            name: name.to_string(),
+            host_port,
+            subdomain,
+        })
+        .await
+        .map(Some)
+    }
+
     pub async fn ingress_list(&self) -> Result<Vec<AppIngress>, AppsError> {
         let routes = CaddyApi::new()
             .list_app_routes()
@@ -4693,7 +4806,7 @@ impl AppsService {
                 // Pinning is what stops a multi-port app's ingress from
                 // re-deriving to the wrong port on every restart.
                 let pinned = load_ingress_host_port(&app.name).await;
-                let Some(port) = resolve_ingress_port(pinned, &app.ports) else {
+                let Some(port) = resolve_ingress_port(None, pinned, &app.ports) else {
                     continue;
                 };
                 routes.push(AppRoute {
@@ -7977,7 +8090,9 @@ services:
 
     // ── resolve_ingress_port ──
 
-    use super::{MappedPort, resolve_ingress_port, sort_and_dedup_ports};
+    use super::{
+        MappedPort, parse_ingress_preferences, resolve_ingress_port, sort_and_dedup_ports,
+    };
 
     fn port(host: u16, proto: &str) -> MappedPort {
         MappedPort {
@@ -7991,17 +8106,17 @@ services:
     fn ingress_port_pinned_choice_wins() {
         // The z-app bug: published 2300-2305 + 8080, pinned to 8080.
         let ports = vec![port(2300, "tcp"), port(2301, "tcp"), port(8080, "tcp")];
-        assert_eq!(resolve_ingress_port(Some(8080), &ports), Some(8080));
+        assert_eq!(resolve_ingress_port(None, Some(8080), &ports), Some(8080));
     }
 
     #[test]
     fn ingress_port_unpinned_falls_back_to_first_tcp() {
         // No pin → lowest TCP (the historical default).
         let ports = vec![port(2300, "tcp"), port(8080, "tcp")];
-        assert_eq!(resolve_ingress_port(None, &ports), Some(2300));
+        assert_eq!(resolve_ingress_port(None, None, &ports), Some(2300));
         // A UDP-first list still skips to the first TCP port.
         let mixed = vec![port(2300, "udp"), port(8080, "tcp")];
-        assert_eq!(resolve_ingress_port(None, &mixed), Some(8080));
+        assert_eq!(resolve_ingress_port(None, None, &mixed), Some(8080));
     }
 
     #[test]
@@ -8009,7 +8124,51 @@ services:
         // Pinned port no longer published (operator changed ports) → don't
         // dial a dead port; fall back to the first TCP port.
         let ports = vec![port(2300, "tcp"), port(8080, "tcp")];
-        assert_eq!(resolve_ingress_port(Some(9999), &ports), Some(2300));
+        assert_eq!(resolve_ingress_port(None, Some(9999), &ports), Some(2300));
+    }
+
+    #[test]
+    fn ingress_port_requested_choice_wins_then_falls_back_to_pin() {
+        let ports = vec![port(8080, "tcp"), port(9090, "tcp")];
+        assert_eq!(
+            resolve_ingress_port(Some(9090), Some(8080), &ports),
+            Some(9090)
+        );
+        assert_eq!(
+            resolve_ingress_port(Some(9999), Some(8080), &ports),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn ingress_port_never_selects_udp_only_candidate() {
+        let ports = vec![port(8080, "udp"), port(9090, "tcp")];
+        assert_eq!(
+            resolve_ingress_port(Some(8080), Some(8080), &ports),
+            Some(9090)
+        );
+        assert_eq!(
+            resolve_ingress_port(Some(8080), Some(8080), &[port(8080, "udp")]),
+            None
+        );
+    }
+
+    #[test]
+    fn persisted_ingress_preferences_preserve_domain_and_port() {
+        let manifest = serde_json::json!({
+            "ingress_subdomain": " app.example.com ",
+            "ingress_host_port": 8080,
+        });
+        assert_eq!(
+            parse_ingress_preferences(&manifest).unwrap(),
+            (Some("app.example.com".into()), Some(8080))
+        );
+        assert!(
+            parse_ingress_preferences(&serde_json::json!({
+                "ingress_subdomain": ["invalid"],
+            }))
+            .is_err()
+        );
     }
 
     #[test]
