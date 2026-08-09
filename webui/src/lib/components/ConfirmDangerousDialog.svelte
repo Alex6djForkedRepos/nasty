@@ -40,7 +40,7 @@
 		/>
 		<DialogFooter class="gap-2">
 			<Button variant="outline" onclick={() => confirmDangerousRespond(false)}>Cancel</Button>
-			<Button variant="destructive" disabled={!matches} onclick={() => confirmDangerousRespond(true)}>Destroy</Button>
+			<Button variant="destructive" disabled={!matches} onclick={() => confirmDangerousRespond(true)}>{confirmDangerousState.confirmLabel}</Button>
 		</DialogFooter>
 	</DialogContent>
 </Dialog>

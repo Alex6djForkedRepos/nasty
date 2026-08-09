@@ -896,6 +896,15 @@ impl BackupService {
             .collect()
     }
 
+    /// Return the in-memory profiles only after verifying that persisted state
+    /// is readable and valid. Destructive dependency checks use this to avoid
+    /// treating a corrupt profile file as an empty configuration.
+    pub async fn list_profiles_strict(&self) -> Result<Vec<BackupProfile>, BackupError> {
+        let profiles = self.profiles.lock().await;
+        load_profiles_strict()?;
+        Ok(profiles.iter().map(|profile| profile.redacted()).collect())
+    }
+
     pub async fn get_profile(&self, id: &str) -> Result<BackupProfile, BackupError> {
         self.get_profile_internal(id).await.map(|p| p.redacted())
     }
@@ -1510,10 +1519,17 @@ impl BackupService {
 // ── Persistence ────────────────────────────────────────────────
 
 fn load_profiles() -> Vec<BackupProfile> {
-    std::fs::read_to_string(STATE_PATH)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    load_profiles_strict().unwrap_or_default()
+}
+
+fn load_profiles_strict() -> Result<Vec<BackupProfile>, BackupError> {
+    let content = match std::fs::read_to_string(STATE_PATH) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(BackupError::Io(error)),
+    };
+    serde_json::from_str(&content)
+        .map_err(|error| BackupError::Failed(format!("parse {STATE_PATH}: {error}")))
 }
 
 async fn save_profiles(profiles: &[BackupProfile]) {

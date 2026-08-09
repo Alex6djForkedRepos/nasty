@@ -42,6 +42,7 @@ const ACTION_VERBS: &[(&str, HttpVerb)] = &[
     ("find", HttpVerb::Get),
     ("delete", HttpVerb::Delete),
     ("destroy", HttpVerb::Delete),
+    ("forget", HttpVerb::Delete),
     ("remove", HttpVerb::Delete),
     ("set", HttpVerb::Put),
     ("update", HttpVerb::Put),
@@ -140,6 +141,7 @@ mod tests {
         assert_eq!(translate("subvolume.find_by_property").0, HttpVerb::Get);
         assert_eq!(translate("auth.delete_user").0, HttpVerb::Delete);
         assert_eq!(translate("share.iscsi.remove_acl").0, HttpVerb::Delete);
+        assert_eq!(translate("fs.forget").0, HttpVerb::Delete);
         assert_eq!(translate("fs.options.update").0, HttpVerb::Put);
         assert_eq!(translate("fs.device.set_label").0, HttpVerb::Put);
     }

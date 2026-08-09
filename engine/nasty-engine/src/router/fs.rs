@@ -26,6 +26,15 @@ pub(super) async fn try_route(
             }
             Err(e) => err(req, e),
         },
+        "fs.unavailable.list" => match state.filesystems.list_unavailable().await {
+            Ok(mut filesystems) => {
+                if let Some(ref fs_name) = session.filesystem {
+                    filesystems.retain(|filesystem| &filesystem.name == fs_name);
+                }
+                ok(req, filesystems)
+            }
+            Err(error) => err(req, error),
+        },
         "fs.get" => match require_str(req, "name") {
             Ok(name) => {
                 if session.filesystem.as_deref().is_some_and(|p| p != name) {
@@ -59,6 +68,59 @@ pub(super) async fn try_route(
                     }
                 }
                 Err(e) => invalid(req, e),
+            }
+        }
+        "fs.forget" => {
+            match parse_params::<nasty_storage::filesystem::ForgetUnavailableRequest>(req) {
+                Ok(request) => {
+                    if session
+                        .filesystem
+                        .as_deref()
+                        .is_some_and(|filesystem| filesystem != request.name)
+                    {
+                        err(req, "access denied")
+                    } else {
+                        let dependents = crate::fs_dependents::find_dependents_with_uuid(
+                            state,
+                            &request.name,
+                            Some(&request.expected_uuid),
+                        )
+                        .await;
+                        if !dependents.state_errors.is_empty() {
+                            err(
+                                req,
+                                format!(
+                                    "cannot verify filesystem dependencies: {}",
+                                    dependents.state_errors.join("; ")
+                                ),
+                            )
+                        } else if dependents.has_dependents() {
+                            err(
+                                req,
+                                format!(
+                                    "filesystem '{}' still has dependent state; remove its dependents before forgetting it",
+                                    request.name
+                                ),
+                            )
+                        } else {
+                            let name = request.name.clone();
+                            match state.filesystems.forget_unavailable(request).await {
+                                Ok(()) => {
+                                    state
+                                        .mount_failures
+                                        .lock()
+                                        .await
+                                        .retain(|failed_name| failed_name != &name);
+                                    *state.alerts_cache.lock().await = None;
+                                    *state.status_cache.lock().await = None;
+                                    ok(req, "ok")
+                                }
+                                Err(error) => err(req, error),
+                            }
+                        }
+                    }
+                }
+                Err(error) => invalid(req, error),
             }
         }
         "fs.mount" => {

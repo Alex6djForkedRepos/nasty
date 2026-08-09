@@ -467,6 +467,29 @@ pub struct DestroyFilesystemRequest {
     pub confirm_name: String,
 }
 
+/// A filesystem registration whose persisted UUID is not currently visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnavailableFilesystem {
+    pub name: String,
+    /// UUID persisted in the host-side registration.
+    pub uuid: String,
+    #[serde(default)]
+    pub devices: Vec<String>,
+    pub auto_mount: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mount_error: Option<MountFailure>,
+}
+
+/// Remove an unavailable filesystem from host-side tracking only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ForgetUnavailableRequest {
+    pub name: String,
+    /// Must exactly match the UUID currently persisted for `name`.
+    pub expected_uuid: String,
+    /// Must exactly match `name`.
+    pub confirm_name: String,
+}
+
 /// Update runtime-mutable filesystem options on a mounted filesystem.
 /// Options are written directly to sysfs (/sys/fs/bcachefs/<uuid>/options/).
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2248,6 +2271,16 @@ impl FilesystemService {
         Ok(result)
     }
 
+    /// List UUID-bound registrations that are absent from live discovery.
+    /// Legacy name-only registrations are intentionally omitted because they
+    /// cannot be forgotten with an identity-safe request.
+    pub async fn list_unavailable(&self) -> Result<Vec<UnavailableFilesystem>, FilesystemError> {
+        let state = load_fs_state_strict().await?;
+        let live = self.list().await?;
+        let failures = self.mount_state.lock().await;
+        Ok(project_unavailable_filesystems(&state, &live, &failures))
+    }
+
     /// Uncached implementation of filesystem listing.
     async fn list_uncached(&self) -> Result<Vec<Filesystem>, FilesystemError> {
         let mounts = read_bcachefs_mounts().await?;
@@ -2773,6 +2806,52 @@ impl FilesystemService {
         Ok(())
     }
 
+    /// Forget only the host-side registration for an unavailable filesystem.
+    /// This deliberately leaves device contents, encryption keys, and the
+    /// canonical mount directory untouched.
+    pub async fn forget_unavailable(
+        &self,
+        req: ForgetUnavailableRequest,
+    ) -> Result<(), FilesystemError> {
+        let _mutation_guard = self.block_mutations.lock().await;
+        let mut state = load_fs_state_strict().await?;
+        validate_forget_unavailable(&state, &req)?;
+
+        let mount_point = format!("{NASTY_MOUNT_BASE}/{}", req.name);
+        if is_mountpoint(&mount_point).await {
+            return Err(FilesystemError::CommandFailed(format!(
+                "mount point {mount_point} is occupied; refusing to forget the filesystem"
+            )));
+        }
+
+        // Safety must distinguish a genuinely absent UUID from a failed
+        // discovery command. `blkid -U` exits 2 for no match; every other
+        // failure aborts instead of being treated as evidence of absence.
+        if filesystem_uuid_is_visible(&req.expected_uuid).await? {
+            return Err(FilesystemError::CommandFailed(format!(
+                "filesystem UUID {} is visible or mounted; refusing to forget it",
+                req.expected_uuid
+            )));
+        }
+
+        state.remove(&req.name);
+        save_fs_state(&state).await?;
+
+        // Registration removal is authoritative. History cleanup is
+        // best-effort and must not turn a completed forget into a failure.
+        if self.mount_state.lock().await.remove(&req.name).is_some() {
+            persist_mount_state(&self.mount_state).await;
+        }
+        if self.scrub_state.lock().await.remove(&req.name).is_some() {
+            persist_scrub_state(&self.scrub_state).await;
+        }
+        if self.fsck_state.lock().await.remove(&req.name).is_some() {
+            persist_fsck_state(&self.fsck_state).await;
+        }
+        self.invalidate_list_cache().await;
+        Ok(())
+    }
+
     /// Mount an existing unmounted filesystem
     pub async fn mount(&self, name: &str) -> Result<Filesystem, FilesystemError> {
         self.mount_maybe_degraded(name, false).await
@@ -2821,11 +2900,30 @@ impl FilesystemService {
             Ok(filesystem) => filesystem,
             Err(error) => {
                 if let Some(expected_uuid) = expected_uuid {
-                    self.record_mount_failure(
-                        name,
-                        identity_mismatch_failure(name, expected_uuid, visible_uuid.as_deref()),
-                    )
-                    .await;
+                    let mount_point = format!("{NASTY_MOUNT_BASE}/{name}");
+                    let mount_point_occupied = is_mountpoint(&mount_point).await;
+                    let persisted_path_has_expected_uuid =
+                        if visible_uuid.is_none() && !mount_point_occupied {
+                            persisted_path_has_uuid(&opts.devices, expected_uuid).await
+                        } else {
+                            false
+                        };
+                    let reason = classify_unavailable_selection(
+                        visible_uuid.is_some(),
+                        mount_point_occupied,
+                        persisted_path_has_expected_uuid,
+                    );
+                    let failure = if reason == MountFailureReason::MissingDevice {
+                        unavailable_filesystem_failure(name, &opts.devices)
+                    } else {
+                        let actual_uuid = if mount_point_occupied {
+                            mounted_fs_uuid_at(&mount_point).await.ok().flatten()
+                        } else {
+                            visible_uuid
+                        };
+                        identity_mismatch_failure(name, expected_uuid, actual_uuid.as_deref())
+                    };
+                    self.record_mount_failure(name, failure).await;
                 }
                 return Err(error);
             }
@@ -5874,6 +5972,63 @@ struct FsMountOptions {
 /// Filesystem state: maps fs name → mount options.
 type FsState = HashMap<String, FsMountOptions>;
 
+fn project_unavailable_filesystems(
+    state: &FsState,
+    live: &[Filesystem],
+    failures: &HashMap<String, MountFailure>,
+) -> Vec<UnavailableFilesystem> {
+    let live_uuids: HashSet<&str> = live
+        .iter()
+        .map(|filesystem| filesystem.uuid.as_str())
+        .collect();
+    let mut unavailable = state
+        .iter()
+        .filter_map(|(name, options)| {
+            let uuid = options.uuid.as_deref().filter(|uuid| !uuid.is_empty())?;
+            (!live_uuids.contains(uuid)).then(|| UnavailableFilesystem {
+                name: name.clone(),
+                uuid: uuid.to_string(),
+                devices: options.devices.clone(),
+                auto_mount: options.mounted != Some(false),
+                last_mount_error: failures.get(name).cloned(),
+            })
+        })
+        .collect::<Vec<_>>();
+    unavailable.sort_by(|a, b| a.name.cmp(&b.name).then(a.uuid.cmp(&b.uuid)));
+    unavailable
+}
+
+fn validate_forget_unavailable(
+    state: &FsState,
+    req: &ForgetUnavailableRequest,
+) -> Result<(), FilesystemError> {
+    if req.confirm_name != req.name {
+        return Err(FilesystemError::InvalidInput(
+            "confirmation name does not match filesystem name".into(),
+        ));
+    }
+    let options = state
+        .get(&req.name)
+        .ok_or_else(|| FilesystemError::NotFound(req.name.clone()))?;
+    let persisted_uuid = options
+        .uuid
+        .as_deref()
+        .filter(|uuid| !uuid.is_empty())
+        .ok_or_else(|| {
+            FilesystemError::InvalidInput(format!(
+                "filesystem '{}' has legacy state without a UUID and cannot be safely forgotten",
+                req.name
+            ))
+        })?;
+    if persisted_uuid != req.expected_uuid {
+        return Err(FilesystemError::InvalidInput(format!(
+            "expected UUID does not match the persisted UUID for filesystem '{}'",
+            req.name
+        )));
+    }
+    Ok(())
+}
+
 async fn save_fs_mounted_with_opts(fs_name: &str, mut opts: FsMountOptions) {
     // Always flip mounted=true here so callers can't forget — the
     // function name promises "mounted state recorded," and the only
@@ -5928,28 +6083,28 @@ async fn forget_fs(fs_name: &str) {
 }
 
 async fn load_fs_state() -> FsState {
-    let content = match tokio::fs::read_to_string(FS_STATE_PATH).await {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FsState::new(),
-        Err(e) => {
-            // A non-NotFound read error means we *might* be silently
-            // resetting persisted mount state — log so a "filesystems
-            // didn't auto-mount" report can be matched to the real
-            // cause (permissions, IO error, etc.).
-            warn!("read {FS_STATE_PATH} failed: {e} — using empty state");
-            return FsState::new();
-        }
-    };
-    match serde_json::from_str(&content) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                "parse {FS_STATE_PATH} failed: {e} — file may be corrupt; \
-                 using empty state (mount-option overrides will be lost)"
-            );
+    match load_fs_state_strict().await {
+        Ok(state) => state,
+        Err(error) => {
+            warn!("{error} — using empty state");
             FsState::new()
         }
     }
+}
+
+async fn load_fs_state_strict() -> Result<FsState, FilesystemError> {
+    let content = match tokio::fs::read_to_string(FS_STATE_PATH).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(FsState::new()),
+        Err(error) => {
+            return Err(FilesystemError::CommandFailed(format!(
+                "read {FS_STATE_PATH} failed: {error}"
+            )));
+        }
+    };
+    serde_json::from_str(&content).map_err(|error| {
+        FilesystemError::CommandFailed(format!("parse {FS_STATE_PATH} failed: {error}"))
+    })
 }
 
 async fn save_fs_state(state: &FsState) -> Result<(), FilesystemError> {
@@ -6211,6 +6366,125 @@ fn identity_mismatch_failure(
         missing_devices: Vec::new(),
         raw: message,
     }
+}
+
+fn classify_unavailable_selection(
+    conflicting_visible_identity: bool,
+    canonical_mountpoint_occupied: bool,
+    persisted_path_has_expected_uuid: bool,
+) -> MountFailureReason {
+    if conflicting_visible_identity
+        || canonical_mountpoint_occupied
+        || persisted_path_has_expected_uuid
+    {
+        MountFailureReason::IdentityMismatch
+    } else {
+        MountFailureReason::MissingDevice
+    }
+}
+
+fn unavailable_filesystem_failure(name: &str, paths: &[String]) -> MountFailure {
+    let missing_devices = paths
+        .iter()
+        .map(|path| MissingDevice {
+            path: path.clone(),
+            member_index: None,
+            label: None,
+        })
+        .collect::<Vec<_>>();
+    let message = if missing_devices.is_empty() {
+        format!(
+            "Filesystem '{name}' is not visible and has no available last-known member devices."
+        )
+    } else {
+        classify_mount_failure("", &missing_devices).1
+    };
+    MountFailure {
+        attempted_at: unix_now_secs(),
+        reason: MountFailureReason::MissingDevice,
+        message: message.clone(),
+        missing_devices,
+        raw: message,
+    }
+}
+
+async fn persisted_path_has_uuid(paths: &[String], expected_uuid: &str) -> bool {
+    for path in paths {
+        if Path::new(path).exists() && get_fs_uuid(path).await.as_deref() == Some(expected_uuid) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn filesystem_uuid_is_visible(uuid: &str) -> Result<bool, FilesystemError> {
+    let output = tokio::process::Command::new("blkid")
+        .args(["-U", uuid])
+        .output()
+        .await
+        .map_err(FilesystemError::Io)?;
+    if classify_blkid_uuid_probe(
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )? {
+        return Ok(true);
+    }
+
+    // bcachefs 1.38+ can make blkid miss mounted devices. A strict lsblk
+    // fallback prevents an alternate mount from being mistaken for absence.
+    let output = tokio::process::Command::new("lsblk")
+        .args(["--json", "--output", "UUID"])
+        .output()
+        .await
+        .map_err(FilesystemError::Io)?;
+    if !output.status.success() {
+        return Err(FilesystemError::CommandFailed(format!(
+            "lsblk UUID probe failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    lsblk_output_has_uuid(&String::from_utf8_lossy(&output.stdout), uuid)
+}
+
+fn classify_blkid_uuid_probe(
+    status_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<bool, FilesystemError> {
+    match status_code {
+        Some(0) if !stdout.trim().is_empty() => Ok(true),
+        Some(2) if stderr.trim().is_empty() => Ok(false),
+        code => Err(FilesystemError::CommandFailed(format!(
+            "blkid UUID probe failed with status {code:?}: {}",
+            stderr.trim()
+        ))),
+    }
+}
+
+fn lsblk_output_has_uuid(output: &str, expected_uuid: &str) -> Result<bool, FilesystemError> {
+    let parsed: serde_json::Value = serde_json::from_str(output).map_err(|error| {
+        FilesystemError::CommandFailed(format!("parse lsblk UUID probe: {error}"))
+    })?;
+    let roots = parsed
+        .get("blockdevices")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            FilesystemError::CommandFailed("lsblk UUID probe returned no blockdevices".into())
+        })?;
+
+    fn contains_uuid(nodes: &[serde_json::Value], expected_uuid: &str) -> bool {
+        nodes.iter().any(|node| {
+            node.get("uuid").and_then(serde_json::Value::as_str) == Some(expected_uuid)
+                || node
+                    .get("children")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|children| contains_uuid(children, expected_uuid))
+        })
+    }
+
+    Ok(contains_uuid(roots, expected_uuid))
 }
 
 /// Assemble a [`MountFailure`] from a failed mount: figure out which
@@ -7118,6 +7392,145 @@ mod tests {
         ));
         assert!(!mounted_identity_matches(Some("aaaaaaaa-main"), None));
         assert!(!mounted_identity_matches(None, Some("bbbbbbbb-usb")));
+    }
+
+    #[test]
+    fn unavailable_projection_is_uuid_based_actionable_and_sorted() {
+        let state = HashMap::from([
+            (
+                "zeta".to_string(),
+                FsMountOptions {
+                    uuid: Some("uuid-z".to_string()),
+                    devices: vec!["/dev/z-last".to_string()],
+                    mounted: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                "alpha".to_string(),
+                FsMountOptions {
+                    uuid: Some("uuid-a".to_string()),
+                    devices: vec!["/dev/a-last".to_string()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "live-under-another-name".to_string(),
+                FsMountOptions {
+                    uuid: Some("uuid-live".to_string()),
+                    ..Default::default()
+                },
+            ),
+            ("legacy".to_string(), FsMountOptions::default()),
+        ]);
+        let failure = unavailable_filesystem_failure("alpha", &["/dev/a-last".to_string()]);
+        let failures = HashMap::from([("alpha".to_string(), failure.clone())]);
+        let live = vec![filesystem_fixture("renamed", "uuid-live")];
+
+        let unavailable = project_unavailable_filesystems(&state, &live, &failures);
+
+        assert_eq!(unavailable.len(), 2);
+        assert_eq!(unavailable[0].name, "alpha");
+        assert_eq!(unavailable[0].uuid, "uuid-a");
+        assert_eq!(unavailable[0].devices, vec!["/dev/a-last"]);
+        assert!(unavailable[0].auto_mount);
+        assert_eq!(unavailable[0].last_mount_error, Some(failure));
+        assert_eq!(unavailable[1].name, "zeta");
+        assert!(!unavailable[1].auto_mount);
+    }
+
+    #[test]
+    fn forget_validation_requires_confirmation_uuid_and_actionable_state() {
+        let state = HashMap::from([
+            (
+                "tank".to_string(),
+                FsMountOptions {
+                    uuid: Some("uuid-tank".to_string()),
+                    ..Default::default()
+                },
+            ),
+            ("legacy".to_string(), FsMountOptions::default()),
+        ]);
+        let mut request = ForgetUnavailableRequest {
+            name: "tank".to_string(),
+            expected_uuid: "uuid-tank".to_string(),
+            confirm_name: "tank".to_string(),
+        };
+        assert!(validate_forget_unavailable(&state, &request).is_ok());
+
+        request.confirm_name = "other".to_string();
+        assert!(matches!(
+            validate_forget_unavailable(&state, &request),
+            Err(FilesystemError::InvalidInput(_))
+        ));
+        request.confirm_name = "tank".to_string();
+        request.expected_uuid = "different".to_string();
+        assert!(matches!(
+            validate_forget_unavailable(&state, &request),
+            Err(FilesystemError::InvalidInput(_))
+        ));
+        request.name = "legacy".to_string();
+        request.confirm_name = "legacy".to_string();
+        assert!(matches!(
+            validate_forget_unavailable(&state, &request),
+            Err(FilesystemError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn unavailable_selection_classifies_only_total_absence_as_missing() {
+        assert_eq!(
+            classify_unavailable_selection(false, false, false),
+            MountFailureReason::MissingDevice
+        );
+        assert_eq!(
+            classify_unavailable_selection(true, false, false),
+            MountFailureReason::IdentityMismatch
+        );
+        assert_eq!(
+            classify_unavailable_selection(false, true, false),
+            MountFailureReason::IdentityMismatch
+        );
+        assert_eq!(
+            classify_unavailable_selection(false, false, true),
+            MountFailureReason::IdentityMismatch
+        );
+
+        let paths = vec!["/dev/old-a".to_string(), "/dev/old-b".to_string()];
+        let failure = unavailable_filesystem_failure("tank", &paths);
+        assert_eq!(failure.reason, MountFailureReason::MissingDevice);
+        assert_eq!(
+            failure
+                .missing_devices
+                .iter()
+                .map(|device| device.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/dev/old-a", "/dev/old-b"]
+        );
+    }
+
+    #[test]
+    fn blkid_uuid_probe_distinguishes_absence_from_failure() {
+        assert!(classify_blkid_uuid_probe(Some(0), "/dev/sda\n", "").unwrap());
+        assert!(!classify_blkid_uuid_probe(Some(2), "", "").unwrap());
+        assert!(classify_blkid_uuid_probe(Some(2), "", "probe error").is_err());
+        assert!(classify_blkid_uuid_probe(Some(0), "", "").is_err());
+        assert!(classify_blkid_uuid_probe(Some(1), "", "permission denied").is_err());
+        assert!(classify_blkid_uuid_probe(None, "", "terminated").is_err());
+    }
+
+    #[test]
+    fn lsblk_uuid_probe_walks_nested_devices() {
+        let output = r#"{
+            "blockdevices": [
+                {"uuid": null, "children": [{"uuid": "root"}]},
+                {"uuid": "pool", "children": []}
+            ]
+        }"#;
+        assert!(lsblk_output_has_uuid(output, "root").unwrap());
+        assert!(lsblk_output_has_uuid(output, "pool").unwrap());
+        assert!(!lsblk_output_has_uuid(output, "missing").unwrap());
+        assert!(lsblk_output_has_uuid("{}", "pool").is_err());
     }
 
     #[test]

@@ -39,8 +39,9 @@ use nasty_sharing::smb::{
 use nasty_storage::disk_type::DiskTypeUpdate;
 use nasty_storage::filesystem::{
     BlockDevice, CreateFilesystemRequest, DestroyFilesystemRequest, DeviceActionRequest,
-    DeviceAddRequest, DeviceSetLabelRequest, DeviceSetStateRequest, Filesystem, FsUsage,
-    FsckStatus, ReconcileStatus, ScrubStatus, TpmBindStatus, UpdateFilesystemOptionsRequest,
+    DeviceAddRequest, DeviceSetLabelRequest, DeviceSetStateRequest, Filesystem,
+    ForgetUnavailableRequest, FsUsage, FsckStatus, ReconcileStatus, ScrubStatus, TpmBindStatus,
+    UnavailableFilesystem, UpdateFilesystemOptionsRequest,
 };
 use nasty_storage::io_scheduler::{IoSchedulerResult, IoSchedulerUpdate};
 use nasty_storage::subvolume::{
@@ -546,6 +547,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     result: Some(gen_schema::<Vec<Filesystem>>(generator)),
                 },
                 Method {
+                    name: "fs.unavailable.list",
+                    desc: "List UUID-bound host registrations whose filesystem is not currently visible. Filesystem-scoped tokens see only their assigned filesystem.",
+                    role: MethodRole::Any,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<Vec<UnavailableFilesystem>>(generator)),
+                },
+                Method {
                     name: "fs.get",
                     desc: "Get a single filesystem by name.",
                     role: MethodRole::Any,
@@ -561,9 +569,16 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.destroy",
-                    desc: "Unmount and unregister a filesystem. Does not wipe the devices.",
+                    desc: "Unmount a filesystem, wipe filesystem signatures/superblocks from its member devices, and unregister it.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<DestroyFilesystemRequest>(generator)),
+                    result: None,
+                },
+                Method {
+                    name: "fs.forget",
+                    desc: "Forget an unavailable filesystem's host-side registration and operation history without modifying disks or encryption key files.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<ForgetUnavailableRequest>(generator)),
                     result: None,
                 },
                 Method {

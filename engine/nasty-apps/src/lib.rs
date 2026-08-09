@@ -2589,29 +2589,27 @@ impl AppsService {
     }
 
     pub fn load_config() -> AppsConfig {
-        let content = match std::fs::read_to_string(STATE_PATH) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AppsConfig::default(),
-            Err(e) => {
-                // A non-NotFound read error (permissions, IO) means we
-                // *might* be silently resetting a real config. Log
-                // before returning defaults so the user can match a
-                // "my installed apps disappeared" report to the
-                // underlying cause.
-                warn!("apps.json read from {STATE_PATH} failed: {e} — using defaults");
-                return AppsConfig::default();
-            }
-        };
-        match serde_json::from_str(&content) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                warn!(
-                    "apps.json parse failed: {e} — file may be corrupt; \
-                     using defaults (any persisted config will be lost)"
-                );
+        match Self::load_config_strict() {
+            Ok(config) => config,
+            Err(error) => {
+                warn!("apps config failed to load: {error} — using defaults");
                 AppsConfig::default()
             }
         }
+    }
+
+    /// Load persisted app storage paths without silently replacing unreadable
+    /// or corrupt state. Destructive dependency checks use this to fail closed.
+    pub fn load_config_strict() -> Result<AppsConfig, AppsError> {
+        let content = match std::fs::read_to_string(STATE_PATH) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AppsConfig::default());
+            }
+            Err(error) => return Err(AppsError::Io(error)),
+        };
+        serde_json::from_str(&content)
+            .map_err(|error| AppsError::CommandFailed(format!("parse {STATE_PATH}: {error}")))
     }
 
     async fn save_config(config: &AppsConfig) -> Result<(), AppsError> {

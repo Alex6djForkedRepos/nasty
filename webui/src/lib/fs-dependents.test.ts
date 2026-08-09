@@ -7,6 +7,7 @@ function deps(over: Partial<FsDependents> = {}): FsDependents {
 		filesystem: 'tank',
 		mounted: true,
 		subvolumes: [],
+		apps_storage: false,
 		apps: [],
 		vms: [],
 		backup_jobs: [],
@@ -31,6 +32,12 @@ describe('summarizeDependents', () => {
 		// pluralization is fragile but the labels are hand-curated.
 		const summary = summarizeDependents(deps({ apps: ['jellyfin'] }));
 		expect(summary).toBe('• 1 app (jellyfin)');
+	});
+
+	it('reports Apps storage without installed apps', () => {
+		expect(summarizeDependents(deps({ apps_storage: true }))).toContain(
+			'Apps storage configuration',
+		);
 	});
 
 	it('plural noun and comma-joined names when multiple items', () => {
