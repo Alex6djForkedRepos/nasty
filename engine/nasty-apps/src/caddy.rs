@@ -360,11 +360,15 @@ impl CaddyApi {
     /// with the same name updates the port; with a different name
     /// adds another entry.
     pub async fn set_app_route(&self, route: &AppRoute) -> Result<(), String> {
+        // Resolve the insertion target before deleting the old route. If
+        // Caddy is unavailable or its config shape is unexpected, a healthy
+        // existing route remains in place.
+        let server = self.find_https_server_name().await?;
+
         // Remove any prior route with this name so we don't end up
         // with duplicates after a port change.
         let _ = self.remove_app_route(&route.name).await;
 
-        let server = self.find_https_server_name().await?;
         let payload = build_route_json(route);
 
         // PUT to `routes/0` inserts the new route at index 0,

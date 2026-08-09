@@ -1564,6 +1564,9 @@
 		composeName = name;
 		composeContent = content.compose_file;
 		composeEnv = content.env_file ?? '';
+		await loadIngresses();
+		newIngressPort = getIngress(name)?.host_port ?? null;
+		checkComposePortConflicts();
 		// Pre-fill the unsafe flag from the live apps list — compose apps store
 		// it in .nasty-meta.json next to the yaml; the engine surfaces it on App.
 		composeAllowUnsafe = apps.find(a => a.name === name)?.unsafe_mode ?? false;
