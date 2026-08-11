@@ -2224,7 +2224,7 @@ in {
           "github.com/caddy-dns/duckdns@v0.5.0"
           # Cloud / hosting providers commonly running NASty boxes.
           "github.com/caddy-dns/route53@v1.6.2"
-          "github.com/caddy-dns/hetzner/v2@v2.0.0"
+          "github.com/caddy-dns/hetzner/v2@v2.0.1"
           "github.com/caddy-dns/linode@v0.8.0"
           # Indie domain registrars with first-class API support.
           "github.com/caddy-dns/porkbun@v0.3.1"
@@ -2235,7 +2235,7 @@ in {
           "github.com/caddy-dns/desec@v1.1.0"
           "github.com/caddy-dns/rfc2136@v1.0.0"
         ];
-        hash = "sha256-Pws8IAyp2Iui5YrUIGswVBb/OiUeGz1mUyhJvjfn0Zo=";
+        hash = "sha256-koAljBnPgSNGZXlqVa4aab8A7EUb9xmXqEgBzZen0a0=";
       };
       globalConfig = ''
         # auto_https stays ON so Caddy generates the per-hostname
