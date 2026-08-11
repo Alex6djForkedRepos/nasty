@@ -20,7 +20,7 @@ jobs:
       run:
         working-directory: engine
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Version must match rust-toolchain.toml at the repo root.
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -47,9 +47,9 @@ jobs:
       run:
         working-directory: webui
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: 'npm'
@@ -76,7 +76,7 @@ jobs:
     name: npmDepsHash freshness
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -138,7 +138,7 @@ jobs:
     name: Installer template canonical shape and effective bcachefs pin
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Assert template uses follows for nixpkgs
         run: |
@@ -223,7 +223,7 @@ jobs:
     name: Installer wrapper-lock shape stable (nix flake lock idempotent)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: cachix/install-nix-action@v31
         with:
