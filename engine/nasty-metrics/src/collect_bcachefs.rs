@@ -539,10 +539,9 @@ fn parse_human_bytes(s: &str) -> Option<u64> {
         (n, 1024 * 1024)
     } else if let Some(n) = s.strip_suffix('G') {
         (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix('T') {
-        (n, 1024 * 1024 * 1024 * 1024)
     } else {
-        return None;
+        let n = s.strip_suffix('T')?;
+        (n, 1024 * 1024 * 1024 * 1024)
     };
 
     num_str
