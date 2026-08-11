@@ -104,17 +104,17 @@ ignore = [
     #           — heap/memory exhaustion from a single crafted start tag.
     # Both are fixed in quick-xml >= 0.41.0.
     #
-    # Reach in our codebase (two copies, both transitive via the backup
-    # stack, neither a direct dep):
+    # Reach in our codebase (transitive via the backup stack, not a direct
+    # dep):
     #   rustic_backend → opendal
-    #     → opendal-core            → quick-xml 0.39.4   (0194/0195)
-    #     → reqsign-aws-v4 / -google → quick-xml 0.40.1  (0194/0195)
+    #     → opendal-core → quick-xml 0.39.4 (0194/0195)
     #
-    # No bump is available: opendal 0.57.0 and rustic_backend 0.6.2 are
-    # already the newest crates.io releases and both cap quick-xml below
-    # 0.41, so `cargo update` cannot reach the fix (verified — it's a
-    # no-op). The only alternatives are forking/patching opendal, or
-    # waiting on its next release.
+    # A compatible update moved the reqsign-aws-v4 / -google branch to
+    # quick-xml 0.41.0, which is fixed. No bump is available for the copy
+    # above: opendal 0.57.0 and rustic_backend 0.6.2 are already the newest
+    # crates.io releases, and opendal-core caps quick-xml below 0.41. The
+    # only alternatives are forking/patching opendal, or waiting on its
+    # next release.
     #
     # Exposure model: quick-xml here parses XML *responses from the S3 /
     # Azure / GCS endpoint the operator configured as their backup
