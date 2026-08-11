@@ -36,7 +36,7 @@ jobs:
     name: cargo-deny (advisories, licenses, sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Official action: pins cargo-deny version, downloads a prebuilt
       # binary (no `cargo install` compile penalty), and runs `check`.
@@ -55,9 +55,9 @@ jobs:
       run:
         working-directory: webui
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -84,7 +84,7 @@ jobs:
       run:
         working-directory: engine
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
@@ -102,7 +102,7 @@ jobs:
       - name: Run geiger
         run: cargo geiger --workspace --output-format Ascii > /tmp/geiger.txt 2>&1 || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cargo-geiger-report
           path: /tmp/geiger.txt
