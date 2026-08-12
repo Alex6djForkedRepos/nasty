@@ -1,6 +1,11 @@
 # Vendored Swagger UI
 
-Vendored assets from [swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) v5.17.14.
+Vendored assets from the official
+[swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) v5.32.13 npm
+package:
+
+- Tarball: `https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-5.32.13.tgz`
+- Integrity: `sha512-qQobzb3DeC2LeK0j3E8812Ef4aIq1y9flJxvZkimkqUC/w4u7wS+yCc+VakqGJLweUUBrI24effhwo8OsAvNAw==`
 
 Served by the engine at `/api/docs` (via `engine/nasty-engine/src/swagger_ui.rs`)
 loading the spec from `/api/openapi.json`. Embedded into the engine binary at
@@ -12,16 +17,22 @@ runtime file dependency — including on air-gapped boxes.
 - `swagger-ui.css` — Stylesheet
 - `swagger-ui-bundle.js` — Bundled UI + all standard plugins
 - `LICENSE` — Apache 2.0
+- `NOTICE` — Upstream attribution notice
+- `swagger-ui-bundle.js.LICENSE.txt` — Bundled dependency license notices
 
 ## Updating
 
 ```sh
 ver=<new-version>
-cd vendor/swagger-ui
-curl -sLO "https://cdn.jsdelivr.net/npm/swagger-ui-dist@${ver}/swagger-ui.css"
-curl -sLO "https://cdn.jsdelivr.net/npm/swagger-ui-dist@${ver}/swagger-ui-bundle.js"
-curl -sLO "https://cdn.jsdelivr.net/npm/swagger-ui-dist@${ver}/LICENSE"
+tmp=$(mktemp -d)
+npm pack "swagger-ui-dist@${ver}" --pack-destination "$tmp"
+tar -xzf "$tmp/swagger-ui-dist-${ver}.tgz" -C "$tmp"
+for file in swagger-ui.css swagger-ui-bundle.js \
+  swagger-ui-bundle.js.LICENSE.txt LICENSE NOTICE; do
+  install -m 0644 "$tmp/package/$file" "vendor/swagger-ui/$file"
+done
 ```
 
-Update the version number in this README and in the comment at the top of
-`engine/nasty-engine/src/swagger_ui.rs`.
+Update the version, tarball, and registry integrity in this README, the comment
+at the top of `engine/nasty-engine/src/swagger_ui.rs`, and other current-version
+references.
