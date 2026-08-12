@@ -327,7 +327,12 @@
 
 	async function loadStatus() {
 		await withToast(async () => {
-			status = await client.call<UpdateStatus>('system.update.status');
+			// Version-update start RPCs can spend several minutes in remote
+			// preflight before they launch the transient unit. Requests on this
+			// socket are serialized, so status reconciliation queued behind a
+			// timed-out start must outwait that handler instead of timing out in
+			// the default 10 seconds and leaving optimistic UI state behind.
+			status = await client.call<UpdateStatus>('system.update.status', undefined, 300000);
 			if (readVersionPageAction() === 'version-switch') {
 				if (status?.state === 'running') {
 					taggedReleaseBanner = { kind: 'switching' };
@@ -380,13 +385,17 @@
 					url: row.url.trim(),
 					update: row.update
 				}))
-			}),
+			}, 120000),
 			'Version switch started'
 		);
 		if (result !== undefined) {
 			startPolling();
 		} else {
 			writeVersionPageAction(null);
+			// Reconcile with systemd instead of leaving the optimistic empty
+			// running state behind. This also catches a request that started
+			// server-side despite a transport timeout.
+			await loadStatus();
 			void loadTaggedReleaseBanner();
 		}
 		startingSwitch = false;
@@ -430,13 +439,13 @@
 		logCollapsed = false;
 		status = { state: 'running', log: '', reboot_required: false, webui_changed: false };
 		const result = await withToast(
-			() => client.call('system.version.upgrade_tagged_release'),
+			() => client.call('system.version.upgrade_tagged_release', undefined, 120000),
 			'Tagged release upgrade started'
 		);
 		if (result !== undefined) {
 			startPolling();
 		} else {
-			status = null;
+			await loadStatus();
 		}
 		startingUpgrade = false;
 	}
@@ -487,13 +496,13 @@
 					// place that opts into refreshing that package source.
 					update: row.name !== 'tailscale-nixpkgs'
 				}))
-			}),
+			}, 120000),
 			'Development build update started'
 		);
 		if (result !== undefined) {
 			startPolling();
 		} else {
-			status = null; // RPC failed — clear running state, keep everything else
+			await loadStatus();
 		}
 		startingDevUpgrade = false;
 	}
@@ -675,9 +684,9 @@
 					<div class="flex items-start gap-3 text-sm">
 						<span class="mt-0.5 text-amber-400">⚠</span>
 						<div class="flex-1">
-							<div class="font-medium text-amber-200">Last upgrade attempt failed</div>
+							<div class="font-medium text-amber-200">Last update attempt failed</div>
 							<p class="mt-1 text-muted-foreground">
-								The most recent upgrade didn't complete — the system kept running the previous generation. Common causes are <code class="font-mono text-xs">/boot</code> running out of space (try <code class="font-mono text-xs">nix-collect-garbage --delete-older-than 7d</code>) or a panic during activation. Hit Upgrade again to retry; the log below has the journal output from the failed attempt.
+								The most recent update didn't complete — the system kept running the previous generation. If disk space ran out, use <code class="font-mono text-xs">nasty-cleanup</code> to reclaim old generations and re-sync <code class="font-mono text-xs">/boot</code>. Then start the same action again: check and upgrade a development build, use Upgrade for a tagged release, or resubmit the selected Upstream inputs. The log below has the failed attempt's journal output.
 							</p>
 						</div>
 					</div>
@@ -779,9 +788,9 @@
 												{syncingBcachefs ? 'Switching...' : `Sync bcachefs → ${recommendedBcachefs}`}
 											</Button>
 										{/if}
-									{:else if taggedReleaseBanner.kind === 'ready' && (!taggedReleaseBanner.current_is_latest_standard_url || info?.last_attempt === 'failed')}
+									{:else if taggedReleaseBanner.kind === 'ready' && !taggedReleaseBanner.current_is_latest_standard_url}
 										<Button size="sm" onclick={upgradeTaggedRelease} disabled={startingUpgrade || status?.state === 'running'}>
-											{startingUpgrade ? 'Starting...' : (info?.last_attempt === 'failed' ? 'Retry Upgrade' : 'Upgrade')}
+											{startingUpgrade ? 'Starting...' : 'Upgrade'}
 										</Button>
 									{/if}
 								</div>
@@ -1003,8 +1012,10 @@
 					{/if}
 
 					{#if status?.state === 'failed'}
-						<div class="mt-4 flex gap-2">
-							<Button size="sm" onclick={doVersionSwitch}>Retry</Button>
+						<p class="mt-4 text-xs text-muted-foreground">
+							Resolve the cause, then start the same action again above. For disk-space failures, run <code class="font-mono">nasty-cleanup</code> first.
+						</p>
+						<div class="mt-3 flex gap-2">
 							<Button variant="secondary" size="sm" onclick={() => status = { state: 'idle', log: '', reboot_required: false, webui_changed: false }}>Dismiss</Button>
 						</div>
 					{/if}
