@@ -73,6 +73,10 @@ Apps run on Docker. You can deploy single containers or full Compose stacks from
 
 Both features are under active development. Contributions in these areas would have outsized impact.
 
+## Can I run Jellyfin?
+
+Yes. Jellyfin runs as a Docker Compose app and does not require any NixOS experience. See [Jellyfin on NASty](docs/jellyfin.md) for a safe CPU/direct-play setup, optional HTTPS and hardware acceleration, updates, backups, and troubleshooting.
+
 ## How can I help?
 
 Try it. Break it. Tell me what sucks. Open issues. Send patches. Or just use it and let the telemetry tell me you exist — that alone is motivating.
