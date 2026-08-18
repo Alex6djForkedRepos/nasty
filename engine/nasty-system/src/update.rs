@@ -336,6 +336,7 @@ PROFILE_MUTATED=false
 MARKER_SET=false
 TAILSCALE_REQUIRED=false
 TAILSCALE_IP_BEFORE=""
+TRANSACTION_STARTED_AT=$(date '+%Y-%m-%d %H:%M:%S')
 
 _proxy_conf() {
     readlink -f /run/current-system/etc/caddy/Caddyfile 2>/dev/null || true
@@ -361,6 +362,24 @@ wait_for_previous_tailscale() {
     return 1
 }
 
+dump_failure_diagnostics() {
+    local phase="$1"
+    echo "--- $phase: failed services ---"
+    systemctl --failed --no-pager --full || true
+    echo "--- $phase: relevant service status ---"
+    systemctl status --no-pager --full --lines=30 \
+        nasty-engine.service caddy.service nasty-tailscale.service \
+        docker.service containerd.service nftables.service || true
+    echo "--- $phase: nasty-engine journal ---"
+    journalctl --since "$TRANSACTION_STARTED_AT" --no-pager -n 160 \
+        -u nasty-engine.service || true
+    echo "--- $phase: supporting service journal ---"
+    journalctl --since "$TRANSACTION_STARTED_AT" --no-pager -n 160 \
+        -u caddy.service -u nasty-tailscale.service -u docker.service \
+        -u containerd.service -u nftables.service || true
+    echo "--- end $phase diagnostics ---"
+}
+
 cleanup() {
 @BD_CLEANUP@
     rm -rf "$WORK_DIR"
@@ -383,6 +402,9 @@ rollback_transaction() {
     trap - ERR TERM INT HUP
     set +e
     echo "==> Update transaction failed (exit $rc); restoring the previous system..."
+    if $PROFILE_MUTATED; then
+        dump_failure_diagnostics "candidate activation failure"
+    fi
     if $PROFILE_MUTATED && ! $MARKER_SET; then
         if install -m 0600 /dev/null "$MARKER"; then
             MARKER_SET=true
@@ -464,15 +486,13 @@ SIGNAL_ROLLBACK_EOF
         rm -f "$MARKER" || rollback_ok=false
     fi
     rm -f "$LIVE_DIR/.flake.nix.nasty-new" "$LIVE_DIR/.flake.lock.nasty-new"
-    echo "--- journalctl -u nixos-rebuild-switch-to-configuration -n 60 ---"
-    journalctl -u nixos-rebuild-switch-to-configuration --no-pager -n 60 || true
-    echo "--- end journal dump ---"
     if $detached_started; then
         echo "==> Previous-generation activation continues in $ROLLBACK_UNIT.service"
 @BD_CLEANUP@
     elif $rollback_ok; then
         cleanup
     else
+        dump_failure_diagnostics "rollback failure"
         echo "==> CRITICAL: automatic rollback failed."
         echo "==> Recovery remains suppressed; backups are in $BACKUP"
 @BD_CLEANUP@
@@ -4372,6 +4392,27 @@ proc /proc proc rw 0 0\n\
         assert!(script.contains("--property=Nice=10"));
         assert!(script.contains("--property=IOSchedulingClass=best-effort"));
         assert!(script.contains("--property=IOSchedulingPriority=7"));
+    }
+
+    #[test]
+    fn wrapper_transaction_captures_actionable_failure_diagnostics() {
+        let script = rendered_transaction();
+        let candidate_dump = script
+            .find("dump_failure_diagnostics \"candidate activation failure\"")
+            .unwrap();
+        let rollback_activation = script
+            .find("\"$OLD_SYSTEM/bin/switch-to-configuration\" switch")
+            .unwrap();
+
+        assert!(candidate_dump < rollback_activation);
+        assert!(script.contains("TRANSACTION_STARTED_AT=$(date"));
+        assert!(script.contains("systemctl --failed --no-pager --full"));
+        assert!(script.contains("nasty-engine.service caddy.service nasty-tailscale.service"));
+        assert!(script.contains("docker.service containerd.service nftables.service"));
+        assert!(script.contains("journalctl --since \"$TRANSACTION_STARTED_AT\""));
+        assert!(script.contains("-u nasty-engine.service"));
+        assert!(script.contains("dump_failure_diagnostics \"rollback failure\""));
+        assert!(!script.contains("nixos-rebuild-switch-to-configuration"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{prelude::*, reload};
 
 mod app_deploy;
@@ -431,7 +431,21 @@ async fn main() -> anyhow::Result<()> {
                     let dc_enabled = nasty_system::dc::DcService::load_config().await.is_some();
                     let (iscsi_ports, nvmeof_ports) =
                         router::share::portal_firewall_ports(&state).await?;
-                    let published = router::apps::published_firewall_ports(&state).await?;
+                    let published = match tokio::time::timeout(
+                        secs(5),
+                        router::apps::published_firewall_ports(&state),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            warn!(
+                                "Docker app-port discovery exceeded 5s during firewall initialization; \
+                                 starting fail-closed with app ports blocked until app restoration reconciles them"
+                            );
+                            Vec::new()
+                        }
+                    };
                     state
                         .firewall
                         .init(

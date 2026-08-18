@@ -11,7 +11,9 @@
 //! docker-compose.yml files and using Docker's `com.docker.compose.project` label.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use bollard::Docker;
 use bollard::models::{
@@ -37,6 +39,8 @@ pub use caddy::{CaddyRouteSummary, HostCert};
 const STATE_PATH: &str = "/var/lib/nasty/apps-enabled";
 const COMPOSE_DIR: &str = "/var/lib/nasty/apps";
 const DOCKER_SERVICE: &str = "docker.service";
+const DOCKER_PING_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Stable, relocation-proof home for container persistent data (#436).
 /// A symlink whose target is the real appdata subvolume on some
 /// bcachefs filesystem — compose files reference `/appdata/<app>/…`,
@@ -5353,7 +5357,7 @@ impl AppsService {
 
     async fn is_docker_ready(&self) -> bool {
         match self.docker() {
-            Ok(d) => d.ping().await.is_ok(),
+            Ok(d) => completes_ok_within(DOCKER_PING_TIMEOUT, d.ping()).await,
             Err(_) => false,
         }
     }
@@ -5828,6 +5832,13 @@ impl AppsService {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
+
+async fn completes_ok_within<F, T, E>(limit: Duration, operation: F) -> bool
+where
+    F: Future<Output = Result<T, E>>,
+{
+    matches!(tokio::time::timeout(limit, operation).await, Ok(Ok(_)))
+}
 
 /// Container name for simple apps: "nasty-{name}"
 fn container_name(app_name: &str) -> String {
@@ -6810,12 +6821,22 @@ async fn fetch_manifest_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppVolume, InstallAppRequest, StartupConfig, compose_file_args, docker_data_root_status,
-        extract_user_env, render_env_file, render_startup_override, validate_app_name,
-        validate_new_app_name, validate_new_app_request, validate_simple_volumes,
-        validate_volume_name,
+        AppVolume, InstallAppRequest, StartupConfig, completes_ok_within, compose_file_args,
+        docker_data_root_status, extract_user_env, render_env_file, render_startup_override,
+        validate_app_name, validate_new_app_name, validate_new_app_request,
+        validate_simple_volumes, validate_volume_name,
     };
     use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn bounded_operation_distinguishes_success_error_and_stall() {
+        assert!(completes_ok_within(Duration::ZERO, async { Ok::<_, ()>(()) }).await);
+        assert!(!completes_ok_within(Duration::ZERO, async { Err::<(), _>(()) }).await);
+        assert!(
+            !completes_ok_within(Duration::ZERO, std::future::pending::<Result<(), ()>>(),).await
+        );
+    }
 
     #[test]
     fn new_app_name_accepts_conservative_grammar() {
