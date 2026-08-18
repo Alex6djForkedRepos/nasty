@@ -10,10 +10,10 @@
     tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # ── bcachefs override (optional) ──────────────────────────────
-    # Pinned to v1.39.1 release tag.
+    # Pinned to v1.39.2 release tag.
     # To revert to pure nixpkgs: comment out these two lines.
     # No other changes needed — bcachefs.nix defaults to pkgs.bcachefs-tools.
-    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.39.1";
+    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.39.2";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
 
     # ── lanzaboote (Secure Boot for NixOS) ─────────────────────────
