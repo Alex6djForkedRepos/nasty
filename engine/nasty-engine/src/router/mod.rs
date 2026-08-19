@@ -1501,6 +1501,38 @@ pub(crate) async fn evaluate_active_alerts_inner(
             .collect(),
     };
 
+    let mut certificates = Vec::new();
+    let (certificate_statuses, certificate_inventory_complete) =
+        nasty_system::settings::list_host_tls_statuses_with_coverage().await;
+    if !certificate_inventory_complete {
+        coverage.mark_metric(alerts::AlertMetric::CertificateExpiryDays);
+        coverage.mark_metric(alerts::AlertMetric::CertificateRenewalFailure);
+    }
+    for status in certificate_statuses {
+        // Direct-IP access uses Caddy's short-lived internal CA and is
+        // intentionally excluded from public ACME expiry alerts.
+        if status.host.parse::<std::net::IpAddr>().is_ok() {
+            continue;
+        }
+        if status.expires_in_days.is_none() {
+            coverage.mark_source(
+                alerts::AlertMetric::CertificateExpiryDays,
+                status.host.clone(),
+            );
+        }
+        if !status.renewal_observed {
+            coverage.mark_source(
+                alerts::AlertMetric::CertificateRenewalFailure,
+                status.host.clone(),
+            );
+        }
+        certificates.push(alerts::CertificateHealth {
+            host: status.host,
+            expires_in_days: status.expires_in_days,
+            renewal_error: status.renewal_error,
+        });
+    }
+
     let (mut active, unavailable_disk_metrics) = state
         .alerts
         .evaluate(
@@ -1509,6 +1541,7 @@ pub(crate) async fn evaluate_active_alerts_inner(
             &disk_summary,
             &bcachefs_health,
             &kernel_alert,
+            &certificates,
         )
         .await;
     for metric in unavailable_disk_metrics {

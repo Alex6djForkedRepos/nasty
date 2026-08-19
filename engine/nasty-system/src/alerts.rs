@@ -59,6 +59,10 @@ pub enum AlertMetric {
     /// switch-to-configuration step fails with ENOSPC trying to copy
     /// the new initrd onto the ESP.
     BootDiskFreeMb,
+    /// Days remaining before a managed ACME certificate expires.
+    CertificateExpiryDays,
+    /// Caddy reported a failed ACME issuance or renewal attempt.
+    CertificateRenewalFailure,
     // Kernel error monitoring
     KernelErrors,
 }
@@ -258,6 +262,7 @@ impl AlertService {
         disk_health: &[DiskHealthSummary],
         bcachefs_health: &[BcachefsHealth],
         kernel_errors: &KernelErrorAlert,
+        certificates: &[CertificateHealth],
     ) -> (Vec<ActiveAlert>, Vec<AlertMetric>) {
         let state = self.state.read().await;
         let disk_free = DiskFreeSpace {
@@ -271,7 +276,7 @@ impl AlertService {
         if disk_free.boot_free_mb.is_none() {
             unavailable.push(AlertMetric::BootDiskFreeMb);
         }
-        let alerts = evaluate_rules(
+        let mut alerts = evaluate_rules(
             &state.rules,
             stats,
             filesystems,
@@ -280,6 +285,7 @@ impl AlertService {
             kernel_errors,
             disk_free,
         );
+        alerts.extend(evaluate_certificate_rules(&state.rules, certificates));
         (alerts, unavailable)
     }
 
@@ -854,9 +860,82 @@ fn evaluate_rules(
                     });
                 }
             }
+            AlertMetric::CertificateExpiryDays | AlertMetric::CertificateRenewalFailure => {
+                // Evaluated separately because certificate state is not part
+                // of the metrics-service snapshot.
+            }
         }
     }
 
+    alerts
+}
+
+fn evaluate_certificate_rules(
+    rules: &[AlertRule],
+    certificates: &[CertificateHealth],
+) -> Vec<ActiveAlert> {
+    let mut alerts = Vec::new();
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        match rule.metric {
+            AlertMetric::CertificateExpiryDays => {
+                for certificate in certificates {
+                    let Some(days) = certificate.expires_in_days else {
+                        continue;
+                    };
+                    let value = days as f64;
+                    if !check_condition(value, &rule.condition, rule.threshold) {
+                        continue;
+                    }
+                    let message = if days < 0 {
+                        format!(
+                            "TLS certificate for {} expired {} day(s) ago",
+                            certificate.host,
+                            days.unsigned_abs()
+                        )
+                    } else {
+                        format!(
+                            "TLS certificate for {} expires in {days} day(s) (threshold: {:.0} days)",
+                            certificate.host, rule.threshold
+                        )
+                    };
+                    alerts.push(ActiveAlert {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        severity: rule.severity.clone(),
+                        metric: rule.metric.clone(),
+                        message,
+                        current_value: value,
+                        threshold: rule.threshold,
+                        source: certificate.host.clone(),
+                    });
+                }
+            }
+            AlertMetric::CertificateRenewalFailure => {
+                if !check_condition(1.0, &rule.condition, rule.threshold) {
+                    continue;
+                }
+                for certificate in certificates {
+                    let Some(error) = certificate.renewal_error.as_deref() else {
+                        continue;
+                    };
+                    alerts.push(ActiveAlert {
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        severity: rule.severity.clone(),
+                        metric: rule.metric.clone(),
+                        message: format!(
+                            "TLS certificate issuance or renewal failed for {}: {error}",
+                            certificate.host
+                        ),
+                        current_value: 1.0,
+                        threshold: rule.threshold,
+                        source: certificate.host.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
     alerts
 }
 
@@ -866,6 +945,13 @@ pub struct FsUsage {
     pub name: String,
     pub used_bytes: u64,
     pub total_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct CertificateHealth {
+    pub host: String,
+    pub expires_in_days: Option<i64>,
+    pub renewal_error: Option<String>,
 }
 
 /// ATA SMART attribute IDs flagged as critical per Scrutiny's
@@ -1285,6 +1371,33 @@ fn default_rules() -> Vec<AlertRule> {
             metric: AlertMetric::BootDiskFreeMb,
             condition: AlertCondition::Below,
             threshold: 30.0,
+            severity: AlertSeverity::Critical,
+        },
+        AlertRule {
+            id: "certificate-expiry-warn".into(),
+            name: "TLS certificate expiring soon".into(),
+            enabled: true,
+            metric: AlertMetric::CertificateExpiryDays,
+            condition: AlertCondition::Below,
+            threshold: 31.0,
+            severity: AlertSeverity::Warning,
+        },
+        AlertRule {
+            id: "certificate-expiry-crit".into(),
+            name: "TLS certificate expiry critical".into(),
+            enabled: true,
+            metric: AlertMetric::CertificateExpiryDays,
+            condition: AlertCondition::Below,
+            threshold: 8.0,
+            severity: AlertSeverity::Critical,
+        },
+        AlertRule {
+            id: "certificate-renewal-failure".into(),
+            name: "TLS certificate renewal failed".into(),
+            enabled: true,
+            metric: AlertMetric::CertificateRenewalFailure,
+            condition: AlertCondition::Equals,
+            threshold: 1.0,
             severity: AlertSeverity::Critical,
         },
         // Kernel error monitoring
@@ -2202,6 +2315,49 @@ mod tests {
             },
         );
         assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn certificate_expiry_rules_fire_per_host() {
+        let warning = rule(
+            AlertMetric::CertificateExpiryDays,
+            AlertCondition::Below,
+            30.0,
+        );
+        let certificates = vec![
+            CertificateHealth {
+                host: "nas.example.com".into(),
+                expires_in_days: Some(12),
+                renewal_error: None,
+            },
+            CertificateHealth {
+                host: "healthy.example.com".into(),
+                expires_in_days: Some(60),
+                renewal_error: None,
+            },
+        ];
+        let alerts = evaluate_certificate_rules(&[warning], &certificates);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "nas.example.com");
+        assert_eq!(alerts[0].current_value, 12.0);
+    }
+
+    #[test]
+    fn certificate_renewal_failure_includes_caddy_error() {
+        let failure = rule(
+            AlertMetric::CertificateRenewalFailure,
+            AlertCondition::Equals,
+            1.0,
+        );
+        let certificates = vec![CertificateHealth {
+            host: "nas.example.com".into(),
+            expires_in_days: Some(5),
+            renewal_error: Some("cloudflare: Invalid access token".into()),
+        }];
+        let alerts = evaluate_certificate_rules(&[failure], &certificates);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "nas.example.com");
+        assert!(alerts[0].message.contains("Invalid access token"));
     }
 
     // ── default_rules smoke ────────────────────────────────────────

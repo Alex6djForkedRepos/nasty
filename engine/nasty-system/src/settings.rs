@@ -157,24 +157,44 @@ async fn load_app_subdomains() -> Vec<String> {
 /// The app name is the manifest's `name` field, falling back to the
 /// file stem. Best-effort, same as [`load_app_subdomains`].
 async fn load_app_ingress_hosts() -> Vec<(String, String)> {
+    load_app_ingress_hosts_with_coverage().await.0
+}
+
+async fn load_app_ingress_hosts_with_coverage() -> (Vec<(String, String)>, bool) {
     let dir = "/var/lib/nasty/apps";
     let mut out = Vec::new();
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(d) => d,
-        Err(_) => return out,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (out, true),
+        Err(_) => return (out, false),
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    let mut complete = true;
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(_) => {
+                complete = false;
+                break;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         let v: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         let Some(host) = v
             .get("ingress_subdomain")
@@ -198,7 +218,7 @@ async fn load_app_ingress_hosts() -> Vec<(String, String)> {
             .unwrap_or_default();
         out.push((host.to_string(), name));
     }
-    out
+    (out, complete)
 }
 
 const STATE_PATH: &str = "/var/lib/nasty/settings.json";
@@ -1347,9 +1367,9 @@ fn build_policy_set(
     policies
 }
 
-/// Locate the cert Caddy is currently serving for `domain` when ACME
-/// is on. Returns None when no managed cert is on disk yet — caller
-/// surfaces that as "still issuing".
+/// Locate the newest issued cert Caddy has stored for `domain` when
+/// ACME is on. Returns None when no managed cert is on disk yet —
+/// caller surfaces that as "still issuing".
 ///
 /// We only look under Caddy's ACME-issuer subtrees
 /// (`certificates/acme-v02.*` etc.) — NOT under the internal-CA
@@ -1357,31 +1377,22 @@ fn build_policy_set(
 /// by Caddy's local-authority cert. The internal CA's cert is what
 /// the `:443` fallback serves, and the WebUI's "active certificate"
 /// view is about the *managed* cert.
-async fn locate_serving_cert(settings: &Settings) -> Option<String> {
+async fn locate_serving_cert(settings: &Settings) -> Option<(String, CertInfo)> {
     if !settings.tls_acme_enabled {
         return None;
     }
     let domain = settings.tls_domain.as_deref()?;
-    let base = format!("{CADDY_DATA_DIR}/.local/share/caddy/certificates");
-    let mut endpoints = tokio::fs::read_dir(&base).await.ok()?;
-    while let Ok(Some(ep)) = endpoints.next_entry().await {
-        let name = ep.file_name().to_string_lossy().into_owned();
-        // Skip the internal-CA dir — those certs are for the fallback,
-        // not for the managed hostname.
-        if name.starts_with("local") {
-            continue;
-        }
-        let candidate = format!("{}/{domain}/{domain}.crt", ep.path().display());
-        if tokio::fs::metadata(&candidate).await.is_ok() {
-            return Some(candidate);
-        }
-    }
-    None
+    let (_, caddy_complete, active_staging) = fetch_caddy_tls_inventory().await;
+    let preferred_staging = if caddy_complete {
+        active_staging?
+    } else {
+        settings.tls_acme_staging
+    };
+    newest_cert_for_host(domain, false, Some(preferred_staging)).await
 }
 
 /// Repopulate the cached ACME status struct from whatever cert Caddy is
-/// (or isn't yet) serving. Cheap to call repeatedly — does at most one
-/// directory listing + one cert parse.
+/// (or isn't yet) serving.
 pub async fn refresh_acme_status_from_disk(settings: &Settings) {
     let domain = settings.tls_domain.clone();
     if !settings.tls_acme_enabled {
@@ -1401,7 +1412,7 @@ pub async fn refresh_acme_status_from_disk(settings: &Settings) {
         return;
     }
 
-    let Some(path) = locate_serving_cert(settings).await else {
+    let Some((_, cert_info)) = locate_serving_cert(settings).await else {
         // ACME enabled but no managed cert on disk yet — still issuing.
         set_acme_status(
             "running",
@@ -1410,13 +1421,23 @@ pub async fn refresh_acme_status_from_disk(settings: &Settings) {
         );
         return;
     };
-    let cert_info = read_cert_info(&path).await;
+    let expires_in_days = cert_info
+        .expires
+        .as_deref()
+        .and_then(|expires| certificate_expires_in_days(expires, chrono::Utc::now()));
     let status = ACME_STATUS.get_or_init(|| std::sync::Mutex::new(AcmeStatus::default()));
     if let Ok(mut s) = status.lock() {
-        s.state = "success".into();
-        s.message = match domain.as_deref() {
-            Some(d) => format!("Certificate active for {d}"),
-            None => "Certificate active".into(),
+        let expired = expires_in_days.is_some_and(|days| days < 0);
+        s.state = if expired { "error" } else { "success" }.into();
+        s.message = match (expired, domain.as_deref(), cert_info.expires.as_deref()) {
+            (true, Some(d), Some(expires)) => {
+                format!("Certificate for {d} expired on {expires}")
+            }
+            (true, Some(d), None) => format!("Certificate for {d} has expired"),
+            (true, None, Some(expires)) => format!("Certificate expired on {expires}"),
+            (true, None, None) => "Certificate has expired".into(),
+            (false, Some(d), _) => format!("Certificate active for {d}"),
+            (false, None, _) => "Certificate active".into(),
         };
         s.domain = domain;
         s.expires = cert_info.expires;
@@ -1438,6 +1459,20 @@ struct CertInfo {
     expires: Option<String>,
     issued: Option<String>,
     issuer: Option<String>,
+    issued_timestamp: Option<i64>,
+}
+
+fn certificate_expires_in_days(expires: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let expires = chrono::DateTime::parse_from_rfc2822(expires).ok()?;
+    Some((expires.timestamp() - now.timestamp()).div_euclid(86_400))
+}
+
+fn certificate_state(expires_in_days: Option<i64>) -> &'static str {
+    match expires_in_days {
+        Some(days) if days < 0 => "expired",
+        Some(days) if days <= 30 => "expiring",
+        _ => "active",
+    }
 }
 
 /// Per-host certificate details for the Ingress overview page. Returned
@@ -1478,16 +1513,28 @@ pub struct HostCertInfo {
 /// richer state (issuing / failed / active) including the last error
 /// message when issuance is stuck.
 pub async fn cert_info_for_host(host: &str) -> Option<HostCertInfo> {
-    let path = locate_cert_for_host(host).await?;
-    let info = read_cert_info(&path).await;
+    let include_internal = host.parse::<std::net::IpAddr>().is_ok();
+    let preferred_staging = if include_internal {
+        None
+    } else {
+        Some(load().await.tls_acme_staging)
+    };
+    cert_info_for_host_with_environment(host, preferred_staging).await
+}
+
+async fn cert_info_for_host_with_environment(
+    host: &str,
+    preferred_staging: Option<bool>,
+) -> Option<HostCertInfo> {
+    let include_internal = host.parse::<std::net::IpAddr>().is_ok();
+    let (path, info) = newest_cert_for_host(host, include_internal, preferred_staging).await?;
     // Convert `expires` (RFC 2822) to days-from-now. Parse failure is
     // benign — the caller still sees `expires` as a string, just no
     // colour-coding. We use chrono since it's already in the deps.
-    let expires_in_days = info.expires.as_deref().and_then(|s| {
-        let parsed = chrono::DateTime::parse_from_rfc2822(s).ok()?;
-        let secs = parsed.timestamp() - chrono::Utc::now().timestamp();
-        Some(secs / 86_400)
-    });
+    let expires_in_days = info
+        .expires
+        .as_deref()
+        .and_then(|expires| certificate_expires_in_days(expires, chrono::Utc::now()));
     Some(HostCertInfo {
         issuer: info.issuer,
         issued: info.issued,
@@ -1498,9 +1545,12 @@ pub async fn cert_info_for_host(host: &str) -> Option<HostCertInfo> {
 }
 
 /// Per-host TLS state surfaced on the `/tls` page. Distinguishes the
-/// four states a managed hostname can be in:
+/// states a managed hostname can be in:
 ///
-/// - `active` — cert on disk, currently being served. `issuer` /
+/// - `active` — cert on disk with more than 30 days of validity.
+/// - `expiring` — cert on disk with 30 days or less of validity.
+/// - `expired` — cert on disk but its `notAfter` is in the past.
+///   `issuer` /
 ///   `expires` / `expires_in_days` are populated.
 /// - `issuing` — Caddy is actively working on getting a cert. Tail
 ///   of recent log lines for this host showed `obtaining
@@ -1528,6 +1578,13 @@ pub struct HostTlsStatus {
     /// line, verbatim. `pending` ⇒ None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Most recent failed issuance or renewal event from Caddy while a
+    /// certificate is still present on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_error: Option<String>,
+    /// Whether Caddy's recent ACME journal supplied a conclusive event
+    /// for this host, or a freshly valid certificate proved recovery.
+    pub renewal_observed: bool,
     /// Name of the app whose ingress owns this hostname, when the host
     /// is an app subdomain (vs. the WebUI's own TLS domain or an
     /// internal-CA IP). Lets the TLS page label the row so an operator
@@ -1551,37 +1608,66 @@ pub struct HostTlsStatus {
 ///          as `message`
 ///   3. No matching log lines ⇒ `pending`.
 pub async fn host_tls_status(host: &str) -> HostTlsStatus {
-    if let Some(info) = cert_info_for_host(host).await {
+    let logs = recent_caddy_acme_logs().await;
+    let (_, caddy_complete, active_staging) = fetch_caddy_tls_inventory().await;
+    let preferred_staging = if caddy_complete {
+        active_staging
+    } else {
+        Some(load().await.tls_acme_staging)
+    };
+    host_tls_status_with_logs(
+        host,
+        logs.as_deref(),
+        preferred_staging,
+        !caddy_complete || active_staging.is_some(),
+    )
+    .await
+}
+
+async fn host_tls_status_with_logs(
+    host: &str,
+    logs: Option<&str>,
+    preferred_staging: Option<bool>,
+    managed_acme_active: bool,
+) -> HostTlsStatus {
+    let include_certificate = managed_acme_active || host.parse::<std::net::IpAddr>().is_ok();
+    if let Some(info) = if include_certificate {
+        cert_info_for_host_with_environment(host, preferred_staging).await
+    } else {
+        None
+    } {
+        let state = certificate_state(info.expires_in_days);
+        let needs_renewal = info.expires_in_days.is_none_or(|days| days <= 30);
+        let event = if needs_renewal {
+            logs.and_then(|logs| classify_acme_journal_event(logs, host))
+        } else {
+            None
+        };
+        let renewal_error = event.as_ref().and_then(|event| {
+            (event.state == AcmeJournalState::Failed).then(|| event.message.clone())
+        });
+        let renewal_observed = !needs_renewal
+            || event.as_ref().is_some_and(|event| {
+                matches!(
+                    event.state,
+                    AcmeJournalState::Succeeded | AcmeJournalState::Failed
+                )
+            });
         return HostTlsStatus {
             host: host.to_string(),
-            state: "active".into(),
+            state: state.into(),
             issuer: info.issuer,
             issued: info.issued,
             expires: info.expires,
             expires_in_days: info.expires_in_days,
             message: Some(info.path),
+            renewal_error,
+            renewal_observed,
             app: None,
         };
     }
 
-    // Tail Caddy's journal for this host. JSON-formatted logs from
-    // certmagic always carry `"identifier":"<host>"` for ACME events
-    // — that's the field we grep for. 10-minute window covers a
-    // full DNS-01 attempt + a retry, but stays cheap.
-    let output = tokio::process::Command::new("journalctl")
-        .args(["-u", "caddy", "--since", "10 min ago", "--no-pager"])
-        .output()
-        .await;
-    let lines = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => String::new(),
-    };
-
-    // Walk lines newest-last (journalctl default). Find the most
-    // recent log mentioning this host; classify by content.
-    let needle = format!("\"identifier\":\"{host}\"");
-    let last = lines.lines().rev().find(|l| l.contains(&needle));
-    let Some(line) = last else {
+    let Some(event) = logs.and_then(|logs| classify_acme_journal_event(logs, host)) else {
         return HostTlsStatus {
             host: host.to_string(),
             state: "pending".into(),
@@ -1590,18 +1676,19 @@ pub async fn host_tls_status(host: &str) -> HostTlsStatus {
             expires: None,
             expires_in_days: None,
             message: None,
+            renewal_error: None,
+            renewal_observed: false,
             app: None,
         };
     };
 
-    let lower = line.to_lowercase();
-    let state = if lower.contains("could not get") || lower.contains("timed out") {
-        "failed"
-    } else if lower.contains("obtained successfully") {
-        "active"
-    } else {
-        "issuing"
+    let state = match event.state {
+        AcmeJournalState::Succeeded => "active",
+        AcmeJournalState::Failed => "failed",
+        AcmeJournalState::Issuing => "issuing",
     };
+    let renewal_error = (event.state == AcmeJournalState::Failed).then(|| event.message.clone());
+    let renewal_observed = event.state != AcmeJournalState::Issuing;
 
     HostTlsStatus {
         host: host.to_string(),
@@ -1610,27 +1697,124 @@ pub async fn host_tls_status(host: &str) -> HostTlsStatus {
         issued: None,
         expires: None,
         expires_in_days: None,
-        message: Some(extract_log_message(line)),
+        message: Some(event.message),
+        renewal_error,
+        renewal_observed,
         app: None,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcmeJournalState {
+    Succeeded,
+    Failed,
+    Issuing,
+}
+
+struct AcmeJournalEvent {
+    state: AcmeJournalState,
+    message: String,
+}
+
+fn classify_acme_journal_event(logs: &str, host: &str) -> Option<AcmeJournalEvent> {
+    let host = host.to_ascii_lowercase();
+    let needle = format!("\"identifier\":\"{host}\"");
+    let quoted_host = format!("\"{host}\"");
+    logs.lines().rev().find_map(|line| {
+        let lower = line.to_lowercase();
+        let matches_single = lower.contains(&needle);
+        let matches_plural = lower.contains("\"identifiers\":") && lower.contains(&quoted_host);
+        if !matches_single && !matches_plural {
+            return None;
+        }
+        let state =
+            if lower.contains("obtained successfully") || lower.contains("renewed successfully") {
+                AcmeJournalState::Succeeded
+            } else if lower.contains("could not get")
+                || lower.contains("timed out")
+                || lower.contains("\"level\":\"error\"")
+            {
+                AcmeJournalState::Failed
+            } else if lower.contains("obtaining certificate")
+                || lower.contains("renewing certificate")
+                || lower.contains("trying to solve challenge")
+                || lower.contains("using acme account")
+            {
+                AcmeJournalState::Issuing
+            } else {
+                return None;
+            };
+        Some(AcmeJournalEvent {
+            state,
+            message: extract_log_message(line),
+        })
+    })
+}
+
+async fn recent_caddy_acme_logs() -> Option<String> {
+    let mut command = tokio::process::Command::new("journalctl");
+    command.kill_on_drop(true).args([
+        "-u",
+        "caddy",
+        "--since",
+        "7 days ago",
+        "-n",
+        "2000",
+        "--no-pager",
+    ]);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Fetch the `certificates.automate` list from Caddy's admin API — the
 /// authoritative "what hosts should Caddy be obtaining certs for" set,
 /// written by our `set_tls_automation` flow. Empty on any error (admin
 /// API down, parse failure); callers still surface app ingress hosts.
-async fn fetch_caddy_automate_hosts() -> Vec<String> {
-    let url = "http://127.0.0.1:2019/config/apps/tls/certificates/automate";
+async fn fetch_caddy_tls_inventory() -> (Vec<String>, bool, Option<bool>) {
+    let url = "http://127.0.0.1:2019/config/apps/tls";
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
     else {
-        return Vec::new();
+        return (Vec::new(), false, None);
     };
     let Ok(resp) = client.get(url).send().await else {
-        return Vec::new();
+        return (Vec::new(), false, None);
     };
-    resp.json().await.unwrap_or_default()
+    match resp.error_for_status() {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(config) => {
+                let hosts = config
+                    .pointer("/certificates/automate")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                let staging = config
+                    .pointer("/automation/policies")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|policy| policy.get("issuers")?.as_array())
+                    .flatten()
+                    .find(|issuer| issuer.get("module").and_then(|v| v.as_str()) == Some("acme"))
+                    .map(|issuer| {
+                        issuer
+                            .get("ca")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|ca| ca.contains("acme-staging"))
+                    });
+                (hosts, true, staging)
+            }
+            Err(_) => (Vec::new(), false, None),
+        },
+        Err(_) => (Vec::new(), false, None),
+    }
 }
 
 /// Merge Caddy's formally-automated host list with app ingress hosts
@@ -1651,12 +1835,16 @@ fn merge_host_lists(
     automate: Vec<String>,
     app_hosts: Vec<(String, String)>,
 ) -> Vec<(String, Option<String>)> {
-    let app_map: std::collections::HashMap<String, String> = app_hosts.iter().cloned().collect();
+    let app_map: std::collections::HashMap<String, String> = app_hosts
+        .iter()
+        .map(|(host, app)| (host.to_ascii_lowercase(), app.clone()))
+        .collect();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for host in automate
         .into_iter()
         .chain(app_hosts.into_iter().map(|(host, _)| host))
+        .map(|host| host.to_ascii_lowercase())
     {
         if host == "nasty.local" {
             continue;
@@ -1671,20 +1859,56 @@ fn merge_host_lists(
 
 /// Return the list of all managed hostnames Caddy is currently
 /// tracking, with each one's current TLS status. Unions Caddy's
-/// `certificates.automate` set with the box's app ingress hosts (see
-/// [`merge_host_lists`]) and resolves status per host, so every
-/// hostname Caddy is serving or attempting — including app ingresses
-/// not yet in the automate set — appears on the /tls page.
+/// `certificates.automate` set, configured TLS domains, and the box's
+/// app ingress hosts (see [`merge_host_lists`]) and resolves status per
+/// host, so every hostname Caddy is serving or attempting — including
+/// app ingresses not yet in the automate set — appears on the /tls page.
 pub async fn list_host_tls_statuses() -> Vec<HostTlsStatus> {
-    let automate = fetch_caddy_automate_hosts().await;
-    let app_hosts = load_app_ingress_hosts().await;
+    list_host_tls_statuses_with_coverage().await.0
+}
+
+pub async fn list_host_tls_statuses_with_coverage() -> (Vec<HostTlsStatus>, bool) {
+    let (mut automate, caddy_complete, active_staging) = fetch_caddy_tls_inventory().await;
+    let settings = load().await;
+    if settings.tls_acme_enabled {
+        automate.extend(
+            [settings.tls_domain, settings.files_domain]
+                .into_iter()
+                .flatten()
+                .filter(|host| !host.trim().is_empty()),
+        );
+    } else {
+        automate.retain(|host| host == "nasty.local" || host.parse::<std::net::IpAddr>().is_ok());
+    }
+    let (app_hosts, apps_complete) = if settings.tls_acme_enabled {
+        load_app_ingress_hosts_with_coverage().await
+    } else {
+        (Vec::new(), true)
+    };
+    let hosts = merge_host_lists(automate, app_hosts);
+    if hosts.is_empty() {
+        return (Vec::new(), caddy_complete && apps_complete);
+    }
+    let logs = recent_caddy_acme_logs().await;
+    let preferred_staging = if caddy_complete {
+        active_staging
+    } else {
+        Some(settings.tls_acme_staging)
+    };
+    let managed_acme_active = !caddy_complete || active_staging.is_some();
     let mut out = Vec::new();
-    for (host, app) in merge_host_lists(automate, app_hosts) {
-        let mut status = host_tls_status(&host).await;
+    for (host, app) in hosts {
+        let mut status = host_tls_status_with_logs(
+            &host,
+            logs.as_deref(),
+            preferred_staging,
+            managed_acme_active,
+        )
+        .await;
         status.app = app;
         out.push(status);
     }
-    out
+    (out, caddy_complete && apps_complete)
 }
 
 /// Pull the human-readable `msg` field out of a Caddy JSON log line,
@@ -1725,14 +1949,47 @@ fn extract_json_string_field(line: &str, field: &str) -> Option<String> {
     Some(rest[..end].replace("\\\"", "\"").replace("\\\\", "\\"))
 }
 
-async fn locate_cert_for_host(host: &str) -> Option<String> {
+fn wildcard_covers_host(host: &str, suffix: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let suffix = suffix.to_ascii_lowercase();
+    host.strip_suffix(&format!(".{suffix}"))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'))
+}
+
+fn certificate_endpoint_allowed(
+    endpoint: &str,
+    include_internal: bool,
+    preferred_staging: Option<bool>,
+) -> bool {
+    let endpoint = endpoint.to_ascii_lowercase();
+    let internal = endpoint.starts_with("local");
+    if internal {
+        return include_internal;
+    }
+    preferred_staging.is_none_or(|staging| endpoint.contains("staging") == staging)
+}
+
+async fn locate_cert_candidates(
+    host: &str,
+    include_internal: bool,
+    preferred_staging: Option<bool>,
+) -> Vec<(String, bool)> {
+    let host = host.to_ascii_lowercase();
     let base = format!("{CADDY_DATA_DIR}/.local/share/caddy/certificates");
-    let mut endpoints = tokio::fs::read_dir(&base).await.ok()?;
+    let Ok(mut endpoints) = tokio::fs::read_dir(&base).await else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
     while let Ok(Some(ep)) = endpoints.next_entry().await {
+        let endpoint = ep.file_name().to_string_lossy().to_ascii_lowercase();
+        if !certificate_endpoint_allowed(&endpoint, include_internal, preferred_staging) {
+            continue;
+        }
         // Direct match: <endpoint>/<host>/<host>.crt
-        let direct = ep.path().join(host).join(format!("{host}.crt"));
+        let direct = ep.path().join(&host).join(format!("{host}.crt"));
         if tokio::fs::metadata(&direct).await.is_ok() {
-            return Some(direct.to_string_lossy().into_owned());
+            candidates.push((direct.to_string_lossy().into_owned(), true));
+            continue;
         }
         // Wildcard match: walk subdirs named `wildcard_.<suffix>` and
         // check whether `host` ends in `.<suffix>`. Cert filename
@@ -1741,17 +1998,40 @@ async fn locate_cert_for_host(host: &str) -> Option<String> {
             while let Ok(Some(sd)) = subdirs.next_entry().await {
                 let name = sd.file_name().to_string_lossy().into_owned();
                 if let Some(suffix) = name.strip_prefix("wildcard_.")
-                    && host.ends_with(&format!(".{suffix}"))
+                    && wildcard_covers_host(&host, suffix)
                 {
                     let candidate = sd.path().join(format!("{name}.crt"));
                     if tokio::fs::metadata(&candidate).await.is_ok() {
-                        return Some(candidate.to_string_lossy().into_owned());
+                        candidates.push((candidate.to_string_lossy().into_owned(), false));
                     }
                 }
             }
         }
     }
-    None
+    candidates
+}
+
+async fn newest_cert_for_host(
+    host: &str,
+    include_internal: bool,
+    preferred_staging: Option<bool>,
+) -> Option<(String, CertInfo)> {
+    let candidates = locate_cert_candidates(host, include_internal, preferred_staging).await;
+    let prefer_exact = candidates.iter().any(|(_, exact)| *exact);
+    let mut newest: Option<(String, CertInfo)> = None;
+    for (path, exact) in candidates {
+        if prefer_exact && !exact {
+            continue;
+        }
+        let info = read_cert_info(&path).await;
+        let replace = newest.as_ref().is_none_or(|(_, current)| {
+            info.issued_timestamp.unwrap_or(i64::MIN) > current.issued_timestamp.unwrap_or(i64::MIN)
+        });
+        if replace {
+            newest = Some((path, info));
+        }
+    }
+    newest
 }
 
 /// Read certificate details from a PEM file.
@@ -1760,6 +2040,7 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
         expires: None,
         issued: None,
         issuer: None,
+        issued_timestamp: None,
     };
     let pem_data = match tokio::fs::read(cert_path).await {
         Ok(d) => d,
@@ -1774,6 +2055,7 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
         Err(_) => return info,
     };
     let validity = cert.validity();
+    info.issued_timestamp = Some(validity.not_before.timestamp());
     info.issued = Some(
         validity
             .not_before
@@ -1807,9 +2089,11 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        EncryptedBlob, OidcSettings, Settings, SettingsUpdate, apply_domain_updates,
-        build_policy_set, caddy_acme_env, merge_host_lists, redact_oidc_secret,
-        resolve_dns_credentials, to_nix_string, validate_files_domain,
+        AcmeJournalState, EncryptedBlob, OidcSettings, Settings, SettingsUpdate,
+        apply_domain_updates, build_policy_set, caddy_acme_env, certificate_endpoint_allowed,
+        certificate_expires_in_days, certificate_state, classify_acme_journal_event,
+        merge_host_lists, redact_oidc_secret, resolve_dns_credentials, to_nix_string,
+        validate_files_domain, wildcard_covers_host,
     };
 
     fn fake_blob() -> EncryptedBlob {
@@ -1856,6 +2140,73 @@ mod tests {
         );
         let hosts: Vec<_> = out.iter().map(|(h, _)| h.as_str()).collect();
         assert_eq!(hosts, vec!["a.example", "b.example", "c.example"]);
+    }
+
+    #[test]
+    fn merge_host_lists_normalizes_dns_names() {
+        let out = merge_host_lists(
+            vec!["NAS.Example.COM".into()],
+            vec![("nas.example.com".into(), "app".into())],
+        );
+        assert_eq!(out, vec![("nas.example.com".into(), Some("app".into()))]);
+    }
+
+    #[test]
+    fn certificate_expiry_days_is_negative_immediately_after_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-18T11:38:36Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            certificate_expires_in_days("Tue, 18 Aug 2026 11:38:35 +0000", now),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn certificate_state_classifies_expiry_boundaries() {
+        assert_eq!(certificate_state(Some(31)), "active");
+        assert_eq!(certificate_state(Some(30)), "expiring");
+        assert_eq!(certificate_state(Some(0)), "expiring");
+        assert_eq!(certificate_state(Some(-1)), "expired");
+    }
+
+    #[test]
+    fn acme_journal_classification_uses_latest_relevant_host_event() {
+        let logs = r#"
+{"level":"error","msg":"certificate acquisition failed","identifier":"nas.example.com","error":"cloudflare: Invalid access token"}
+{"level":"info","msg":"certificate obtained successfully","identifier":"other.example.com"}
+"#;
+        let event = classify_acme_journal_event(logs, "nas.example.com").unwrap();
+        assert_eq!(event.state, AcmeJournalState::Failed);
+        assert_eq!(event.message, "cloudflare: Invalid access token");
+    }
+
+    #[test]
+    fn acme_journal_classification_recognizes_plural_renewal_success() {
+        let logs = r#"
+{"level":"error","msg":"renewal failed","identifier":"nas.example.com"}
+{"level":"info","msg":"certificate renewed successfully","identifiers":["nas.example.com"]}
+"#;
+        let event = classify_acme_journal_event(logs, "nas.example.com").unwrap();
+        assert_eq!(event.state, AcmeJournalState::Succeeded);
+    }
+
+    #[test]
+    fn wildcard_certificate_covers_exactly_one_label() {
+        assert!(wildcard_covers_host("app.example.com", "example.com"));
+        assert!(!wildcard_covers_host("deep.app.example.com", "example.com"));
+        assert!(!wildcard_covers_host("example.com", "example.com"));
+    }
+
+    #[test]
+    fn certificate_endpoint_matches_configured_environment() {
+        let production = "acme-v02.api.letsencrypt.org-directory";
+        let staging = "acme-staging-v02.api.letsencrypt.org-directory";
+        assert!(certificate_endpoint_allowed(production, false, Some(false)));
+        assert!(!certificate_endpoint_allowed(staging, false, Some(false)));
+        assert!(certificate_endpoint_allowed(staging, false, Some(true)));
+        assert!(!certificate_endpoint_allowed("local", false, None));
+        assert!(certificate_endpoint_allowed("local", true, None));
     }
 
     #[test]

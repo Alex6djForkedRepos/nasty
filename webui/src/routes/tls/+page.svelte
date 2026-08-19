@@ -101,12 +101,13 @@
 
 	type HostTlsStatus = {
 		host: string;
-		state: 'active' | 'issuing' | 'failed' | 'pending';
+		state: 'active' | 'expiring' | 'expired' | 'issuing' | 'failed' | 'pending';
 		issuer?: string;
 		issued?: string;
 		expires?: string;
 		expires_in_days?: number;
 		message?: string;
+		renewal_error?: string;
 		app?: string;
 	};
 
@@ -178,6 +179,8 @@
 	function badgeForState(s: string): { label: string; cls: string } {
 		switch (s) {
 			case 'active': return { label: 'active', cls: 'bg-green-500/15 text-green-400 border-green-500/40' };
+			case 'expiring': return { label: 'expiring', cls: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/40' };
+			case 'expired': return { label: 'expired', cls: 'bg-red-500/15 text-red-400 border-red-500/40' };
 			case 'issuing': return { label: 'issuing…', cls: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/40' };
 			case 'failed': return { label: 'failed', cls: 'bg-red-500/15 text-red-400 border-red-500/40' };
 			default: return { label: 'pending', cls: 'bg-muted text-muted-foreground border-border' };
@@ -345,7 +348,7 @@
 					class="w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
 					placeholder="admin@example.com"
 				/>
-				<span class="mt-1 block text-xs text-muted-foreground">Let's Encrypt sends expiry warnings here.</span>
+				<span class="mt-1 block text-xs text-muted-foreground">Used for ACME account registration and recovery. NASty alerts separately before certificates expire.</span>
 			</div>
 
 			<div class="mb-4">
@@ -610,17 +613,17 @@
 								<span class="inline-flex items-center rounded-md border px-2 py-0.5 text-[0.65rem] {badge.cls}">{badge.label}</span>
 							</td>
 							<td class="py-2 pr-3 text-xs">
-								{#if h.state === 'active'}
+								{#if h.expires}
 									<div>{h.issuer || '—'}</div>
-									{#if h.expires}
-										<div class="text-muted-foreground">{h.expires}{#if h.expires_in_days !== undefined && h.expires_in_days !== null} ({h.expires_in_days}d){/if}</div>
-									{/if}
+									<div class="text-muted-foreground">{h.expires}{#if h.expires_in_days !== undefined && h.expires_in_days !== null} ({h.expires_in_days}d){/if}</div>
 								{:else}
 									<span class="text-muted-foreground">—</span>
 								{/if}
 							</td>
 							<td class="py-2 text-xs">
-								{#if h.message}
+								{#if h.renewal_error}
+									<span class="text-red-400 break-all">{h.renewal_error}</span>
+								{:else if h.message}
 									<span class="text-muted-foreground break-all">{h.message}</span>
 								{:else if h.state === 'pending'}
 									<span class="text-muted-foreground">Waiting for Caddy to start issuance…</span>
