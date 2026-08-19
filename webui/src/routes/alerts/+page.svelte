@@ -52,6 +52,8 @@
 		bcachefs_reconcile_stalled: 'bcachefs Reconcile Stalled',
 		root_disk_free_gb: 'Root Partition Free (GB)',
 		boot_disk_free_mb: '/boot (ESP) Free (MB)',
+		certificate_expiry_days: 'TLS Certificate Validity (days)',
+		certificate_renewal_failure: 'TLS Certificate Renewal Failure',
 		kernel_errors: 'Kernel Errors',
 	});
 
