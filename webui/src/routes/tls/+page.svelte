@@ -5,16 +5,18 @@
 	import type { Settings } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import SortTh from '$lib/components/SortTh.svelte';
+	import { selectPrimaryTlsStatus, type AcmeStatus, type HostTlsStatus } from '$lib/tls-status';
 
 	const client = getClient();
 
 	let settings: Settings | null = $state(null);
 	let tlsDomain = $state('');
+	let configuredTlsDomain = $state('');
 	let filesDomain = $state('');
 	let configuredFilesDomain = $state('');
 	let tlsAcmeEmail = $state('');
 	let tlsAcmeEnabled = $state(false);
-	let acmeStatus: { state: string; message: string; domain?: string; expires?: string; issued?: string; issuer?: string; last_attempt?: string } | null = $state(null);
+	let acmeStatus: AcmeStatus | null = $state(null);
 	let tlsAcmeStaging = $state(false);
 	let tlsChallengeType = $state<'tls-alpn' | 'http' | 'dns'>('tls-alpn');
 	let tlsDnsProvider = $state('');
@@ -31,7 +33,11 @@
 	let savingTls = $state(false);
 	let tlsChanged = $state(false);
 	let editing = $state(false);
-	const certActive = $derived.by(() => Boolean(acmeStatus && acmeStatus.state === 'success' && tlsAcmeEnabled));
+	let hostStatuses: HostTlsStatus[] = $state([]);
+	const displayAcmeStatus = $derived.by(() =>
+		selectPrimaryTlsStatus(configuredTlsDomain, acmeStatus, hostStatuses)
+	);
+	const certActive = $derived.by(() => Boolean(displayAcmeStatus?.state === 'success' && tlsAcmeEnabled));
 	const configuredFilesPortalUrl = $derived(configuredFilesDomain ? `https://${configuredFilesDomain}/portal` : '');
 	const filesDomainError = $derived(validateOptionalFilesDomain(filesDomain, tlsDomain));
 
@@ -71,6 +77,7 @@
 	onMount(async () => {
 		settings = await client.call<Settings>('system.settings.get');
 		tlsDomain = settings?.tls_domain ?? '';
+		configuredTlsDomain = tlsDomain;
 		filesDomain = settings?.files_domain ?? '';
 		configuredFilesDomain = filesDomain;
 		tlsAcmeEmail = settings?.tls_acme_email ?? '';
@@ -99,19 +106,6 @@
 		hostStatusPollHandle = setInterval(refreshHostStatuses, 10_000) as unknown as number;
 	});
 
-	type HostTlsStatus = {
-		host: string;
-		state: 'active' | 'expiring' | 'expired' | 'issuing' | 'failed' | 'pending';
-		issuer?: string;
-		issued?: string;
-		expires?: string;
-		expires_in_days?: number;
-		message?: string;
-		renewal_error?: string;
-		app?: string;
-	};
-
-	let hostStatuses: HostTlsStatus[] = $state([]);
 	let hostStatusPollHandle: number | null = $state(null);
 
 	// ── Column sorting ──────────────────────────────────────────────────
@@ -232,6 +226,7 @@
 		);
 		if (result !== undefined) {
 			settings = result;
+			configuredTlsDomain = result.tls_domain ?? '';
 			filesDomain = result.files_domain ?? '';
 			configuredFilesDomain = filesDomain;
 			tlsChanged = false;
@@ -495,7 +490,7 @@
 			<Button size="sm" onclick={saveTls} disabled={savingTls || !tlsChanged || !!filesDomainError}>
 				{savingTls ? 'Saving…' : 'Save'}
 			</Button>
-			{#if tlsAcmeEnabled && acmeStatus?.state !== 'running'}
+			{#if tlsAcmeEnabled && displayAcmeStatus?.state !== 'running'}
 				<Button size="sm" variant="secondary" onclick={async () => {
 					await withToast(() => client.call('system.acme.retry'), 'Provisioning started');
 					startAcmePolling();
@@ -510,65 +505,69 @@
 	<!-- Status panel (right column) -->
 	<section class="rounded-lg border border-border p-5 self-start">
 		<h3 class="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Certificate Status</h3>
-		{#if !acmeStatus || acmeStatus.state === 'idle'}
+		{#if !displayAcmeStatus || displayAcmeStatus.state === 'idle'}
 			<div class="flex items-center gap-2 text-sm">
 				<span class="h-2 w-2 rounded-full bg-muted-foreground"></span>
 				<span class="text-muted-foreground">Self-signed (default)</span>
 			</div>
 			<p class="mt-2 text-xs text-muted-foreground">Browsers will show a security warning. Enable Let's Encrypt for a trusted certificate.</p>
-		{:else if acmeStatus.state === 'running'}
+		{:else if displayAcmeStatus.state === 'running'}
 			<div class="flex items-center gap-2 text-sm">
 				<span class="h-2 w-2 rounded-full bg-yellow-500 animate-pulse"></span>
 				<span class="text-yellow-500 font-medium">Provisioning</span>
 			</div>
-			{#if acmeStatus.domain}
-				<p class="mt-1 text-xs text-muted-foreground">{acmeStatus.domain}</p>
+			{#if displayAcmeStatus.domain}
+				<p class="mt-1 text-xs text-muted-foreground">{displayAcmeStatus.domain}</p>
 			{/if}
 			<div class="mt-3 rounded bg-muted/30 p-3">
-				<p class="text-xs text-muted-foreground whitespace-pre-wrap break-words">{acmeStatus.message}</p>
+				<p class="text-xs text-muted-foreground whitespace-pre-wrap break-words">{displayAcmeStatus.message}</p>
 			</div>
 			<div class="mt-3 h-1 overflow-hidden rounded-full bg-secondary">
 				<div class="h-full w-1/3 bg-yellow-500 animate-[indeterminate_1.5s_ease-in-out_infinite]"></div>
 			</div>
-			<Button size="xs" variant="secondary" class="mt-3" onclick={async () => { await client.call('system.acme.reset'); acmeStatus = await client.call('system.acme.status'); }}>
-				Dismiss
-			</Button>
-		{:else if acmeStatus.state === 'success'}
+			{#if displayAcmeStatus === acmeStatus}
+				<Button size="xs" variant="secondary" class="mt-3" onclick={async () => { await client.call('system.acme.reset'); acmeStatus = await client.call('system.acme.status'); }}>
+					Dismiss
+				</Button>
+			{/if}
+		{:else if displayAcmeStatus.state === 'success'}
 			<div class="flex items-center gap-2 text-sm">
 				<span class="h-2 w-2 rounded-full bg-green-500"></span>
 				<span class="text-green-500 font-medium">Certificate active</span>
 			</div>
-			{#if acmeStatus.domain}
-				<p class="mt-1 text-xs font-mono">{acmeStatus.domain}</p>
+			{#if displayAcmeStatus.domain}
+				<p class="mt-1 text-xs font-mono">{displayAcmeStatus.domain}</p>
 			{/if}
 			<div class="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-				{#if acmeStatus.issuer}
+				{#if displayAcmeStatus.issuer}
 					<span class="text-muted-foreground">Issuer</span>
-					<span>{acmeStatus.issuer}</span>
+					<span>{displayAcmeStatus.issuer}</span>
 				{/if}
-				{#if acmeStatus.issued}
+				{#if displayAcmeStatus.issued}
 					<span class="text-muted-foreground">Issued</span>
-					<span>{acmeStatus.issued}</span>
+					<span>{displayAcmeStatus.issued}</span>
 				{/if}
-				{#if acmeStatus.expires}
+				{#if displayAcmeStatus.expires}
 					<span class="text-muted-foreground">Expires</span>
-					<span>{acmeStatus.expires}</span>
+					<span>{displayAcmeStatus.expires}</span>
 				{/if}
 			</div>
-		{:else if acmeStatus.state === 'error'}
+		{:else if displayAcmeStatus.state === 'error'}
 			<div class="flex items-center gap-2 text-sm">
 				<span class="h-2 w-2 rounded-full bg-red-500"></span>
 				<span class="text-red-500 font-medium">Error</span>
 			</div>
-			{#if acmeStatus.domain}
-				<p class="mt-1 text-xs font-mono">{acmeStatus.domain}</p>
+			{#if displayAcmeStatus.domain}
+				<p class="mt-1 text-xs font-mono">{displayAcmeStatus.domain}</p>
 			{/if}
-			{#if acmeStatus.message}
-				<pre class="mt-2 max-h-48 overflow-auto rounded bg-red-950/30 p-3 text-xs text-red-300 whitespace-pre-wrap break-words">{acmeStatus.message}</pre>
+			{#if displayAcmeStatus.message}
+				<pre class="mt-2 max-h-48 overflow-auto rounded bg-red-950/30 p-3 text-xs text-red-300 whitespace-pre-wrap break-words">{displayAcmeStatus.message}</pre>
 			{/if}
-			<Button size="xs" variant="secondary" class="mt-3" onclick={async () => { await client.call('system.acme.reset'); acmeStatus = await client.call('system.acme.status'); }}>
-				Dismiss
-			</Button>
+			{#if displayAcmeStatus === acmeStatus}
+				<Button size="xs" variant="secondary" class="mt-3" onclick={async () => { await client.call('system.acme.reset'); acmeStatus = await client.call('system.acme.status'); }}>
+					Dismiss
+				</Button>
+			{/if}
 		{/if}
 	</section>
 
