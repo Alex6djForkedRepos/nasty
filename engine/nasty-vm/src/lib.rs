@@ -425,6 +425,87 @@ fn validate_vm_path(path: &str) -> Result<(), VmError> {
     Ok(())
 }
 
+fn validate_qemu_drive_value(field: &str, value: &str) -> Result<(), VmError> {
+    if value.contains([',', '\n', '\r', '\0']) {
+        return Err(VmError::InvalidDiskPath(format!(
+            "{field} contains characters that alter QEMU drive options"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_vm_disk(disk: &VmDisk) -> Result<(), VmError> {
+    validate_qemu_drive_value("disk path", &disk.path)?;
+    if !matches!(disk.interface.as_str(), "" | "virtio" | "scsi" | "ide") {
+        return Err(VmError::InvalidDiskPath(format!(
+            "unsupported disk interface '{}'",
+            disk.interface
+        )));
+    }
+    if disk
+        .cache
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "writeback" | "writethrough" | "none" | "unsafe"))
+    {
+        return Err(VmError::InvalidDiskPath(
+            "unsupported cache mode".to_string(),
+        ));
+    }
+    if disk
+        .aio
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "threads" | "native"))
+    {
+        return Err(VmError::InvalidDiskPath("unsupported I/O mode".to_string()));
+    }
+    if disk
+        .discard
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "unmap" | "ignore"))
+    {
+        return Err(VmError::InvalidDiskPath(
+            "unsupported discard mode".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vm_network_values(networks: &[VmNetwork]) -> Result<(), VmError> {
+    for network in networks {
+        if !matches!(network.mode.as_str(), "user" | "bridge") {
+            return Err(VmError::InvalidNetwork(format!(
+                "unsupported network mode '{}'",
+                network.mode
+            )));
+        }
+        if let Some(bridge) = network.bridge.as_deref()
+            && (bridge.is_empty()
+                || bridge.len() > 15
+                || !bridge.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || "._-".contains(character)
+                }))
+        {
+            return Err(VmError::InvalidNetwork(
+                "bridge name contains unsupported characters".to_string(),
+            ));
+        }
+        if let Some(mac) = network.mac.as_deref() {
+            let mut octets = mac.split(':');
+            let valid = (0..6).all(|_| {
+                octets.next().is_some_and(|octet| {
+                    octet.len() == 2 && octet.chars().all(|character| character.is_ascii_hexdigit())
+                })
+            }) && octets.next().is_none();
+            if !valid {
+                return Err(VmError::InvalidNetwork(
+                    "MAC address must contain six hexadecimal octets".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Path to the QMP unix socket for a given VM.
 fn qmp_socket_path(vm_id: &str) -> String {
     format!("{QMP_DIR}/{vm_id}.qmp")
@@ -671,6 +752,7 @@ impl VmService {
         // Validate disk paths exist and are within allowed locations
         if let Some(ref disks) = req.disks {
             for disk in disks {
+                validate_vm_disk(disk)?;
                 if !Path::new(&disk.path).exists() {
                     return Err(VmError::InvalidDiskPath(format!(
                         "disk path {} does not exist",
@@ -696,6 +778,7 @@ impl VmService {
         .filter(|iso| !iso.trim().is_empty())
         .collect();
         for iso in &cdroms {
+            validate_qemu_drive_value("CD-ROM path", iso)?;
             if !Path::new(iso).exists() {
                 return Err(VmError::InvalidDiskPath(format!(
                     "CD-ROM ISO {iso} does not exist"
@@ -705,6 +788,9 @@ impl VmService {
         }
         if let Some(ref usb) = req.usb_devices {
             validate_usb_passthroughs(usb)?;
+        }
+        if let Some(ref networks) = req.networks {
+            validate_vm_network_values(networks)?;
         }
 
         let id = Uuid::new_v4().to_string();
@@ -799,12 +885,16 @@ impl VmService {
                 config.memory_mib = mem;
             }
             if let Some(mut disks) = req.disks {
+                for disk in &disks {
+                    validate_vm_disk(disk)?;
+                }
                 // Capture the stable backing file for new block-device
                 // disks while the loop mapping is still valid (#592).
                 backfill_disk_sources(&mut disks, &losetup_pairs().await);
                 config.disks = disks;
             }
             if let Some(nets) = req.networks {
+                validate_vm_network_values(&nets)?;
                 config.networks = nets;
             }
             if let Some(pt) = req.passthrough_devices {
@@ -830,6 +920,7 @@ impl VmService {
                     .filter(|iso| !iso.trim().is_empty())
                     .collect();
                 for iso in &list {
+                    validate_qemu_drive_value("CD-ROM path", iso)?;
                     if !Path::new(iso).exists() {
                         return Err(VmError::InvalidDiskPath(format!(
                             "CD-ROM ISO {iso} does not exist"
@@ -921,6 +1012,7 @@ impl VmService {
 
         // Validate all disk paths exist and are within allowed locations before starting
         for disk in &config.disks {
+            validate_vm_disk(disk)?;
             if !Path::new(&disk.path).exists() {
                 return Err(VmError::InvalidDiskPath(format!(
                     "disk path {} does not exist",
@@ -930,6 +1022,7 @@ impl VmService {
             validate_vm_path(&disk.path)?;
         }
         for iso in &config.cdroms {
+            validate_qemu_drive_value("CD-ROM path", iso)?;
             if !Path::new(iso).exists() {
                 return Err(VmError::InvalidDiskPath(format!(
                     "CD-ROM ISO {iso} does not exist"
@@ -942,6 +1035,7 @@ impl VmService {
         // VM never launches) if the target bridge doesn't exist. Catching it here
         // gives the operator a clear reason instead of a daemon that silently
         // never came up.
+        validate_vm_network_values(&config.networks)?;
         validate_bridge_networks(&config.networks)?;
 
         // Ensure runtime directory exists with restrictive permissions (owner-only)
@@ -1479,6 +1573,26 @@ mod tests {
         assert!(validate_bridge_networks(&nets).is_ok());
     }
 
+    #[test]
+    fn network_validation_rejects_qemu_suboption_injection() {
+        let networks = vec![VmNetwork {
+            mode: "bridge".to_string(),
+            bridge: Some("br0,helper=/tmp/x".to_string()),
+            mac: Some("52:54:00:12:34:56,romfile=/etc/shadow".to_string()),
+        }];
+        assert!(validate_vm_network_values(&networks).is_err());
+    }
+
+    #[test]
+    fn network_validation_accepts_documented_values() {
+        let networks = vec![VmNetwork {
+            mode: "bridge".to_string(),
+            bridge: Some("br0".to_string()),
+            mac: Some("52:54:00:12:34:56".to_string()),
+        }];
+        assert!(validate_vm_network_values(&networks).is_ok());
+    }
+
     fn base_config() -> VmConfig {
         VmConfig {
             id: "test-id".to_string(),
@@ -1514,6 +1628,26 @@ mod tests {
             iops_rd: None,
             iops_wr: None,
         }
+    }
+
+    #[test]
+    fn disk_validation_rejects_qemu_option_injection() {
+        let mut value = disk("/fs/tank/vm.img", None);
+        value.cache = Some("none,file=/dev/sda".to_string());
+        assert!(validate_vm_disk(&value).is_err());
+
+        let value = disk("/fs/tank/vm.img,format=qcow2", None);
+        assert!(validate_vm_disk(&value).is_err());
+        assert!(validate_qemu_drive_value("CD-ROM path", "/fs/install.iso,if=none").is_err());
+    }
+
+    #[test]
+    fn disk_validation_accepts_documented_options() {
+        let mut value = disk("/fs/tank/vm.img", None);
+        value.cache = Some("none".to_string());
+        value.aio = Some("native".to_string());
+        value.discard = Some("unmap".to_string());
+        assert!(validate_vm_disk(&value).is_ok());
     }
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {

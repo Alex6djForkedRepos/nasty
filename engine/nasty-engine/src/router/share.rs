@@ -127,6 +127,29 @@ fn resource_matches_scope(
         && owner_filter.is_none_or(|filter| owner == Some(filter))
 }
 
+fn session_allows_raw_block_sources(session: &Session) -> bool {
+    session.role == Role::Admin && !session_is_scoped(session)
+}
+
+fn session_allows_empty_block_destination(session: &Session) -> bool {
+    session.role == Role::Operator && !session_is_scoped(session)
+}
+
+fn block_authorization_error(req: &Request, session: &Session, error: String) -> Response {
+    if error == "access denied" {
+        crate::auth::audit(
+            "permission_denied",
+            &session.username,
+            session.client_ip.as_deref().unwrap_or("unknown"),
+            &format!(
+                "method={} role={:?} reason=block_source_policy",
+                req.method, session.role
+            ),
+        );
+    }
+    err(req, error)
+}
+
 fn path_source_matches_scope(
     requested: &std::path::Path,
     candidates: &[(std::path::PathBuf, String, Option<String>)],
@@ -159,7 +182,7 @@ fn path_source_matches_scope(
     containing_matches && nested_matches
 }
 
-async fn authorize_path_source(
+pub(super) async fn authorize_path_source(
     state: &AppState,
     session: &Session,
     requested: &str,
@@ -202,7 +225,7 @@ async fn authorize_block_source(
     session: &Session,
     device_path: &str,
 ) -> Result<Option<BlockVolumeId>, String> {
-    if session.filesystem.is_none() && session.owner.is_none() {
+    if session_allows_raw_block_sources(session) {
         return state
             .subvolumes
             .block_volume_id_for_device(device_path)
@@ -234,15 +257,102 @@ async fn authorize_block_source(
     })
 }
 
+async fn authorize_fileio_source(
+    state: &AppState,
+    session: &Session,
+    requested: &str,
+) -> Result<String, String> {
+    if session_allows_raw_block_sources(session) {
+        return Ok(requested.to_string());
+    }
+
+    let canonical = canonical_fileio_source(requested).await?;
+    if !canonical.starts_with("/fs") {
+        return Err("access denied".to_string());
+    }
+
+    if session_is_scoped(session) {
+        let subvolumes = state
+            .subvolumes
+            .list_all(None, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut candidates = Vec::with_capacity(subvolumes.len());
+        for subvolume in subvolumes {
+            if let Ok(path) = tokio::fs::canonicalize(&subvolume.path).await {
+                candidates.push((path, subvolume.filesystem, subvolume.owner));
+            }
+        }
+        if !path_source_matches_scope(
+            &canonical,
+            &candidates,
+            session.filesystem.as_deref(),
+            session.owner.as_deref(),
+        ) {
+            return Err("access denied".to_string());
+        }
+    }
+
+    canonical
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "access denied".to_string())
+}
+
+async fn canonical_fileio_source(requested: &str) -> Result<std::path::PathBuf, String> {
+    let requested_path = std::path::Path::new(requested);
+    let canonical = if requested_path.exists() {
+        tokio::fs::canonicalize(requested_path)
+            .await
+            .map_err(|_| "access denied".to_string())?
+    } else {
+        let name = requested_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "access denied".to_string())?;
+        let parent = requested_path
+            .parent()
+            .ok_or_else(|| "access denied".to_string())?;
+        tokio::fs::canonicalize(parent)
+            .await
+            .map_err(|_| "access denied".to_string())?
+            .join(name)
+    };
+    Ok(canonical)
+}
+
+pub(super) async fn fileio_source_is_managed(requested: &str) -> bool {
+    match canonical_fileio_source(requested).await {
+        Ok(path) => path.starts_with("/fs"),
+        Err(_) => fileio_source_is_lexically_managed(requested),
+    }
+}
+
+fn fileio_source_is_lexically_managed(requested: &str) -> bool {
+    let path = std::path::Path::new(requested);
+    path.is_absolute()
+        && path.starts_with("/fs")
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+}
+
 async fn authorize_block_destination(
     state: &AppState,
     session: &Session,
     identities: &[Option<BlockVolumeId>],
 ) -> Result<(), String> {
-    if session.filesystem.is_none() && session.owner.is_none() {
+    if session_allows_raw_block_sources(session) {
         return Ok(());
     }
-    if identities.is_empty() || identities.iter().any(Option::is_none) {
+    if identities.is_empty() {
+        return if session_allows_empty_block_destination(session) {
+            Ok(())
+        } else {
+            Err("access denied".to_string())
+        };
+    }
+    if identities.iter().any(Option::is_none) {
         return Err("access denied".to_string());
     }
 
@@ -268,8 +378,105 @@ async fn authorize_block_destination(
     Ok(())
 }
 
+async fn authorized_iscsi_target(
+    req: &Request,
+    state: &AppState,
+    session: &Session,
+    target_id: &str,
+) -> Result<nasty_sharing::iscsi::IscsiTarget, Response> {
+    let target = state
+        .iscsi
+        .get(target_id)
+        .await
+        .map_err(|error| err(req, error))?;
+
+    let mut root_reason = None;
+    for lun in &target.luns {
+        match lun.backstore_type.as_str() {
+            "block" if lun.backing_volume.is_none() || lun.backing_volume_unresolved => {
+                root_reason = Some("raw_iscsi_destination");
+            }
+            "fileio" if !fileio_source_is_managed(&lun.backstore_path).await => {
+                root_reason = Some("unmanaged_iscsi_fileio_destination");
+            }
+            "block" | "fileio" => {}
+            _ => root_reason = Some("unknown_iscsi_backstore"),
+        }
+    }
+    if let Some(reason) = root_reason
+        && let Some(response) = require_root_equivalent(req, session, reason)
+    {
+        return Err(response);
+    }
+
+    if session_is_scoped(session) {
+        for lun in target
+            .luns
+            .iter()
+            .filter(|lun| lun.backstore_type == "fileio")
+        {
+            authorize_fileio_source(state, session, &lun.backstore_path)
+                .await
+                .map_err(|error| block_authorization_error(req, session, error))?;
+        }
+        let identities: Vec<_> = target
+            .luns
+            .iter()
+            .filter(|lun| lun.backstore_type == "block")
+            .map(|lun| lun.backing_volume.clone())
+            .collect();
+        if target.luns.is_empty() || !identities.is_empty() {
+            authorize_block_destination(state, session, &identities)
+                .await
+                .map_err(|error| block_authorization_error(req, session, error))?;
+        }
+    }
+    Ok(target)
+}
+
+async fn authorized_nvmeof_subsystem(
+    req: &Request,
+    state: &AppState,
+    session: &Session,
+    subsystem_id: &str,
+) -> Result<nasty_sharing::nvmeof::NvmeofSubsystem, Response> {
+    let subsystem = state
+        .nvmeof
+        .get(subsystem_id)
+        .await
+        .map_err(|error| err(req, error))?;
+    if subsystem
+        .namespaces
+        .iter()
+        .any(|namespace| namespace.backing_volume.is_none() || namespace.backing_volume_unresolved)
+        && let Some(response) = require_root_equivalent(req, session, "raw_nvmeof_destination")
+    {
+        return Err(response);
+    }
+    if session_is_scoped(session) {
+        let identities: Vec<_> = subsystem
+            .namespaces
+            .iter()
+            .map(|namespace| namespace.backing_volume.clone())
+            .collect();
+        authorize_block_destination(state, session, &identities)
+            .await
+            .map_err(|error| block_authorization_error(req, session, error))?;
+    }
+    Ok(subsystem)
+}
+
 fn session_is_scoped(session: &Session) -> bool {
     session.filesystem.is_some() || session.owner.is_some()
+}
+
+fn smb_extra_params_require_admin(
+    existing: Option<&std::collections::HashMap<String, String>>,
+    requested: Option<&std::collections::HashMap<String, String>>,
+) -> bool {
+    requested
+        .or(existing)
+        .is_some_and(|params| !params.is_empty())
 }
 
 async fn quiesce_iscsi_after_failed_repair(state: &AppState) -> Option<String> {
@@ -355,11 +562,20 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nfs.update(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nfs::UpdateNfsShareRequest>(req) {
+                Ok(p) => {
+                    let share = match state.nfs.get(&p.id).await {
+                        Ok(share) => share,
+                        Err(error) => return Some(err(req, error)),
+                    };
+                    if let Err(error) = authorize_path_source(state, session, &share.path).await {
+                        return Some(err(req, error));
+                    }
+                    match state.nfs.update(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -369,11 +585,20 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nfs.delete(p).await {
-                    Ok(()) => ok(req, "ok"),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nfs::DeleteNfsShareRequest>(req) {
+                Ok(p) => {
+                    let share = match state.nfs.get(&p.id).await {
+                        Ok(share) => share,
+                        Err(error) => return Some(err(req, error)),
+                    };
+                    if let Err(error) = authorize_path_source(state, session, &share.path).await {
+                        return Some(err(req, error));
+                    }
+                    match state.nfs.delete(p).await {
+                        Ok(()) => ok(req, "ok"),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -396,6 +621,12 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::smb::CreateSmbShareRequest>(req) {
                 Ok(mut p) => {
+                    if smb_extra_params_require_admin(None, p.extra_params.as_ref())
+                        && let Some(response) =
+                            require_root_equivalent(req, session, "raw_samba_parameters")
+                    {
+                        return Some(response);
+                    }
                     if session_is_scoped(session)
                         && state.smb.list().await.is_ok_and(|shares| {
                             shares
@@ -425,11 +656,28 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.smb.update(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::smb::UpdateSmbShareRequest>(req) {
+                Ok(p) => {
+                    let share = match state.smb.get(&p.id).await {
+                        Ok(share) => share,
+                        Err(error) => return Some(err(req, error)),
+                    };
+                    if smb_extra_params_require_admin(
+                        Some(&share.extra_params),
+                        p.extra_params.as_ref(),
+                    ) && let Some(response) =
+                        require_root_equivalent(req, session, "raw_samba_parameters")
+                    {
+                        return Some(response);
+                    }
+                    if let Err(error) = authorize_path_source(state, session, &share.path).await {
+                        return Some(err(req, error));
+                    }
+                    match state.smb.update(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -439,11 +687,20 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.smb.delete(p).await {
-                    Ok(()) => ok(req, "ok"),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::smb::DeleteSmbShareRequest>(req) {
+                Ok(p) => {
+                    let share = match state.smb.get(&p.id).await {
+                        Ok(share) => share,
+                        Err(error) => return Some(err(req, error)),
+                    };
+                    if let Err(error) = authorize_path_source(state, session, &share.path).await {
+                        return Some(err(req, error));
+                    }
+                    match state.smb.delete(p).await {
+                        Ok(()) => ok(req, "ok"),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -488,8 +745,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                     }
                     if let Some(ref device_path) = p.device_path {
                         match authorize_block_source(state, session, device_path).await {
-                            Ok(identity) => p.backing_volume = identity,
-                            Err(error) => return Some(err(req, error)),
+                            Ok(identity) => {
+                                if identity.is_none()
+                                    && let Some(response) =
+                                        require_root_equivalent(req, session, "raw_iscsi_source")
+                                {
+                                    return Some(response);
+                                }
+                                p.backing_volume = identity;
+                            }
+                            Err(error) => {
+                                return Some(block_authorization_error(req, session, error));
+                            }
                         }
                     }
                     if let Some(ref dp) = p.device_path
@@ -512,11 +779,17 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.iscsi.delete(p).await {
-                    Ok(()) => ok(req, "ok"),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::iscsi::DeleteTargetRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) = authorized_iscsi_target(req, state, session, &p.id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.iscsi.delete(p).await {
+                        Ok(()) => ok(req, "ok"),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -528,23 +801,38 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::iscsi::AddLunRequest>(req) {
                 Ok(mut p) => {
-                    let target = match state.iscsi.get(&p.target_id).await {
-                        Ok(target) => target,
-                        Err(error) => return Some(err(req, error)),
-                    };
-                    let identities: Vec<_> = target
-                        .luns
-                        .iter()
-                        .map(|lun| lun.backing_volume.clone())
-                        .collect();
-                    if let Err(error) =
-                        authorize_block_destination(state, session, &identities).await
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
                     {
-                        return Some(err(req, error));
+                        return Some(response);
                     }
-                    match authorize_block_source(state, session, &p.backstore_path).await {
-                        Ok(identity) => p.backing_volume = identity,
-                        Err(error) => return Some(err(req, error)),
+                    let fileio = p.backstore_type.as_deref() == Some("fileio")
+                        || (p.backstore_type.is_none()
+                            && std::path::Path::new(&p.backstore_path)
+                                .metadata()
+                                .is_ok_and(|metadata| metadata.is_file()));
+                    if fileio {
+                        match authorize_fileio_source(state, session, &p.backstore_path).await {
+                            Ok(path) => p.backstore_path = path,
+                            Err(error) => {
+                                return Some(block_authorization_error(req, session, error));
+                            }
+                        }
+                    } else {
+                        match authorize_block_source(state, session, &p.backstore_path).await {
+                            Ok(identity) => {
+                                if identity.is_none()
+                                    && let Some(response) =
+                                        require_root_equivalent(req, session, "raw_iscsi_source")
+                                {
+                                    return Some(response);
+                                }
+                                p.backing_volume = identity;
+                            }
+                            Err(error) => {
+                                return Some(block_authorization_error(req, session, error));
+                            }
+                        }
                     }
                     if let Some(conflict) =
                         check_block_device_conflict(state, &p.backstore_path, "iscsi").await
@@ -566,11 +854,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.iscsi.remove_lun(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::iscsi::RemoveLunRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.iscsi.remove_lun(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -645,11 +940,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.iscsi.add_acl(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::iscsi::AddAclRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.iscsi.add_acl(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -659,11 +961,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.iscsi.remove_acl(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::iscsi::RemoveAclRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.iscsi.remove_acl(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -675,6 +984,11 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::iscsi::AddPortalRequest>(req) {
                 Ok(p) => {
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
+                    {
+                        return Some(response);
+                    }
                     if p.iser
                         && let Some(r) = require_rdma(req, "ib_isert").await
                     {
@@ -696,6 +1010,11 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::iscsi::SetPortalsRequest>(req) {
                 Ok(p) => {
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
+                    {
+                        return Some(response);
+                    }
                     if p.portals.iter().any(|portal| portal.iser)
                         && let Some(r) = require_rdma(req, "ib_isert").await
                     {
@@ -715,11 +1034,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.iscsi.remove_portal(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::iscsi::RemovePortalRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_iscsi_target(req, state, session, &p.target_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.iscsi.remove_portal(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -755,8 +1081,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                     }
                     if let Some(ref device_path) = p.device_path {
                         match authorize_block_source(state, session, device_path).await {
-                            Ok(identity) => p.backing_volume = identity,
-                            Err(error) => return Some(err(req, error)),
+                            Ok(identity) => {
+                                if identity.is_none()
+                                    && let Some(response) =
+                                        require_root_equivalent(req, session, "raw_nvmeof_source")
+                                {
+                                    return Some(response);
+                                }
+                                p.backing_volume = identity;
+                            }
+                            Err(error) => {
+                                return Some(block_authorization_error(req, session, error));
+                            }
                         }
                     }
                     if let Some(ref device_path) = p.device_path
@@ -803,11 +1139,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nvmeof.delete(p).await {
-                    Ok(()) => ok(req, "ok"),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nvmeof::DeleteSubsystemRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.nvmeof.delete(p).await {
+                        Ok(()) => ok(req, "ok"),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -819,23 +1162,24 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::nvmeof::AddNamespaceRequest>(req) {
                 Ok(mut p) => {
-                    let subsystem = match state.nvmeof.get(&p.subsystem_id).await {
-                        Ok(subsystem) => subsystem,
-                        Err(error) => return Some(err(req, error)),
-                    };
-                    let identities: Vec<_> = subsystem
-                        .namespaces
-                        .iter()
-                        .map(|namespace| namespace.backing_volume.clone())
-                        .collect();
-                    if let Err(error) =
-                        authorize_block_destination(state, session, &identities).await
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.subsystem_id).await
                     {
-                        return Some(err(req, error));
+                        return Some(response);
                     }
                     match authorize_block_source(state, session, &p.device_path).await {
-                        Ok(identity) => p.backing_volume = identity,
-                        Err(error) => return Some(err(req, error)),
+                        Ok(identity) => {
+                            if identity.is_none()
+                                && let Some(response) =
+                                    require_root_equivalent(req, session, "raw_nvmeof_source")
+                            {
+                                return Some(response);
+                            }
+                            p.backing_volume = identity;
+                        }
+                        Err(error) => {
+                            return Some(block_authorization_error(req, session, error));
+                        }
                     }
                     if let Some(conflict) =
                         check_block_device_conflict(state, &p.device_path, "nvmeof").await
@@ -857,11 +1201,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nvmeof.remove_namespace(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nvmeof::RemoveNamespaceRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.subsystem_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.nvmeof.remove_namespace(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -941,6 +1292,11 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::nvmeof::AddPortRequest>(req) {
                 Ok(p) => {
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.subsystem_id).await
+                    {
+                        return Some(response);
+                    }
                     if p.transport.as_deref() == Some("rdma")
                         && let Some(r) = require_rdma(req, "nvmet-rdma").await
                     {
@@ -960,11 +1316,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nvmeof.remove_port(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nvmeof::RemovePortRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.subsystem_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.nvmeof.remove_port(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -974,11 +1337,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nvmeof.add_host(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nvmeof::AddHostRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.subsystem_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.nvmeof.add_host(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -988,11 +1358,18 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             {
                 return Some(r);
             }
-            match parse_params(req) {
-                Ok(p) => match state.nvmeof.remove_host(p).await {
-                    Ok(v) => ok(req, v),
-                    Err(e) => err(req, e),
-                },
+            match parse_params::<nasty_sharing::nvmeof::RemoveHostRequest>(req) {
+                Ok(p) => {
+                    if let Err(response) =
+                        authorized_nvmeof_subsystem(req, state, session, &p.subsystem_id).await
+                    {
+                        return Some(response);
+                    }
+                    match state.nvmeof.remove_host(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -1015,6 +1392,93 @@ mod tests {
             filesystem.to_string(),
             owner.map(str::to_string),
         )
+    }
+
+    fn session(role: Role, filesystem: Option<&str>, owner: Option<&str>) -> Session {
+        Session {
+            token: "token".to_string(),
+            username: "tester".to_string(),
+            role,
+            file_principal: None,
+            filesystem: filesystem.map(str::to_string),
+            owner: owner.map(str::to_string),
+            created_at: 0,
+            must_change_password: false,
+            client_ip: Some("127.0.0.1".to_string()),
+        }
+    }
+
+    #[test]
+    fn raw_block_sources_require_unscoped_admin() {
+        assert!(session_allows_raw_block_sources(&session(
+            Role::Admin,
+            None,
+            None
+        )));
+        assert!(!session_allows_raw_block_sources(&session(
+            Role::Operator,
+            None,
+            None
+        )));
+        assert!(!session_allows_raw_block_sources(&session(
+            Role::Admin,
+            Some("tank"),
+            None
+        )));
+        assert!(!session_allows_raw_block_sources(&session(
+            Role::Admin,
+            None,
+            Some("token-a")
+        )));
+    }
+
+    #[test]
+    fn samba_raw_parameters_use_the_effective_update_value() {
+        let existing = std::collections::HashMap::from([(
+            "root preexec".to_string(),
+            "/bin/true".to_string(),
+        )]);
+        let cleared = std::collections::HashMap::new();
+
+        assert!(smb_extra_params_require_admin(Some(&existing), None));
+        assert!(smb_extra_params_require_admin(None, Some(&existing)));
+        assert!(!smb_extra_params_require_admin(
+            Some(&existing),
+            Some(&cleared)
+        ));
+    }
+
+    #[test]
+    fn offline_fileio_sources_use_a_component_safe_fs_fallback() {
+        assert!(fileio_source_is_lexically_managed(
+            "/fs/offline/subvolume/disk.img"
+        ));
+        assert!(!fileio_source_is_lexically_managed(
+            "/fs/offline/../etc/passwd"
+        ));
+        assert!(!fileio_source_is_lexically_managed(
+            "/filesystem/offline/disk.img"
+        ));
+        assert!(!fileio_source_is_lexically_managed("relative/disk.img"));
+    }
+
+    #[test]
+    fn unscoped_operator_can_seed_an_empty_target_with_a_managed_source() {
+        assert!(session_allows_empty_block_destination(&session(
+            Role::Operator,
+            None,
+            None
+        )));
+        assert!(!session_allows_empty_block_destination(&session(
+            Role::Operator,
+            Some("tank"),
+            None
+        )));
+        assert!(!session_allows_empty_block_destination(&session(
+            Role::ReadOnly,
+            None,
+            None
+        )));
     }
 
     #[test]

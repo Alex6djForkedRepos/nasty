@@ -64,6 +64,10 @@
   Terminals and sensitive deployment/import endpoints require an unscoped
   Admin; file mutations require Operator/Admin authority within any filesystem
   scope, while VM consoles require an unscoped Operator/Admin (#663).
+- Root-equivalent workload and block-device operations now require an unscoped
+  Admin. Operators retain safe simple-app, VM, iSCSI, and NVMe-oF workflows but
+  cannot activate Compose stacks, unsafe mounts, passthrough devices, raw QEMU
+  options, or unmanaged block exports.
 - Existing `auth.json` must be a regular, non-symlinked, initialized JSON file
   owned by root with no group/other permission bits. Invalid state stops the
   engine instead of silently recreating `admin/admin`; only a genuinely absent

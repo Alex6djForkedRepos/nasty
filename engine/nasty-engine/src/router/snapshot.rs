@@ -93,6 +93,11 @@ pub(super) async fn try_route(
         // swap the subvolume to the snapshot, resume. Destructive — takes a
         // safety snapshot first. Orchestrated in the engine layer.
         "snapshot.rollback" => {
+            if let Some(response) =
+                require_root_equivalent(req, session, "dependent_resource_restart")
+            {
+                return Some(response);
+            }
             match parse_params::<nasty_storage::subvolume::RollbackSnapshotRequest>(req) {
                 Ok(p) => {
                     if filesystem_scope_denied(session.filesystem.as_deref(), &p.filesystem) {

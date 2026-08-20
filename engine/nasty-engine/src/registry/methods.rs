@@ -875,7 +875,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 Method {
                     name: "snapshot.rollback",
                     desc: "Roll a subvolume back to a snapshot: quiesce its apps/VMs/shares, take a safety snapshot of the current state, swap the subvolume to the snapshot, and resume. Destructive; filesystem subvolumes only.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<RollbackSnapshotRequest>(generator)),
                     result: Some(gen_schema::<RollbackResult>(generator)),
                 },
@@ -2980,7 +2980,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 Method {
                     name: "apps.appdata.relocate",
                     desc: "Move the appdata subvolume to another filesystem and flip the stable /appdata symlink: stops apps that bind /appdata, copies with ownership preserved, switches, restarts them. The old copy is left in place for the operator to delete after verifying.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "filesystem",
                         "Target filesystem name (the <X> of /fs/<X>).",
@@ -2990,14 +2990,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 Method {
                     name: "apps.enable",
                     desc: "Enable the apps runtime on this box (optionally pinning the storage filesystem) and start Docker.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<EnableAppsRequest>(generator)),
                     result: None,
                 },
                 Method {
                     name: "apps.disable",
                     desc: "Disable the apps runtime on this box (stop Docker and clear the persisted enabled flag in AppsConfig).",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::None,
                     result: None,
                 },
@@ -3103,28 +3103,28 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 Method {
                     name: "apps.compose.install",
                     desc: "Deploy a new compose-based app by writing its docker-compose.yml to disk, pre-creating bind-mount dirs with the right ownership, running `docker compose up -d`, and auto-creating an ingress for the first exposed TCP port.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<InstallComposeRequest>(generator)),
                     result: Some(gen_schema::<App>(generator)),
                 },
                 Method {
                     name: "apps.compose.update",
                     desc: "Overwrite a compose app's docker-compose.yml, pre-create any newly added bind-mount sources, and run `docker compose up -d --no-build --pull missing --remove-orphans` to apply the new config.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<InstallComposeRequest>(generator)),
                     result: Some(gen_schema::<App>(generator)),
                 },
                 Method {
                     name: "apps.compose.remove",
                     desc: "Tear down a compose app via `docker compose down -v --remove-orphans`, delete its project directory, and remove its Caddy ingress.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Compose app name.")),
                     result: None,
                 },
                 Method {
                     name: "apps.compose.set_startup",
                     desc: "Set NASty-managed startup ordering for a compose stack (#437): when managed, the engine forces `restart: \"no\"` and brings the stack up at boot in the configured order with a settle delay; when unmanaged, the stack reverts to its compose file's own restart policy.",
-                    role: MethodRole::Operator,
+                    role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<SetComposeStartupRequest>(generator)),
                     result: None,
                 },

@@ -1006,7 +1006,10 @@ enum BindReject {
 }
 
 fn always_forbidden_bind(source: &str) -> Option<BindReject> {
-    if source.contains("..") {
+    if std::path::Path::new(source)
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
         return Some(BindReject::Hard(
             "'..' traversal is never allowed in bind sources",
         ));
@@ -1016,10 +1019,105 @@ fn always_forbidden_bind(source: &str) -> Option<BindReject> {
             "'/' (host root) is never allowed as a bind source",
         ));
     }
-    if source == "/var/lib/nasty" || source.starts_with("/var/lib/nasty/") {
+    let engine_state = projected_canonical_path("/var/lib/nasty");
+    let source_path = std::path::Path::new(source);
+    if source == "/var/lib/nasty"
+        || source.starts_with("/var/lib/nasty/")
+        || (source_path.is_absolute() && projected_canonical_path(source).starts_with(engine_state))
+    {
         return Some(BindReject::EngineState);
     }
     None
+}
+
+fn projected_canonical_path(path: &str) -> std::path::PathBuf {
+    let original = std::path::PathBuf::from(path);
+    if !original.is_absolute() {
+        return original;
+    }
+
+    let mut existing = original.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            break;
+        };
+        existing = parent;
+    }
+
+    let mut resolved = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
+
+fn projected_compose_path(path: &str, project_dir: &str) -> std::path::PathBuf {
+    if std::path::Path::new(path).is_absolute() {
+        projected_canonical_path(path)
+    } else {
+        projected_canonical_path(
+            std::path::Path::new(project_dir)
+                .join(path)
+                .to_string_lossy()
+                .as_ref(),
+        )
+    }
+}
+
+fn operator_bind_allowed(source: &str, allowed_app_dir: &str) -> bool {
+    if !source.starts_with('/') && !source.starts_with('.') {
+        return false;
+    }
+
+    let source = projected_compose_path(source, allowed_app_dir);
+    [allowed_app_dir, "/appdata", "/fs"]
+        .iter()
+        .map(|root| projected_canonical_path(root))
+        .any(|root| root != std::path::Path::new("/") && source.starts_with(root))
+}
+
+fn value_has_unsafe_host_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            value.starts_with('/')
+                || value.starts_with('~')
+                || value.contains('$')
+                || value.contains("..")
+        }
+        serde_json::Value::Array(values) => values.iter().any(value_has_unsafe_host_reference),
+        _ => false,
+    }
+}
+
+fn value_has_protected_host_reference(value: &serde_json::Value, allowed_app_dir: &str) -> bool {
+    match value {
+        serde_json::Value::String(path) => {
+            if path.contains('$') {
+                return true;
+            }
+            let resolved = projected_compose_path(path, allowed_app_dir);
+            let resolved_app_dir = projected_canonical_path(allowed_app_dir);
+            let in_app_dir = resolved.starts_with(&resolved_app_dir);
+            matches!(always_forbidden_bind(path), Some(BindReject::Hard(_)))
+                || match always_forbidden_bind(&resolved.to_string_lossy()) {
+                    Some(BindReject::Hard(_)) => true,
+                    Some(BindReject::EngineState) => !in_app_dir,
+                    None => false,
+                }
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| value_has_protected_host_reference(value, allowed_app_dir)),
+        serde_json::Value::Object(values) => values
+            .values()
+            .any(|value| value_has_protected_host_reference(value, allowed_app_dir)),
+        _ => false,
+    }
 }
 
 /// Validate a docker-compose YAML before it's written to disk and handed to
@@ -1035,7 +1133,11 @@ fn always_forbidden_bind(source: &str) -> Option<BindReject> {
 /// transcoding (/dev/dri), Frigate (USB cameras), etc. A small core of checks
 /// stays on either way: nothing may bind-mount the engine's state dir, the
 /// root filesystem, or use `..` to escape.
-fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<(), String> {
+pub(crate) fn validate_compose(
+    yaml: &str,
+    app_name: &str,
+    allow_unsafe: bool,
+) -> Result<(), String> {
     let parsed: serde_json::Value =
         serde_yaml_ng::from_str(yaml).map_err(|e| format!("compose YAML failed to parse: {e}"))?;
 
@@ -1050,17 +1152,28 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
         let scope = |field: &str| format!("services.{svc_name}.{field}");
 
         if !allow_unsafe {
-            if svc.get("privileged").and_then(|v| v.as_bool()) == Some(true) {
+            if svc.get("privileged").is_some_and(|value| {
+                value.as_bool() == Some(true)
+                    || value.as_str().is_some_and(|value| value.contains('$'))
+            }) {
                 return Err(format!(
                     "{} sets privileged: true (host-root equivalent). Set allow_unsafe to override.",
                     scope("privileged")
                 ));
             }
 
-            for field in ["pid", "ipc", "uts", "userns_mode", "cgroup", "network_mode"] {
+            for field in [
+                "pid",
+                "ipc",
+                "uts",
+                "userns_mode",
+                "cgroup",
+                "cgroupns_mode",
+                "network_mode",
+            ] {
                 if let Some(v) = svc.get(field).and_then(|v| v.as_str()) {
                     let v_lower = v.to_ascii_lowercase();
-                    if v_lower == "host" || v_lower.starts_with("host:") {
+                    if v.contains('$') || v_lower == "host" || v_lower.starts_with("host:") {
                         return Err(format!(
                             "{} = '{}' shares the host namespace. Set allow_unsafe to override.",
                             scope(field),
@@ -1082,7 +1195,7 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                 for c in caps {
                     if let Some(s) = c.as_str() {
                         let bare = s.strip_prefix("CAP_").unwrap_or(s).to_ascii_uppercase();
-                        if FORBIDDEN_CAPS.contains(&bare.as_str()) {
+                        if s.contains('$') || FORBIDDEN_CAPS.contains(&bare.as_str()) {
                             return Err(format!(
                                 "{} includes '{}' — grants host-equivalent privilege. Set allow_unsafe to override.",
                                 scope("cap_add"),
@@ -1097,7 +1210,9 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                 for o in opts {
                     if let Some(s) = o.as_str() {
                         let normalized = s.replace(' ', "").to_ascii_lowercase();
-                        if FORBIDDEN_SECURITY_OPTS.iter().any(|f| normalized == *f) {
+                        if s.contains('$')
+                            || FORBIDDEN_SECURITY_OPTS.iter().any(|f| normalized == *f)
+                        {
                             return Err(format!(
                                 "{} includes '{}' — disables container sandbox. Set allow_unsafe to override.",
                                 scope("security_opt"),
@@ -1123,6 +1238,44 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                     scope("device_cgroup_rules")
                 ));
             }
+
+            if svc.get("use_api_socket").is_some_and(|value| {
+                value.as_bool() == Some(true)
+                    || value.as_str().is_some_and(|value| value.contains('$'))
+            }) {
+                return Err(format!(
+                    "{} exposes the Docker API socket. Set allow_unsafe to override.",
+                    scope("use_api_socket")
+                ));
+            }
+
+            for field in ["env_file", "label_file"] {
+                if svc.get(field).is_some_and(value_has_unsafe_host_reference) {
+                    return Err(format!(
+                        "{} reads an absolute, escaping, or interpolated host path. Set allow_unsafe to override.",
+                        scope(field)
+                    ));
+                }
+            }
+        }
+
+        for field in ["env_file", "label_file"] {
+            if svc
+                .get(field)
+                .is_some_and(|value| value_has_protected_host_reference(value, &allowed_app_dir))
+            {
+                return Err(format!(
+                    "{} reads an interpolated or protected host path",
+                    scope(field)
+                ));
+            }
+        }
+
+        if svc.get("extends").is_some() || svc.get("volumes_from").is_some() {
+            return Err(format!(
+                "{} imports content that cannot be checked against the protected host-path policy",
+                scope("extends/volumes_from")
+            ));
         }
 
         if let Some(volumes) = svc.get("volumes").and_then(|v| v.as_array()) {
@@ -1134,6 +1287,12 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                     }
                     serde_json::Value::Object(map) => {
                         let kind = map.get("type").and_then(|v| v.as_str()).unwrap_or("volume");
+                        if kind.contains('$') {
+                            return Err(format!(
+                                "{} has an interpolated mount type, which cannot be safety-checked",
+                                scope("volumes")
+                            ));
+                        }
                         if kind != "bind" {
                             // Named volumes, tmpfs, npipe — host filesystem isn't directly exposed.
                             continue;
@@ -1150,16 +1309,32 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                     continue;
                 }
 
+                // Compose expands these after parsing, so this validator cannot
+                // prove an interpolated source avoids protected host state.
+                if source.contains('$') {
+                    return Err(format!(
+                        "{} bind source '{}' is interpolated and cannot be safety-checked",
+                        scope("volumes"),
+                        source
+                    ));
+                }
+
                 // Named volume short-form ("data:/var/lib/foo") — no host path.
                 if !source.starts_with('/') && !source.starts_with('.') && !source.starts_with('~')
                 {
                     continue;
                 }
 
-                let in_app_dir =
-                    source.starts_with(&format!("{allowed_app_dir}/")) || source == allowed_app_dir;
+                let resolved_source = projected_compose_path(&source, &allowed_app_dir);
+                let policy_source = resolved_source.to_string_lossy();
+                let resolved_app_dir = projected_canonical_path(&allowed_app_dir);
+                let in_app_dir = source.starts_with(&format!("{allowed_app_dir}/"))
+                    || source == allowed_app_dir
+                    || resolved_source.starts_with(&resolved_app_dir);
 
-                match always_forbidden_bind(&source) {
+                match always_forbidden_bind(&source)
+                    .or_else(|| always_forbidden_bind(&policy_source))
+                {
                     Some(BindReject::Hard(why)) => {
                         return Err(format!(
                             "{} bind-mounts '{}' — {} (off-limits even with allow_unsafe)",
@@ -1209,9 +1384,7 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                 if !allow_unsafe {
                     // `/appdata` is the stable symlink onto the appdata
                     // subvolume (#436) — sandbox territory by definition.
-                    let in_appdata = source == "/appdata" || source.starts_with("/appdata/");
-                    let allowed =
-                        in_app_dir || source.starts_with("/fs/") || source == "/fs" || in_appdata;
+                    let allowed = operator_bind_allowed(&source, &allowed_app_dir);
                     if !allowed {
                         return Err(format!(
                             "{} bind-mounts '{}' — only paths under '{}/', '/appdata/' or '/fs/' are allowed. Set allow_unsafe to override.",
@@ -1239,6 +1412,15 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                     .and_then(|v| v.as_str())
                     .map(|s| s.contains("bind"))
                     .unwrap_or(false);
+            if ["type", "o", "device"].iter().any(|key| {
+                opts.get(*key)
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| value.contains('$'))
+            }) {
+                return Err(format!(
+                    "volumes.{vol_name}.driver_opts contains interpolation that cannot be safety-checked"
+                ));
+            }
             if !is_bind {
                 continue;
             }
@@ -1247,10 +1429,14 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
                 continue;
             }
 
-            let in_app_dir =
-                device.starts_with(&format!("{allowed_app_dir}/")) || device == allowed_app_dir;
+            let resolved_device = projected_compose_path(device, &allowed_app_dir);
+            let policy_device = resolved_device.to_string_lossy();
+            let resolved_app_dir = projected_canonical_path(&allowed_app_dir);
+            let in_app_dir = device.starts_with(&format!("{allowed_app_dir}/"))
+                || device == allowed_app_dir
+                || resolved_device.starts_with(&resolved_app_dir);
 
-            match always_forbidden_bind(device) {
+            match always_forbidden_bind(device).or_else(|| always_forbidden_bind(&policy_device)) {
                 Some(BindReject::Hard(why)) => {
                     return Err(format!(
                         "volumes.{vol_name} bind-mounts '{device}' — {why} (off-limits even with allow_unsafe)"
@@ -1265,13 +1451,37 @@ fn validate_compose(yaml: &str, app_name: &str, allow_unsafe: bool) -> Result<()
             }
 
             if !allow_unsafe {
-                let in_appdata = device == "/appdata" || device.starts_with("/appdata/");
-                let allowed =
-                    in_app_dir || device.starts_with("/fs/") || device == "/fs" || in_appdata;
+                let allowed = operator_bind_allowed(device, &allowed_app_dir);
                 if !allowed {
                     return Err(format!(
                         "volumes.{vol_name} bind-mounts '{device}' — only paths under '{allowed_app_dir}/', '/appdata/' or '/fs/' are allowed. Set allow_unsafe to override."
                     ));
+                }
+            }
+        }
+    }
+
+    if parsed.get("include").is_some() {
+        return Err(
+            "top-level include imports content that cannot be checked against the protected host-path policy"
+                .to_string(),
+        );
+    }
+
+    for section in ["configs", "secrets"] {
+        if let Some(entries) = parsed.get(section).and_then(|value| value.as_object()) {
+            for (name, entry) in entries {
+                if let Some(file) = entry.get("file") {
+                    if value_has_protected_host_reference(file, &allowed_app_dir) {
+                        return Err(format!(
+                            "{section}.{name}.file reads an interpolated or protected host path"
+                        ));
+                    }
+                    if !allow_unsafe && value_has_unsafe_host_reference(file) {
+                        return Err(format!(
+                            "{section}.{name}.file reads an absolute or escaping host path and requires Admin access"
+                        ));
+                    }
                 }
             }
         }
@@ -1377,7 +1587,10 @@ async fn pull_image_with_progress(
 
 #[cfg(test)]
 mod tests {
-    use super::{external_network_name, validate_compose};
+    use super::{
+        BindReject, always_forbidden_bind, external_network_name, operator_bind_allowed,
+        projected_canonical_path, projected_compose_path, validate_compose,
+    };
 
     #[test]
     fn external_network_name_parses_docker_error() {
@@ -1448,6 +1661,57 @@ mod tests {
             "services:\n  bad:\n    image: alpine\n    privileged: true\n",
             "privileged",
         );
+    }
+
+    #[test]
+    fn strict_rejects_interpolated_privilege_fields() {
+        err_strict(
+            "services:\n  bad:\n    image: alpine\n    privileged: ${PRIVILEGED:-true}\n",
+            "privileged",
+        );
+        err_strict(
+            "services:\n  bad:\n    image: alpine\n    network_mode: ${MODE:-host}\n",
+            "network_mode",
+        );
+        err_strict(
+            "services:\n  bad:\n    image: alpine\n    cap_add: [\"${CAPABILITY:-SYS_ADMIN}\"]\n",
+            "cap_add",
+        );
+    }
+
+    #[test]
+    fn strict_rejects_compose_indirection_and_api_socket() {
+        err_strict(
+            "services:\n  bad:\n    image: alpine\n    use_api_socket: true\n",
+            "Docker API socket",
+        );
+        err_strict(
+            "include:\n  - privileged.yml\nservices:\n  app:\n    image: alpine\n",
+            "include",
+        );
+        err_strict(
+            "services:\n  app:\n    image: alpine\nsecrets:\n  passwd:\n    file: /etc/passwd\n",
+            "secrets.passwd.file",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_bind_policy_resolves_symlinks_before_allowing_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = allowed.join("escape");
+        symlink(&outside, &link).unwrap();
+
+        assert!(!operator_bind_allowed(
+            link.to_str().unwrap(),
+            allowed.to_str().unwrap()
+        ));
     }
 
     #[test]
@@ -1662,6 +1926,65 @@ mod tests {
         err_unsafe(
             "services:\n  s:\n    image: alpine\n    volumes: [evil:/x]\nvolumes:\n  evil:\n    driver_opts:\n      type: none\n      o: bind\n      device: /\n",
             "off-limits",
+        );
+    }
+
+    #[test]
+    fn unsafe_rejects_unvalidated_compose_indirection() {
+        err_unsafe(
+            "include:\n  - imported.yml\nservices:\n  app:\n    image: alpine\n",
+            "include",
+        );
+        err_unsafe(
+            "services:\n  app:\n    extends:\n      file: imported.yml\n      service: base\n",
+            "extends",
+        );
+        err_unsafe(
+            "services:\n  app:\n    image: alpine\n    volumes_from: [base]\n",
+            "volumes_from",
+        );
+    }
+
+    #[test]
+    fn unsafe_rejects_protected_host_file_references() {
+        err_unsafe(
+            "services:\n  app:\n    image: alpine\n    env_file: /var/lib/nasty/auth.json\n",
+            "protected host path",
+        );
+        err_unsafe(
+            "services:\n  app:\n    image: alpine\nsecrets:\n  auth:\n    file: /var/lib/nasty/auth.json\n",
+            "protected host path",
+        );
+        err_unsafe(
+            "services:\n  app:\n    image: alpine\nconfigs:\n  auth:\n    file: ${AUTH_FILE}\n",
+            "interpolated",
+        );
+    }
+
+    #[test]
+    fn dotdot_policy_checks_path_components() {
+        assert!(always_forbidden_bind("/fs/tank/archive..old").is_none());
+        assert!(matches!(
+            always_forbidden_bind("/fs/tank/../private"),
+            Some(BindReject::Hard(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_compose_paths_resolve_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, project.join("escape")).unwrap();
+
+        assert_eq!(
+            projected_compose_path("./escape/data", project.to_str().unwrap()),
+            projected_canonical_path(outside.to_str().unwrap()).join("data")
         );
     }
 

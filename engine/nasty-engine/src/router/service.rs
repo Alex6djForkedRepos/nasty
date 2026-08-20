@@ -11,6 +11,50 @@ use super::*;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
+pub(super) async fn protocol_has_admin_only_sources(
+    state: &AppState,
+    protocol: nasty_system::protocol::Protocol,
+) -> Result<bool, String> {
+    match protocol {
+        nasty_system::protocol::Protocol::Iscsi => {
+            let targets = state
+                .iscsi
+                .list()
+                .await
+                .map_err(|error| error.to_string())?;
+            for lun in targets.iter().flat_map(|target| &target.luns) {
+                match lun.backstore_type.as_str() {
+                    "block" if lun.backing_volume.is_none() || lun.backing_volume_unresolved => {
+                        return Ok(true);
+                    }
+                    "fileio"
+                        if !super::share::fileio_source_is_managed(&lun.backstore_path).await =>
+                    {
+                        return Ok(true);
+                    }
+                    "block" | "fileio" => {}
+                    _ => return Ok(true),
+                }
+            }
+            Ok(false)
+        }
+        nasty_system::protocol::Protocol::Nvmeof => state
+            .nvmeof
+            .list()
+            .await
+            .map(|subsystems| {
+                subsystems
+                    .iter()
+                    .flat_map(|subsystem| &subsystem.namespaces)
+                    .any(|namespace| {
+                        namespace.backing_volume.is_none() || namespace.backing_volume_unresolved
+                    })
+            })
+            .map_err(|error| error.to_string()),
+        _ => Ok(false),
+    }
+}
+
 pub(super) async fn try_route(
     req: &Request,
     state: &AppState,
@@ -36,11 +80,29 @@ pub(super) async fn try_route(
         "service.protocol.enable" => match require_str(req, "name") {
             Ok(name) => {
                 if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
+                    if let Some(response) =
+                        require_unscoped_mutation(req, session, "global_protocol_enable")
+                    {
+                        return Some(response);
+                    }
                     if matches!(
                         proto,
                         nasty_system::protocol::Protocol::Iscsi
                             | nasty_system::protocol::Protocol::Nvmeof
                     ) {
+                        match protocol_has_admin_only_sources(state, proto).await {
+                            Ok(true) => {
+                                if let Some(response) = require_root_equivalent(
+                                    req,
+                                    session,
+                                    "raw_block_protocol_restore",
+                                ) {
+                                    return Some(response);
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => return Some(err(req, error)),
+                        }
                         let mappings = state.subvolumes.restore_block_devices().await;
                         let safe = match proto {
                             nasty_system::protocol::Protocol::Iscsi => {
@@ -146,22 +208,29 @@ pub(super) async fn try_route(
             Err(r) => r,
         },
         "service.protocol.disable" => match require_str(req, "name") {
-            Ok(name) => match state.protocols.disable(name).await {
-                Ok(v) => {
-                    if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
-                        match state.firewall.close(proto).await {
-                            Ok(()) => ok(req, v),
-                            Err(e) => err(
-                                req,
-                                format!("protocol disabled but firewall update failed: {e}"),
-                            ),
-                        }
-                    } else {
-                        ok(req, v)
-                    }
+            Ok(name) => {
+                if let Some(response) =
+                    require_unscoped_mutation(req, session, "global_protocol_disable")
+                {
+                    return Some(response);
                 }
-                Err(e) => err(req, e),
-            },
+                match state.protocols.disable(name).await {
+                    Ok(v) => {
+                        if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
+                            match state.firewall.close(proto).await {
+                                Ok(()) => ok(req, v),
+                                Err(e) => err(
+                                    req,
+                                    format!("protocol disabled but firewall update failed: {e}"),
+                                ),
+                            }
+                        } else {
+                            ok(req, v)
+                        }
+                    }
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "service.base_names.get" => {

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bollard::Docker;
@@ -472,6 +472,37 @@ async fn save_networks(f: &ManagedNetworksFile) -> Result<(), AppsError> {
 /// `..`, and any path under `/var/lib/nasty/` (except the app's own dir) are
 /// rejected outright. In strict mode (allow_unsafe == false), bind mounts
 /// must additionally fall under the app's data dir or `/fs/`.
+fn projected_canonical_path(path: &str) -> PathBuf {
+    let original = PathBuf::from(path);
+    if !original.is_absolute() {
+        return original;
+    }
+
+    let mut existing = original.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = existing.parent() else {
+            break;
+        };
+        existing = parent;
+    }
+
+    let mut resolved = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
+
+fn path_within(path: &Path, root: &str) -> bool {
+    let root = projected_canonical_path(root);
+    root != Path::new("/") && path.starts_with(root)
+}
+
 pub fn validate_simple_volumes(
     app_name: &str,
     storage_base: &str,
@@ -492,15 +523,16 @@ pub fn validate_simple_volumes(
                 "'{src}' escapes via '..'"
             )));
         }
-        if src == "/" {
+        let resolved = projected_canonical_path(src);
+        if resolved == Path::new("/") {
             return Err(AppsError::ForbiddenBind(
                 "host root '/' is never allowed as a bind mount".to_string(),
             ));
         }
-        let in_app_dir = src == &app_data_dir || src.starts_with(&format!("{app_data_dir}/"));
+        let in_app_dir = path_within(&resolved, &app_data_dir);
         // Engine state dir is off-limits even with allow_unsafe — that's where
         // auth.json, settings.json, audit.log, OIDC client secrets live.
-        let in_engine_state = src == "/var/lib/nasty" || src.starts_with("/var/lib/nasty/");
+        let in_engine_state = path_within(&resolved, "/var/lib/nasty");
         if in_engine_state && !in_app_dir {
             return Err(AppsError::ForbiddenBind(format!(
                 "'{src}' targets engine state — not allowed even with allow_unsafe"
@@ -510,8 +542,8 @@ pub fn validate_simple_volumes(
         if !allow_unsafe {
             // `/appdata` is the stable symlink onto the appdata
             // subvolume (#436) — inside the sandbox by definition.
-            let in_appdata = src == APPDATA_LINK || src.starts_with(&format!("{APPDATA_LINK}/"));
-            let allowed = in_app_dir || src == "/fs" || src.starts_with("/fs/") || in_appdata;
+            let allowed =
+                in_app_dir || path_within(&resolved, APPDATA_LINK) || path_within(&resolved, "/fs");
             if !allowed {
                 return Err(AppsError::ForbiddenBind(format!(
                     "'{src}' is outside '{app_data_dir}/', '/appdata/' and '/fs/'. Set allow_unsafe to override."
@@ -7256,6 +7288,30 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(e.contains("/home/user/data"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_rejects_symlink_that_escapes_the_app_data_dir() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_tmp("simple-bind-symlink");
+        let storage = base.join("storage");
+        let app_dir = storage.join("myapp");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = app_dir.join("escape");
+        symlink(&outside, &link).unwrap();
+
+        validate_simple_volumes(
+            "myapp",
+            storage.to_str().unwrap(),
+            &[vol(link.to_str().unwrap())],
+            false,
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
