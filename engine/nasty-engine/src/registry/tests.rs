@@ -1,7 +1,9 @@
 //! Markdown emitter unit tests. Pin the small schema-shape converters so a
 //! refactor that breaks how oneOf / $ref / nullables render fails fast.
 
-use super::markdown::{render_properties, render_result_summary, type_str_from_schema};
+use super::markdown::{
+    render_markdown, render_properties, render_result_summary, type_str_from_schema,
+};
 use serde_json::json;
 
 #[test]
@@ -185,4 +187,29 @@ fn registry_builds_without_panic() {
     assert!(!groups.is_empty(), "registry returned no groups");
     let total: usize = groups.iter().map(|(_, ms)| ms.len()).sum();
     assert!(total > 100, "expected >100 methods, got {total}");
+}
+
+#[test]
+fn markdown_introduction_matches_current_transports_and_names() {
+    let (_generator, groups) = super::build_full_registry();
+    let rendered = render_markdown(&groups);
+
+    for expected in [
+        "`wss://<host>/ws`",
+        "`nasty_session=<token>`",
+        "\"method\": \"fs.list\"",
+        "`GET /api/v1/fs/list`",
+        "`/api/docs`",
+        "`/api/openapi.json`",
+        "\"event\": \"filesystem\"",
+    ] {
+        assert!(rendered.contains(expected), "missing `{expected}`");
+    }
+    for stale in [
+        "`session=<token>`",
+        "\"method\": \"pool.list\"",
+        "\"event\": \"pool\"",
+    ] {
+        assert!(!rendered.contains(stale), "found stale `{stale}`");
+    }
 }
