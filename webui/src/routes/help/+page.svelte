@@ -306,7 +306,7 @@
 				{
 					term: 'API',
 					summary: 'Application Programming Interface — how software talks to NASty.',
-					detail: 'NASty\'s engine exposes a JSON-RPC 2.0 API over WebSocket. Everything the web UI does goes through this API, and you can use it directly for scripting and automation. Connect to ws://<nasty-ip>/ws/api with a valid token.',
+					detail: 'NASty\'s engine exposes JSON-RPC 2.0 over WebSocket at wss://<nasty-host>/ws and the same registered methods through REST under /api/v1. Use the nasty_session cookie or a Bearer token to authenticate. Interactive REST documentation is available at /api/docs.',
 				},
 				{
 					term: 'SSO / OIDC',

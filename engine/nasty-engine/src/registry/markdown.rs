@@ -20,22 +20,25 @@ pub fn render_markdown(groups: &[(&str, Vec<Method>)]) -> String {
     let mut out = String::new();
 
     out.push_str("# NASty JSON-RPC API\n\n");
-    out.push_str("NASty exposes a **JSON-RPC 2.0** API over **WebSocket** at `/ws`.\n\n");
+    out.push_str("NASty exposes a **JSON-RPC 2.0** API over **WebSocket** at `/ws` and a REST gateway for the same registered methods under `/api/v1`.\n\n");
     out.push_str("## Transport\n\n");
-    out.push_str("Connect to `ws://<host>/ws` with a valid session cookie or `Authorization: Bearer <token>` header.\n\n");
-    out.push_str("**Request:**\n```json\n{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"pool.list\", \"params\": {}}\n```\n\n");
+    out.push_str("Connect to `wss://<host>/ws` when the appliance is served over HTTPS. Use `ws://<host>/ws` only for deliberate direct plain-HTTP access. Authenticate with the `nasty_session` cookie or an `Authorization: Bearer <token>` header.\n\n");
+    out.push_str("**Request:**\n```json\n{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"fs.list\", \"params\": {}}\n```\n\n");
     out.push_str(
         "**Response:**\n```json\n{\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": [...]}\n```\n\n",
     );
     out.push_str("**Error:**\n```json\n{\"jsonrpc\": \"2.0\", \"id\": 1, \"error\": {\"code\": -32603, \"message\": \"filesystem not found: mypool\"}}\n```\n\n");
     out.push_str("## Authentication\n\n");
     out.push_str("Send `POST /api/login` with `{\"username\": \"...\", \"password\": \"...\"}` to receive a session token. ");
-    out.push_str("Pass it as a cookie (`session=<token>`) or `Authorization: Bearer <token>` header on the WebSocket upgrade.\n\n");
+    out.push_str("Pass it as a cookie (`nasty_session=<token>`) or `Authorization: Bearer <token>` header.\n\n");
+    out.push_str("## REST and OpenAPI\n\n");
+    out.push_str("Registered methods are also available through the REST gateway; for example, `fs.list` maps to `GET /api/v1/fs/list`. GET parameters use the query string and other methods accept a JSON body. Interactive Swagger UI is available at `/api/docs`, backed by the OpenAPI 3.1 document at `/api/openapi.json`. Streaming endpoints and real-time events remain WebSocket-only.\n\n");
     out.push_str("## Roles\n\n");
     out.push_str("| Role | Description |\n|------|-------------|\n");
     out.push_str("| `admin` | Full access to all methods |\n");
-    out.push_str("| `operator` | Create/delete subvolumes and snapshots; read pools. Cannot manage users, destroy pools, or change system settings. |\n");
-    out.push_str("| `readonly` | Read-only access to all list/get methods |\n\n");
+    out.push_str("| `operator` | Day-to-day storage, sharing, app, and VM operations without Admin-only system or root-equivalent access |\n");
+    out.push_str("| `readonly` | Non-privileged read-only API access |\n");
+    out.push_str("| `user` | Self-service account methods and authorized file-portal access |\n\n");
     out.push_str(
         "API tokens can additionally be scoped to a single **filesystem** (restricts visibility) ",
     );
@@ -44,7 +47,7 @@ pub fn render_markdown(groups: &[(&str, Vec<Method>)]) -> String {
     out.push_str(
         "After any successful mutation the server broadcasts an event on the same WebSocket:\n",
     );
-    out.push_str("```json\n{\"event\": \"pool\"}\n```\n");
+    out.push_str("```json\n{\"event\": \"filesystem\"}\n```\n");
     out.push_str("Clients should re-fetch the relevant resource when they receive an event. ");
     out.push_str("Event types: `filesystem`, `subvolume`, `snapshot`, `share.nfs`, `share.smb`, `share.iscsi`, `share.nvmeof`, `protocol`, `settings`, `alert`.\n\n");
     out.push_str("---\n\n");
