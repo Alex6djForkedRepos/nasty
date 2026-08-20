@@ -318,9 +318,9 @@ fn tcp_range(from: u16, to: u16) -> PortSpec {
 pub fn ports_for_protocol(proto: Protocol) -> Vec<PortSpec> {
     match proto {
         Protocol::Nfs => vec![tcp(2049)],
-        // 445/139: Samba serving. 3702/udp: WSDD announcements for
-        // Windows 10/11 Explorer discovery (samba-wsdd.service).
-        Protocol::Smb => vec![tcp(445), tcp(139), udp(3702)],
+        // 445/139: Samba serving. WSDD uses 3702/udp for discovery and
+        // 5357/tcp for the metadata exchange that completes discovery.
+        Protocol::Smb => vec![tcp(445), tcp(139), udp(3702), tcp(5357)],
         Protocol::Iscsi => vec![tcp(3260)],
         Protocol::Nvmeof => vec![tcp(4420)],
         Protocol::Nut => vec![tcp(3493)],
@@ -1392,11 +1392,9 @@ mod tests {
 
     #[test]
     fn smb_opens_serving_and_wsdd_discovery_ports() {
-        // 445 + 139 are Samba's serving ports; 3702/udp is WSDD's
-        // multicast WS-Discovery port — without it Windows 10/11
-        // Explorer can't browse the host. Pin them so a refactor
-        // doesn't silently drop discovery and turn NASty invisible
-        // to Windows file managers again (issue #70).
+        // 445 + 139 are Samba's serving ports. WSDD discovers over
+        // 3702/udp, then serves device metadata over 5357/tcp. Pin the
+        // complete exchange so NASty remains visible to network browsers.
         let ports = ports_for_protocol(Protocol::Smb);
         assert!(
             ports
@@ -1412,6 +1410,11 @@ mod tests {
             ports
                 .iter()
                 .any(|p| p.port == 3702 && p.transport == Transport::Udp)
+        );
+        assert!(
+            ports
+                .iter()
+                .any(|p| p.port == 5357 && p.transport == Transport::Tcp)
         );
     }
 
