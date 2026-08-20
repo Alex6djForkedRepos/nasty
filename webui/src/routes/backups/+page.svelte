@@ -409,10 +409,11 @@
 			updated.repo_initialized = false;
 		}
 
-		await withToast(
-			() => client.call('backup.profile.update', updated),
+		const result = await withToast(
+			() => client.call<BackupProfile>('backup.profile.update', updated),
 			'Profile updated'
 		);
+		if (result === undefined) return;
 		editId = null;
 		await refresh();
 	}
