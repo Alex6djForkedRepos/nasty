@@ -1971,7 +1971,7 @@ in {
     #
     # - mDNS `_smb._tcp` via Avahi  → macOS Finder, GNOME Files, KDE
     # - mDNS `_device-info._tcp`    → Finder shows the rack-server icon
-    # - WS-Discovery (UDP 3702)     → Windows 10/11 Explorer
+    # - WS-Discovery (UDP 3702 + TCP 5357) → Windows Explorer and GNOME Files
     #
     # All gated on the build-time SMB switch. The engine starts/stops
     # samba-wsdd alongside samba-smbd/nmbd via the protocol service

@@ -122,6 +122,9 @@
 
 ### Sharing & block exports
 
+- SMB discovery now permits WSD metadata exchange on TCP 5357 in addition to
+  UDP 3702, allowing GNOME Files and other WSD clients to finish discovery
+  (#778).
 - iSCSI LUNs and NVMe-oF namespaces persist immutable block-volume identities
   and remap each export independently. Unresolved identities quiesce the
   affected protocol instead of risking the wrong volume (#698).
