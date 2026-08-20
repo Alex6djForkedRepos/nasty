@@ -849,12 +849,13 @@
 					<td class="p-3 text-right text-muted-foreground text-xs tabular-nums">{formatDate(entry.modified)}</td>
 					{#if !isRoot}
 						<td class="p-3 text-right">
-							<div class="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100">
+							<div class="file-row-actions flex items-center justify-end gap-2 transition-opacity">
 								{#if entry.is_dir}
 									<button
 										class="text-muted-foreground/40 hover:text-foreground transition-colors"
 										onclick={() => calcFolderSize(entry)}
 										disabled={folderSizes[entry.name] === 'loading'}
+										aria-label={`Calculate size for ${entry.name}`}
 										title="Calculate size">
 										<Calculator size={14} />
 									</button>
@@ -864,6 +865,7 @@
 										href={contentUrl(entry)}
 										download={entry.name}
 										class="text-muted-foreground/40 hover:text-foreground transition-colors"
+										aria-label={`Download ${entry.name}`}
 										title="Download">
 										<Download size={14} />
 									</a>
@@ -872,6 +874,7 @@
 									<button
 										class="text-muted-foreground/40 hover:text-foreground transition-colors"
 										onclick={() => openShare(entry)}
+										aria-label={`Create guest share for ${entry.name}`}
 										title="Create guest share link">
 										<Share2 size={14} />
 									</button>
@@ -879,24 +882,28 @@
 								<button
 									class="text-muted-foreground/40 hover:text-foreground transition-colors"
 									onclick={() => startRename(entry)}
+									aria-label={`Rename ${entry.name}`}
 									title="Rename">
 									<Pencil size={14} />
 								</button>
 								<button
 									class="text-muted-foreground/40 hover:text-foreground transition-colors"
 									onclick={() => openPicker([entry], 'copy')}
+									aria-label={`Copy ${entry.name}`}
 									title="Copy to…">
 									<Copy size={14} />
 								</button>
 								<button
 									class="text-muted-foreground/40 hover:text-foreground transition-colors"
 									onclick={() => openPicker([entry], 'move')}
+									aria-label={`Move ${entry.name}`}
 									title="Move to…">
 									<FolderInput size={14} />
 								</button>
 								<button
 									class="text-muted-foreground/40 hover:text-destructive transition-colors"
 									onclick={() => deleteTarget = entry}
+									aria-label={`Delete ${entry.name}`}
 									title="Delete">
 									<Trash2 size={14} />
 								</button>
@@ -1162,3 +1169,16 @@
 	onPick={runPickerAction}
 	onClose={() => { pickerOpen = false; pickerTargets = []; }}
 />
+
+<style>
+	@media (hover: hover) and (pointer: fine) and (min-width: 768px) {
+		.group .file-row-actions {
+			opacity: 0;
+		}
+
+		.group:hover .file-row-actions,
+		.group:focus-within .file-row-actions {
+			opacity: 1;
+		}
+	}
+</style>
