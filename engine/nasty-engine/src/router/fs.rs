@@ -11,6 +11,29 @@ use super::*;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
+async fn require_block_share_recovery_access(
+    req: &Request,
+    state: &AppState,
+    session: &Session,
+) -> Option<Response> {
+    for protocol in [
+        nasty_system::protocol::Protocol::Iscsi,
+        nasty_system::protocol::Protocol::Nvmeof,
+    ] {
+        if !state.protocols.is_enabled(protocol).await {
+            continue;
+        }
+        match super::service::protocol_has_admin_only_sources(state, protocol).await {
+            Ok(true) => {
+                return require_root_equivalent(req, session, "raw_block_share_recovery");
+            }
+            Ok(false) => {}
+            Err(error) => return Some(err(req, error)),
+        }
+    }
+    None
+}
+
 pub(super) async fn try_route(
     req: &Request,
     state: &AppState,
@@ -132,6 +155,9 @@ pub(super) async fn try_route(
                 #[serde(default)]
                 degraded: bool,
             }
+            if let Some(response) = require_block_share_recovery_access(req, state, session).await {
+                return Some(response);
+            }
             match parse_params::<MountParams>(req) {
                 Ok(p) => match state
                     .filesystems
@@ -159,6 +185,11 @@ pub(super) async fn try_route(
         },
         "fs.unlock" => match parse_params::<serde_json::Value>(req) {
             Ok(p) => {
+                if let Some(response) =
+                    require_block_share_recovery_access(req, state, session).await
+                {
+                    return Some(response);
+                }
                 let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let passphrase = p.get("passphrase").and_then(|v| v.as_str()).unwrap_or("");
                 match state.filesystems.unlock(name, passphrase).await {

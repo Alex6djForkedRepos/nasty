@@ -11,6 +11,72 @@ use super::*;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
+fn simple_requires_admin(req: &nasty_apps::InstallAppRequest) -> bool {
+    req.allow_unsafe || req.network.as_deref() == Some("host")
+}
+
+async fn existing_app_requires_admin(state: &AppState, name: &str) -> Result<bool, String> {
+    let app = state
+        .apps
+        .get(name)
+        .await
+        .map_err(|error| error.to_string())?;
+    if app.kind == "compose" || app.unsafe_mode || app.network.as_deref() == Some("host") {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn existing_app_access_error(
+    req: &Request,
+    state: &AppState,
+    session: &Session,
+    name: &str,
+) -> Option<Response> {
+    match existing_app_requires_admin(state, name).await {
+        Ok(false) => {
+            if session.filesystem.is_some() || session.owner.is_some() {
+                let config = match state.apps.get_config(name).await {
+                    Ok(config) => config,
+                    Err(error) => return Some(err(req, error)),
+                };
+                if let Err(error) = authorize_app_paths(
+                    state,
+                    session,
+                    config
+                        .volumes
+                        .into_iter()
+                        .map(|volume| volume.host_path)
+                        .collect(),
+                )
+                .await
+                {
+                    return Some(err(req, error));
+                }
+            }
+            None
+        }
+        Ok(true) => require_root_equivalent(req, session, "unsafe_existing_app"),
+        Err(error) => Some(invalid(req, error)),
+    }
+}
+
+async fn authorize_app_paths(
+    state: &AppState,
+    session: &Session,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    if session.filesystem.is_none() && session.owner.is_none() {
+        return Ok(());
+    }
+    for path in &paths {
+        if path.starts_with('/') {
+            super::share::authorize_path_source(state, session, path).await?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn published_firewall_ports(
     state: &AppState,
 ) -> Result<Vec<nasty_system::firewall::PublishedAppPort>, String> {
@@ -54,16 +120,24 @@ pub(super) async fn try_route(
     let response = match req.method.as_str() {
         "apps.status" => ok(req, state.apps.status().await),
         "apps.enable" => {
+            if let Some(response) = require_root_equivalent(req, session, "apps_runtime_enable") {
+                return Some(response);
+            }
             let p: nasty_apps::EnableAppsRequest = parse_params(req).unwrap_or_default();
             match state.apps.enable(p).await {
                 Ok(()) => ok(req, "ok"),
                 Err(e) => err(req, e),
             }
         }
-        "apps.disable" => match state.apps.disable().await {
-            Ok(()) => ok(req, "ok"),
-            Err(e) => err(req, e),
-        },
+        "apps.disable" => {
+            if let Some(response) = require_root_equivalent(req, session, "apps_runtime_disable") {
+                return Some(response);
+            }
+            match state.apps.disable().await {
+                Ok(()) => ok(req, "ok"),
+                Err(e) => err(req, e),
+            }
+        }
         "apps.list" => match state.apps.list().await {
             Ok(v) => ok(req, v),
             Err(e) => err(req, e),
@@ -88,6 +162,24 @@ pub(super) async fn try_route(
         },
         "apps.install" => match parse_params::<nasty_apps::InstallAppRequest>(req) {
             Ok(p) => {
+                if simple_requires_admin(&p)
+                    && let Some(response) =
+                        require_root_equivalent(req, session, "unsafe_app_payload")
+                {
+                    return Some(response);
+                }
+                if let Err(error) = authorize_app_paths(
+                    state,
+                    session,
+                    p.volumes
+                        .iter()
+                        .map(|volume| volume.host_path.clone())
+                        .collect(),
+                )
+                .await
+                {
+                    return Some(err(req, error));
+                }
                 // Refresh Caddy TLS automation when the install opts into
                 // a subdomain ingress — install() wires the route but the
                 // TLS layer is reached from here (see the matching note in
@@ -109,11 +201,31 @@ pub(super) async fn try_route(
             }
             Err(e) => invalid(req, e),
         },
-        "apps.update" => match parse_params(req) {
-            Ok(p) => match state.apps.update(p).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+        "apps.update" => match parse_params::<nasty_apps::InstallAppRequest>(req) {
+            Ok(p) => {
+                if simple_requires_admin(&p)
+                    && let Some(response) =
+                        require_root_equivalent(req, session, "unsafe_app_payload")
+                {
+                    return Some(response);
+                }
+                if let Err(error) = authorize_app_paths(
+                    state,
+                    session,
+                    p.volumes
+                        .iter()
+                        .map(|volume| volume.host_path.clone())
+                        .collect(),
+                )
+                .await
+                {
+                    return Some(err(req, error));
+                }
+                match state.apps.update(p).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(e) => invalid(req, e),
         },
         "apps.inspect_image" => match require_str(req, "image") {
@@ -140,13 +252,18 @@ pub(super) async fn try_route(
             Err(e) => invalid(req, e),
         },
         "apps.appdata.status" => ok(req, state.apps.appdata_relocate_status().await),
-        "apps.appdata.relocate" => match require_str(req, "filesystem") {
-            Ok(fs) => match state.apps.appdata_relocate(fs).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
-            Err(r) => r,
-        },
+        "apps.appdata.relocate" => {
+            if let Some(response) = require_root_equivalent(req, session, "appdata_relocation") {
+                return Some(response);
+            }
+            match require_str(req, "filesystem") {
+                Ok(fs) => match state.apps.appdata_relocate(fs).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                },
+                Err(r) => r,
+            }
+        }
         "apps.fix_volume_perms" => match parse_params(req) {
             Ok(p) => match state.apps.fix_volume_perms(p).await {
                 Ok(()) => ok(req, serde_json::json!({"ok": true})),
@@ -162,52 +279,82 @@ pub(super) async fn try_route(
             Err(r) => r,
         },
         "apps.remove" => match require_str(req, "name") {
-            Ok(name) => match state.apps.remove(name).await {
-                Ok(()) => {
-                    // Cover the case where the removed app had a
-                    // subdomain ingress — Caddy stops trying to renew
-                    // the now-orphaned cert. The internal remove path
-                    // in nasty-apps clears the route via the admin API
-                    // but doesn't know about the TLS-automation layer.
-                    tokio::spawn(nasty_system::settings::reapply_tls_from_disk());
-                    ok(req, "ok")
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
                 }
-                Err(e) => err(req, e),
-            },
+                match state.apps.remove(name).await {
+                    Ok(()) => {
+                        // Cover the case where the removed app had a
+                        // subdomain ingress — Caddy stops trying to renew
+                        // the now-orphaned cert. The internal remove path
+                        // in nasty-apps clears the route via the admin API
+                        // but doesn't know about the TLS-automation layer.
+                        tokio::spawn(nasty_system::settings::reapply_tls_from_disk());
+                        ok(req, "ok")
+                    }
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.stop" => match require_str(req, "name") {
-            Ok(name) => match state.apps.stop(name).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
+                }
+                match state.apps.stop(name).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.start" => match require_str(req, "name") {
-            Ok(name) => match state.apps.start(name).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
+                }
+                match state.apps.start(name).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.restart" => match require_str(req, "name") {
-            Ok(name) => match state.apps.restart(name).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
+                }
+                match state.apps.restart(name).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.pull" => match require_str(req, "name") {
-            Ok(name) => match state.apps.pull(name).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
+                }
+                match state.apps.pull(name).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
-        "apps.prune" => match state.apps.prune().await {
-            Ok(v) => ok(req, v),
-            Err(e) => err(req, e),
-        },
+        "apps.prune" => {
+            if let Some(response) = require_unscoped_mutation(req, session, "global_apps_prune") {
+                return Some(response);
+            }
+            match state.apps.prune().await {
+                Ok(v) => ok(req, v),
+                Err(e) => err(req, e),
+            }
+        }
         "apps.exec_command" => match require_str(req, "name") {
             Ok(name) => match state.apps.exec_command(name).await {
                 Ok(v) => ok(req, v),
@@ -247,25 +394,50 @@ pub(super) async fn try_route(
                 Err(e) => err(req, e),
             }
         }
-        "apps.compose.install" => match parse_params(req) {
-            Ok(p) => match state.apps.compose_install(p).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+        "apps.compose.install" => match parse_params::<nasty_apps::InstallComposeRequest>(req) {
+            Ok(p) => {
+                if let Some(response) = require_root_equivalent(req, session, "compose_lifecycle") {
+                    return Some(response);
+                }
+                if let Err(error) =
+                    crate::app_deploy::validate_compose(&p.compose_file, &p.name, true)
+                {
+                    return Some(invalid(req, error));
+                }
+                match state.apps.compose_install(p).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(e) => invalid(req, e),
         },
-        "apps.compose.update" => match parse_params(req) {
-            Ok(p) => match state.apps.compose_update(p).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+        "apps.compose.update" => match parse_params::<nasty_apps::InstallComposeRequest>(req) {
+            Ok(p) => {
+                if let Some(response) = require_root_equivalent(req, session, "compose_lifecycle") {
+                    return Some(response);
+                }
+                if let Err(error) =
+                    crate::app_deploy::validate_compose(&p.compose_file, &p.name, true)
+                {
+                    return Some(invalid(req, error));
+                }
+                match state.apps.compose_update(p).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(e) => invalid(req, e),
         },
         "apps.compose.remove" => match require_str(req, "name") {
-            Ok(name) => match state.apps.compose_remove(name).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = require_root_equivalent(req, session, "compose_lifecycle") {
+                    return Some(response);
+                }
+                match state.apps.compose_remove(name).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.compose.get" => match require_str(req, "name") {
@@ -293,14 +465,21 @@ pub(super) async fn try_route(
         }
         "apps.compose.set_startup" => {
             match parse_params::<nasty_apps::SetComposeStartupRequest>(req) {
-                Ok(p) => match state
-                    .apps
-                    .compose_set_startup(&p.name, p.managed, p.order, p.delay_secs)
-                    .await
-                {
-                    Ok(()) => ok(req, "ok"),
-                    Err(e) => err(req, e),
-                },
+                Ok(p) => {
+                    if let Some(response) =
+                        existing_app_access_error(req, state, session, &p.name).await
+                    {
+                        return Some(response);
+                    }
+                    match state
+                        .apps
+                        .compose_set_startup(&p.name, p.managed, p.order, p.delay_secs)
+                        .await
+                    {
+                        Ok(()) => ok(req, "ok"),
+                        Err(e) => err(req, e),
+                    }
+                }
                 Err(e) => invalid(req, e),
             }
         }
@@ -343,6 +522,11 @@ pub(super) async fn try_route(
         },
         "apps.ingress.set" => match parse_params::<nasty_apps::SetIngressRequest>(req) {
             Ok(p) => {
+                if let Some(response) =
+                    existing_app_access_error(req, state, session, &p.name).await
+                {
+                    return Some(response);
+                }
                 let _reservation = crate::ingress_conflict::lock_hostname_reservations().await;
                 // Gate the set on a subdomain-conflict check — catches the
                 // "two apps claim the same hostname" / "app subdomain ==
@@ -392,16 +576,21 @@ pub(super) async fn try_route(
             ok(req, reason)
         }
         "apps.ingress.remove" => match require_str(req, "name") {
-            Ok(name) => match state.apps.ingress_remove(name).await {
-                Ok(()) => {
-                    // Reapply so Caddy stops trying to renew the cert
-                    // for the now-orphaned subdomain. Same fire-and-
-                    // forget pattern as the set arm above.
-                    tokio::spawn(nasty_system::settings::reapply_tls_from_disk());
-                    ok(req, "ok")
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
                 }
-                Err(e) => err(req, e),
-            },
+                match state.apps.ingress_remove(name).await {
+                    Ok(()) => {
+                        // Reapply so Caddy stops trying to renew the cert
+                        // for the now-orphaned subdomain. Same fire-and-
+                        // forget pattern as the set arm above.
+                        tokio::spawn(nasty_system::settings::reapply_tls_from_disk());
+                        ok(req, "ok")
+                    }
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
 
@@ -412,6 +601,11 @@ pub(super) async fn try_route(
         },
         "apps.networks.create" => match parse_params::<nasty_apps::ManagedNetwork>(req) {
             Ok(spec) => {
+                if let Some(response) =
+                    require_unscoped_mutation(req, session, "global_apps_network_create")
+                {
+                    return Some(response);
+                }
                 let ifaces = crate::system_network_ifaces(state).await;
                 // Resolve the management interface from the caller's peer so we
                 // can refuse a host shim on it (lockout guard, #448).
@@ -449,16 +643,23 @@ pub(super) async fn try_route(
             Err(e) => invalid(req, e),
         },
         "apps.networks.remove" => match require_str(req, "name") {
-            Ok(name) => match state.apps.network_remove(name).await {
-                Ok(()) => {
-                    // Tear down the host shim too (best-effort).
-                    if let Err(e) = crate::remove_macvlan_shim(state, name).await {
-                        tracing::warn!("apps: failed to remove macvlan shim for '{name}': {e}");
-                    }
-                    ok(req, "ok")
+            Ok(name) => {
+                if let Some(response) =
+                    require_unscoped_mutation(req, session, "global_apps_network_remove")
+                {
+                    return Some(response);
                 }
-                Err(e) => err(req, e),
-            },
+                match state.apps.network_remove(name).await {
+                    Ok(()) => {
+                        // Tear down the host shim too (best-effort).
+                        if let Err(e) = crate::remove_macvlan_shim(state, name).await {
+                            tracing::warn!("apps: failed to remove macvlan shim for '{name}': {e}");
+                        }
+                        ok(req, "ok")
+                    }
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         _ => return None,
@@ -486,4 +687,36 @@ pub(super) async fn try_route(
         tracing::warn!("app firewall reconciliation after failed request also failed: {e}");
     }
     Some(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn simple_request(extra: serde_json::Value) -> nasty_apps::InstallAppRequest {
+        let mut value = serde_json::json!({
+            "name": "safe-app",
+            "image": "example/app:latest"
+        });
+        value.as_object_mut().unwrap().extend(
+            extra
+                .as_object()
+                .expect("test request extension must be an object")
+                .clone(),
+        );
+        serde_json::from_value(value).expect("valid test request")
+    }
+
+    #[test]
+    fn simple_admin_gate_covers_unsafe_mounts_and_host_networking() {
+        assert!(!simple_requires_admin(&simple_request(serde_json::json!(
+            {}
+        ))));
+        assert!(simple_requires_admin(&simple_request(serde_json::json!({
+            "allow_unsafe": true
+        }))));
+        assert!(simple_requires_admin(&simple_request(serde_json::json!({
+            "network": "host"
+        }))));
+    }
 }

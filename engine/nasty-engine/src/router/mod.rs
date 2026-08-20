@@ -84,7 +84,6 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "snapshot.create"
                 | "snapshot.delete"
                 | "snapshot.clone"
-                | "snapshot.rollback"
                 | "share.nfs.create"
                 | "share.nfs.update"
                 | "share.nfs.delete"
@@ -136,10 +135,6 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "vm.kill"
                 | "vm.snapshot"
                 | "vm.clone"
-                | "apps.enable"
-                // `apps.disable` was admin-only — same asymmetry: an
-                // operator could turn the apps runtime on but not off.
-                | "apps.disable"
                 | "apps.install"
                 | "apps.update"
                 | "apps.remove"
@@ -148,13 +143,6 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "apps.restart"
                 | "apps.pull"
                 | "apps.prune"
-                | "apps.compose.install"
-                | "apps.compose.update"
-                | "apps.compose.remove"
-                | "apps.compose.set_startup"
-                // Appdata relocation (#436) — same altitude as the
-                // rest of app lifecycle management.
-                | "apps.appdata.relocate"
                 | "apps.ingress.set"
                 | "apps.ingress.remove"
                 // Docker network management (#435, #438). Registered as
@@ -576,6 +564,71 @@ pub(super) fn invalid(req: &Request, msg: impl std::fmt::Display) -> Response {
         req.id.clone(),
         ErrorCode::InvalidParams,
         format!("Invalid params: {msg}"),
+    )
+}
+
+fn require_endpoint_access(
+    req: &Request,
+    session: &Session,
+    access: crate::auth::EndpointAccess,
+    reason: &str,
+    audit_allowed: bool,
+) -> Option<Response> {
+    match crate::auth::authorize_session(session, access) {
+        Ok(()) => {
+            if audit_allowed {
+                crate::auth::audit(
+                    "root_equivalent_requested",
+                    &session.username,
+                    session.client_ip.as_deref().unwrap_or("unknown"),
+                    &format!("method={} reason={reason}", req.method),
+                );
+            }
+            None
+        }
+        Err(denied) => {
+            crate::auth::audit(
+                "permission_denied",
+                &session.username,
+                session.client_ip.as_deref().unwrap_or("unknown"),
+                &format!(
+                    "method={} role={:?} reason={reason}",
+                    req.method, session.role
+                ),
+            );
+            Some(err(req, denied.message()))
+        }
+    }
+}
+
+/// Gate payloads that turn an otherwise Operator-level method into a
+/// root-equivalent operation. Keep this check beside dispatch so every caller
+/// gets the same scope enforcement and audit trail.
+pub(super) fn require_root_equivalent(
+    req: &Request,
+    session: &Session,
+    reason: &str,
+) -> Option<Response> {
+    require_endpoint_access(
+        req,
+        session,
+        crate::auth::EndpointAccess::RootEquivalent,
+        reason,
+        true,
+    )
+}
+
+pub(super) fn require_unscoped_mutation(
+    req: &Request,
+    session: &Session,
+    reason: &str,
+) -> Option<Response> {
+    require_endpoint_access(
+        req,
+        session,
+        crate::auth::EndpointAccess::UnscopedMutation,
+        reason,
+        false,
     )
 }
 
