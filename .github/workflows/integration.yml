@@ -18,6 +18,8 @@ on:
       # Engine behavior is exercised by appliance-smoke and the AD DC/member
       # test; engine-only changes must not skip those integration checks.
       - 'engine/**'
+      # Verify WebUI changes in the appliance closure, not only the Vite build.
+      - 'webui/**'
       - 'flake.nix'
       - 'flake.lock'
 
