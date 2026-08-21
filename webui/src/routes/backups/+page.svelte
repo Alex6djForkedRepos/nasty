@@ -12,6 +12,7 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { Badge } from '$lib/components/ui/badge';
+	import * as Dialog from '$lib/components/ui/dialog';
 	import PathPicker from '$lib/components/PathPicker.svelte';
 	import { CORE_RECOVERY_SOURCES, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
 	import { FolderOpen } from '@lucide/svelte';
@@ -1202,101 +1203,95 @@
 </div>
 
 <!-- Snapshots modal -->
-{#if viewSnapshotsId}
-	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-		<div class="flex flex-col w-[90vw] max-w-3xl max-h-[70vh] rounded-lg border border-border bg-card shadow-2xl">
-			<div class="flex items-center justify-between px-4 py-2 border-b border-border">
-				<span class="text-sm font-semibold">Snapshots</span>
-				<Button variant="ghost" size="xs" onclick={() => viewSnapshotsId = null}>Close</Button>
-			</div>
-			<div class="flex-1 overflow-auto p-4">
-				{#if snapshotsLoading}
-					<p class="text-sm text-muted-foreground">Loading...</p>
-				{:else if snapshots.length === 0}
-					<p class="text-sm text-muted-foreground">No snapshots yet.</p>
-				{:else}
-					<table class="w-full text-sm">
-						<thead>
-							<tr class="border-b border-border text-xs text-muted-foreground">
-								<th class="p-2 text-left">ID</th>
-								<th class="p-2 text-left">Time</th>
-								<th class="p-2 text-left">Host</th>
-								<th class="p-2 text-left">Paths</th>
-								<th class="p-2 text-left"></th>
+<Dialog.Root open={viewSnapshotsId !== null} onOpenChange={(open) => { if (!open) viewSnapshotsId = null; }}>
+	<Dialog.Content class="flex max-h-[70vh] w-[90vw] max-w-3xl flex-col gap-0 bg-card p-0">
+		<Dialog.Header class="border-b border-border px-4 py-3 pr-12">
+			<Dialog.Title class="text-sm">Snapshots</Dialog.Title>
+		</Dialog.Header>
+		<div class="flex-1 overflow-auto p-4">
+			{#if snapshotsLoading}
+				<p class="text-sm text-muted-foreground">Loading...</p>
+			{:else if snapshots.length === 0}
+				<p class="text-sm text-muted-foreground">No snapshots yet.</p>
+			{:else}
+				<table class="w-full text-sm">
+					<thead>
+						<tr class="border-b border-border text-xs text-muted-foreground">
+							<th class="p-2 text-left">ID</th>
+							<th class="p-2 text-left">Time</th>
+							<th class="p-2 text-left">Host</th>
+							<th class="p-2 text-left">Paths</th>
+							<th class="p-2 text-left"></th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each snapshots as snap}
+							<tr class="border-b border-border/50">
+								<td class="p-2 font-mono text-xs">{snap.id.slice(0, 8)}</td>
+								<td class="p-2 text-xs">{snap.time.slice(0, 19).replace('T', ' ')}</td>
+								<td class="p-2 text-xs">{snap.hostname}</td>
+								<td class="p-2 text-xs text-muted-foreground">{snap.paths.join(', ')}</td>
+								<td class="p-2 text-right">
+									<Button
+										size="xs"
+										variant="secondary"
+										disabled={viewSnapshotsId !== null && activeJobs[viewSnapshotsId] !== undefined}
+										onclick={() => { if (viewSnapshotsId) openRestore(viewSnapshotsId, snap); }}
+									>
+										Restore
+									</Button>
+								</td>
 							</tr>
-						</thead>
-						<tbody>
-							{#each snapshots as snap}
-								<tr class="border-b border-border/50">
-									<td class="p-2 font-mono text-xs">{snap.id.slice(0, 8)}</td>
-									<td class="p-2 text-xs">{snap.time.slice(0, 19).replace('T', ' ')}</td>
-									<td class="p-2 text-xs">{snap.hostname}</td>
-									<td class="p-2 text-xs text-muted-foreground">{snap.paths.join(', ')}</td>
-									<td class="p-2 text-right">
-										<Button
-											size="xs"
-											variant="secondary"
-											disabled={viewSnapshotsId !== null && activeJobs[viewSnapshotsId] !== undefined}
-											onclick={() => { if (viewSnapshotsId) openRestore(viewSnapshotsId, snap); }}
-										>
-											Restore
-										</Button>
-									</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-				{/if}
-			</div>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
 		</div>
-	</div>
-{/if}
+	</Dialog.Content>
+</Dialog.Root>
 
 <!-- Restore dialog -->
-{#if restoreSnapshot}
-	<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" role="button" tabindex="-1" onclick={closeRestore} onkeydown={(e) => { if (e.key === 'Escape') closeRestore(); }}>
-		<Card class="w-[32rem] max-w-[90vw]" role="presentation" onclick={(e: MouseEvent) => e.stopPropagation()} onkeydown={(e: KeyboardEvent) => e.stopPropagation()}>
-			<CardContent class="pt-6 space-y-4">
-				<div class="flex items-center justify-between">
-					<span class="text-sm font-semibold">Restore snapshot</span>
-					<Button variant="ghost" size="xs" onclick={closeRestore}>Close</Button>
-				</div>
-				<p class="text-xs text-muted-foreground">
+<Dialog.Root open={restoreSnapshot !== null} onOpenChange={(open) => { if (!open) closeRestore(); }}>
+	<Dialog.Content class="max-w-[32rem]">
+		<Dialog.Header>
+			<Dialog.Title>Restore snapshot</Dialog.Title>
+			<Dialog.Description class="text-xs">
+				{#if restoreSnapshot}
 					Restoring snapshot {restoreSnapshot.id.slice(0, 8)} from {restoreSnapshot.time.slice(0, 19).replace('T', ' ')}.
 					Files are written into the chosen filesystem; existing files are only replaced
 					when overwrite is enabled, and nothing else is deleted.
-				</p>
+				{/if}
+			</Dialog.Description>
+		</Dialog.Header>
 
-				<div>
-					<Label for="restore-fs">Destination filesystem</Label>
-					<select id="restore-fs" class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" bind:value={restoreFs}>
-						{#each filesystems.filter(f => f.mounted) as fs}
-							<option value={fs.name}>{fs.name}</option>
-						{/each}
-					</select>
-				</div>
+		<div>
+			<Label for="restore-fs">Destination filesystem</Label>
+			<select id="restore-fs" class="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" bind:value={restoreFs}>
+				{#each filesystems.filter(f => f.mounted) as fs}
+					<option value={fs.name}>{fs.name}</option>
+				{/each}
+			</select>
+		</div>
 
-				<div>
-					<Label for="restore-subpath">Subfolder <span class="text-xs font-normal text-muted-foreground">(optional)</span></Label>
-					<Input id="restore-subpath" bind:value={restoreSubpath} placeholder="restored/2026-07-09" class="mt-1 font-mono" />
-					<p class="mt-1 text-xs text-muted-foreground font-mono">
-						Destination: /fs/{restoreFs || '<fs>'}{restoreSubpath ? '/' + restoreSubpath.replace(/^\/+/, '') : ''}
-					</p>
-				</div>
+		<div>
+			<Label for="restore-subpath">Subfolder <span class="text-xs font-normal text-muted-foreground">(optional)</span></Label>
+			<Input id="restore-subpath" bind:value={restoreSubpath} placeholder="restored/2026-07-09" class="mt-1 font-mono" />
+			<p class="mt-1 text-xs text-muted-foreground font-mono">
+				Destination: /fs/{restoreFs || '<fs>'}{restoreSubpath ? '/' + restoreSubpath.replace(/^\/+/, '') : ''}
+			</p>
+		</div>
 
-				<label class="flex items-center gap-2 text-sm">
-					<input type="checkbox" bind:checked={restoreAllowOverwrite} class="rounded border-input" />
-					Overwrite existing files (allow restoring into a non-empty folder)
-				</label>
+		<label class="flex items-center gap-2 text-sm">
+			<input type="checkbox" bind:checked={restoreAllowOverwrite} class="rounded border-input" />
+			Overwrite existing files (allow restoring into a non-empty folder)
+		</label>
 
-				<div class="flex justify-end gap-2">
-					<Button variant="secondary" size="sm" onclick={closeRestore}>Cancel</Button>
-					<Button size="sm" disabled={!restoreFs} onclick={startRestore}>Restore</Button>
-				</div>
-			</CardContent>
-		</Card>
-	</div>
-{/if}
+		<Dialog.Footer>
+			<Button variant="secondary" size="sm" onclick={closeRestore}>Cancel</Button>
+			<Button size="sm" disabled={!restoreFs} onclick={startRestore}>Restore</Button>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>
 
 <!-- Path picker shared by the create form and per-profile edit form.
      Only one is ever open at a time. -->
