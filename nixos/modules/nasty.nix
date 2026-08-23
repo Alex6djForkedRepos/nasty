@@ -529,12 +529,14 @@ in {
          bcachefs subvolume list /fs/first
          bcachefs subvolume snapshot <src> <dst>
 
-       I/O monitoring
+       diagnostics & monitoring
          iotop-c -o
          iostat -x 1
          dool -dny 1
          btop                                       interactive CPU/mem/disk/net dashboard
          diskwatch                                  read-only disk diagnostics TUI (devices, SMART, IO, hot files)
+         netwatch                                   read-only network diagnostics TUI (interfaces, connections, DNS, capture)
+         syswatch                                   read-only system diagnostics TUI (CPU, memory, processes, services)
          # → type 'debug' for perf profiling and kernel oops symbolization
          # → type 'benchmark' for fio storage tests
 
@@ -806,15 +808,55 @@ in {
         diskwatchSrc = pkgs.fetchFromGitHub {
           owner = "matthart1983";
           repo = "diskwatch";
-          rev = "v0.3.2";
-          hash = "sha256-/wR+tUQPV6EnWcZvOdZY9di9Eu07NSnAn25du/KMlfw=";
+          rev = "v0.4.0";
+          hash = "sha256-pKo4zXyoX2OiOIwirCdzQuuFW1dMye/AA4MNVYgki3A=";
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "diskwatch";
-        version = "0.3.2";
+        version = "0.4.0";
         src = diskwatchSrc;
         cargoLock.lockFile = "${diskwatchSrc}/Cargo.lock";
         meta.mainProgram = "diskwatch";
+      })
+
+      # netwatch — sibling read-only network-diagnostics TUI. Packet capture
+      # uses libpcap; the TUI degrades gracefully when elevated capture/eBPF
+      # permissions are unavailable.
+      (let
+        netwatchSrc = pkgs.fetchFromGitHub {
+          owner = "matthart1983";
+          repo = "netwatch";
+          rev = "v0.29.2";
+          hash = "sha256-evfnMhLV+qxovhmBr4bGvCnY7weBGzfw6I67VJfYKJc=";
+        };
+      in pkgs.rustPlatform.buildRustPackage {
+        pname = "netwatch-tui";
+        version = "0.29.2";
+        src = netwatchSrc;
+        cargoLock.lockFile = "${netwatchSrc}/Cargo.lock";
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.libpcap ];
+        postInstall = ''
+          install -Dm644 LICENSE "$out/share/licenses/netwatch/LICENSE"
+          install -Dm644 NOTICE "$out/share/licenses/netwatch/NOTICE"
+        '';
+        meta.mainProgram = "netwatch";
+      })
+
+      # syswatch — sibling read-only host-diagnostics TUI (MIT).
+      (let
+        syswatchSrc = pkgs.fetchFromGitHub {
+          owner = "matthart1983";
+          repo = "syswatch";
+          rev = "v0.10.0";
+          hash = "sha256-EHijnB6hG3qrGteB0Q4Um9GgoIJqyZSflaMvQb2Zk8E=";
+        };
+      in pkgs.rustPlatform.buildRustPackage {
+        pname = "syswatch";
+        version = "0.10.0";
+        src = syswatchSrc;
+        cargoLock.lockFile = "${syswatchSrc}/Cargo.lock";
+        meta.mainProgram = "syswatch";
       })
 
       (writeShellScriptBin "nasty-cleanup" ''
