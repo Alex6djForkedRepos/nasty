@@ -70,6 +70,7 @@ All dependencies use licenses compatible with GPL-3.0.
 | btop | Apache-2.0 |
 | caddy | Apache-2.0 |
 | croc | MIT |
+| diskwatch | MIT |
 | docker | Apache-2.0 |
 | ethtool | GPL-2.0 |
 | fwupd | LGPL-2.1-or-later |
@@ -82,6 +83,7 @@ All dependencies use licenses compatible with GPL-3.0.
 | lm-sensors | GPL-2.0 |
 | lsof | Zlib |
 | nfs-utils | GPL-2.0 |
+| netwatch | MIT; bundled FoxIO JA4 mapping data is BSD-3-Clause |
 | nvme-cli | GPL-2.0 |
 | openssh | BSD-2-Clause |
 | OVMF | BSD-2-Clause |
@@ -91,6 +93,37 @@ All dependencies use licenses compatible with GPL-3.0.
 | rsync | GPL-3.0 |
 | samba | GPL-3.0 |
 | smartmontools | GPL-2.0 |
+| syswatch | MIT |
 | targetcli-fb | Apache-2.0 |
 | tcpdump | BSD-3-Clause |
 | util-linux | GPL-2.0 |
+
+## NetWatch JA4 Data Notice
+
+NetWatch includes JA4 TLS client fingerprint mappings from FoxIO's JA4 mapping
+database. The bundled data is distributed under the BSD-3-Clause license:
+
+Copyright (c) 2026 FoxIO. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of FoxIO nor the names of its contributors may be used to
+   endorse or promote products derived from this software without specific
+   prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
