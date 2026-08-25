@@ -1,5 +1,163 @@
 # Changelog
 
+## v0.1.0 — 2026-08-25
+
+> **This is the storage resilience, control & observability release.**
+> Filesystem operations are now bound to persistent UUIDs, unavailable
+> registrations can be retired safely, and subvolumes and physical disks gain
+> finer policy controls. Under load, NASty prioritizes its control plane while
+> reporting maintenance progress and bcachefs memory more accurately. Alerts
+> gain acknowledgement and managed TLS monitoring, update and Tailscale paths
+> become safer, and root-equivalent operations receive tighter authorization
+> boundaries.
+
+### Headline changes
+
+- **UUID-bound filesystem lifecycle (#721, #733, #753).** Mount, remount,
+  unmount, destroy, and option changes verify the persisted filesystem UUID.
+  Foreign pools cannot silently inherit a managed name or mountpoint. Entirely
+  unavailable filesystems can be forgotten safely without touching their disks,
+  encryption keys, or data.
+- **Storage policy and scheduler controls (#732, #742).** Existing subvolumes
+  can change or inherit compression, replica, and erasure-coding policy.
+  Physical disks gain stable-identity I/O scheduler controls that persist
+  across reboots.
+- **Responsive control plane and truthful maintenance state (#739–#743).**
+  Authentication, API, and status work receive priority over bulk operations.
+  Reconcile alerts track actual moving-byte progress, scrub/fsck completion no
+  longer produces false restart failures, and the dashboard reports the
+  kernel-observed bcachefs btree-node cache.
+- **Actionable alerts and TLS health (#746, #776, #777).** Active alert
+  occurrences can be acknowledged without pretending the condition is
+  resolved. Managed ACME certificates gain live per-host status plus expiry and
+  renewal-failure alerts.
+- **Safer updates and Tailscale lifecycle (#747, #749, #766, #769, #775).**
+  Tailscale has an independently pinned NixOS package source, legacy wrappers
+  migrate safely, update state survives transport failures, and failed
+  activations collect better Docker, Caddy, firewall, and systemd diagnostics.
+- **Tighter Admin boundaries (#781).** Root-equivalent Compose, unsafe mounts,
+  passthrough devices, raw QEMU options, unmanaged block exports, and similar
+  operations now require an unscoped Admin. Operators retain managed,
+  constrained workflows.
+
+### Storage & operations
+
+- Filesystem creation and lifecycle operations use authoritative UUID identity
+  instead of trusting names or mountpoints (#721).
+- Mount identity discovery tolerates the short post-mount visibility delay
+  sometimes seen through `blkid` and `lsblk`, while real mismatches still fail
+  immediately (#733).
+- The **Forget** action removes only the host registration for an unavailable
+  filesystem and fails closed when the pool is visible, mounted, or still has
+  dependencies (#753).
+- Subvolume compression, replicas, and erasure coding expose explicit versus
+  inherited policy and can be changed after creation (#732).
+- I/O scheduler settings move from filesystem-level configuration to individual
+  physical disks and are restored using stable disk identity (#742).
+- Scrub and fsck completion no longer races with status polling into false
+  interrupted or failed states (#743).
+- Reconcile-stall detection follows actual moving keys and bytes rather than
+  only static pending totals (#739).
+- The dashboard exposes approximate bcachefs btree-node cache usage. This is one
+  component of bcachefs memory, not a total memory figure (#741).
+- The bundled bcachefs tools and DKMS module move from 1.38.8 to **1.39.2**
+  (#745, #756, #772).
+
+### Security, authorization & privacy
+
+- Root-equivalent operations require an unscoped Admin, including Compose
+  lifecycle, app-runtime configuration, unsafe mounts, passthrough devices,
+  raw QEMU options, snapshot rollback, and unmanaged iSCSI/NVMe-oF sources
+  (#781).
+- VM disk, network, bridge, MAC, and QEMU configuration receive stricter
+  allow-list validation (#781).
+- Compose inspection rejects configuration that cannot be safely resolved,
+  including `include`, `extends`, `volumes_from`, interpolated bind sources, and
+  mounts into protected engine state (#781).
+- Mounted filesystem browsing works again in guest links and the standard-user
+  portal while retaining descriptor-anchored traversal and mount boundaries
+  (#728).
+- Telemetry documentation now describes the pseudonymous installation ID and
+  transmitted usage information accurately (#718).
+- Enabled telemetry now includes aggregate SMB, NFS, iSCSI, and NVMe-oF
+  configuration counts. Names, paths, hosts, and identifiers remain excluded
+  (#720).
+
+### Alerts, TLS & networking
+
+- Operators and Admins can acknowledge a specific active alert occurrence.
+  Acknowledgements persist across restarts and a recurrence receives a new
+  occurrence ID (#746).
+- Managed ACME certificates gain warning and critical expiry alerts plus
+  renewal-failure detection (#776).
+- TLS cards use live Caddy and certificate state, including issuing, renewed,
+  expiring, expired, and failed states (#777).
+- IPv4 DNS addresses are serialized correctly for NetworkManager instead of
+  being byte-swapped (#751).
+- SMB discovery permits WSD metadata traffic on TCP 5357 in addition to
+  discovery on UDP 3702 (#779).
+- SMART monitoring can be enabled for passed-through disks and controllers in
+  VMs; ordinary virtual disks remain disabled by default (#736).
+
+### Updates, apps & WebUI
+
+- The engine runs at elevated CPU priority while backups, restores, filesystem
+  maintenance, VM work, rebuilds, and other bulk jobs are demoted and bounded
+  (#740).
+- Tailscale can be updated independently from the appliance's main nixpkgs pin,
+  while activation verifies that an existing tailnet connection returns
+  successfully (#747, #749).
+- Failed update starts reconcile against systemd instead of leaving stale
+  running state, and retrying means repeating the original update action
+  (#769).
+- Docker readiness and app-port discovery are bounded during activation,
+  avoiding false upgrade failures on app-heavy systems (#775).
+- Compose edits preserve custom hostnames and pinned ingress ports (#754).
+- Installed apps gain recognizable local logos with deterministic monogram
+  fallbacks (#729).
+- Failed backup profile edits preserve entered values and remain open (#784).
+- Backup snapshot and restore flows use accessible, focus-managed dialogs
+  (#787).
+- File actions remain accessible on touch and coarse-pointer devices (#785).
+
+### Tools, docs & platform
+
+- DiskWatch moves to **0.4.0**, and the appliance adds NetWatch **0.29.2** and
+  SysWatch **0.10.0** to the terminal (#767, #780, #789).
+- Tailscale moves to **1.102.2** (#766).
+- Vendored Swagger UI moves to **5.32.13** (#765).
+- The Hetzner Caddy DNS plugin moves to **2.0.1** (#764).
+- Linux moves from 6.18.40 to **6.18.46** across the weekly nixpkgs updates
+  (#738, #748, #768, #771, #788, #790, #791).
+- Rust moves to **1.97.1**, with compatible Rust and WebUI dependency updates
+  (#759, #760, #762, #773).
+- A new Jellyfin deployment guide covers Compose, HTTPS, hardware acceleration,
+  upgrades, backups, and recovery (#770).
+- API documentation now reflects the current secure WebSocket, REST, Swagger,
+  and OpenAPI endpoints (#783).
+- CI now tests every Rust workspace target and runs appliance integration for
+  WebUI-only changes (#782, #786).
+
+### Upgrading
+
+- **bcachefs 1.39.x:** bcachefs 1.39.0 introduced an upstream on-disk format
+  change for per-device fragmentation tracking. Ensure backups are current and
+  avoid downgrading tools or kernels after a filesystem has adopted the newer
+  format.
+- **Operator permissions:** existing Operator automation that performs
+  root-equivalent operations may now receive access-denied errors. Review role
+  assignments before upgrading (#781).
+- **Legacy filesystem state:** registrations without a persisted UUID now fail
+  closed instead of operating by name. Older or manually edited state may need
+  explicit recovery (#721).
+- **I/O schedulers:** unambiguous filesystem-level scheduler settings migrate to
+  per-device settings automatically. Conflicting or unresolved entries remain
+  unmanaged rather than being guessed (#742).
+- **Telemetry:** installations with telemetry enabled now report aggregate
+  sharing configuration counts (#718, #720).
+- **Tailscale:** native self-update remains disabled on NixOS. Tailscale package
+  updates are managed through NASty's Upstream page (#747, #749).
+
 ## v0.0.15 — 2026-07-30
 
 > **This is the user access, data safety & recovery release.** NASty gains a
@@ -64,10 +222,6 @@
   Terminals and sensitive deployment/import endpoints require an unscoped
   Admin; file mutations require Operator/Admin authority within any filesystem
   scope, while VM consoles require an unscoped Operator/Admin (#663).
-- Root-equivalent workload and block-device operations now require an unscoped
-  Admin. Operators retain safe simple-app, VM, iSCSI, and NVMe-oF workflows but
-  cannot activate Compose stacks, unsafe mounts, passthrough devices, raw QEMU
-  options, or unmanaged block exports.
 - Existing `auth.json` must be a regular, non-symlinked, initialized JSON file
   owned by root with no group/other permission bits. Invalid state stops the
   engine instead of silently recreating `admin/admin`; only a genuinely absent
@@ -126,9 +280,6 @@
 
 ### Sharing & block exports
 
-- SMB discovery now permits WSD metadata exchange on TCP 5357 in addition to
-  UDP 3702, allowing GNOME Files and other WSD clients to finish discovery
-  (#778).
 - iSCSI LUNs and NVMe-oF namespaces persist immutable block-volume identities
   and remap each export independently. Unresolved identities quiesce the
   affected protocol instead of risking the wrong volume (#698).
@@ -178,9 +329,8 @@
 - The Help & Community page links to `r/NAStyProject` (#714).
 - Linux moves from 6.18.38 to **6.18.40** across three weekly nixpkgs updates
   (#672, #693, #705).
-- `diskwatch` moves from 0.1.2 to **0.3.2**, adding runtime-selectable themes
-  and the Dense single-screen view, while fixing stacked-device IO accounting
-  and synchronizing live histories (#669, #706).
+- `diskwatch` moves from 0.1.2 to **0.1.5**, adding independent-filesystem
+  attribution fixes and runtime-selectable themes (#669, #706).
 - `nasty-top` moves from 0.0.8 to **0.0.9**, fixing bcachefs 1.38.8 by-UUID
   discovery and hardening monitoring (#673). bcachefs remains at 1.38.8.
 
