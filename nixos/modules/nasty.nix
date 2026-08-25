@@ -665,7 +665,7 @@ in {
          nixos-rebuild switch --flake /etc/nixos#nasty     rebuild and activate
          nixos-rebuild boot --flake /etc/nixos#nasty       rebuild, activate on next boot
          nix-env --list-generations -p /nix/var/nix/profiles/system   list generations
-         nix-env --delete-generations +3 -p /nix/var/nix/profiles/system   keep last 3
+         nix-env --delete-generations old -p /nix/var/nix/profiles/system   keep current only
 
        NixOS — flake management
          nix flake update nasty --flake /etc/nixos         pull latest NASty
@@ -864,8 +864,10 @@ in {
         ${pkgs.coreutils}/bin/env -u POSIXLY_CORRECT \
           ${pkgs.util-linux}/bin/renice -n 10 -p $$ >/dev/null
         ${pkgs.util-linux}/bin/ionice -c2 -n7 -p $$
-        echo "==> Removing old NixOS generations (keeping last 3)..."
-        nix-env --delete-generations +3 -p /nix/var/nix/profiles/system 2>/dev/null || true
+        echo "==> Removing non-current NixOS generations..."
+        # `old` also removes generations newer than current, which failed
+        # updates can leave behind after rolling the profile back.
+        nix-env --delete-generations old -p /nix/var/nix/profiles/system 2>/dev/null || true
         echo "==> Running garbage collection..."
         nix-collect-garbage 2>&1
         # Re-sync /boot to match the surviving generations: GC removed
