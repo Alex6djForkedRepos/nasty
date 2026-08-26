@@ -1,11 +1,11 @@
 # Vendored Swagger UI
 
 Vendored assets from the official
-[swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) v5.32.13 npm
+[swagger-ui-dist](https://www.npmjs.com/package/swagger-ui-dist) v5.32.14 npm
 package:
 
-- Tarball: `https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-5.32.13.tgz`
-- Integrity: `sha512-qQobzb3DeC2LeK0j3E8812Ef4aIq1y9flJxvZkimkqUC/w4u7wS+yCc+VakqGJLweUUBrI24effhwo8OsAvNAw==`
+- Tarball: `https://registry.npmjs.org/swagger-ui-dist/-/swagger-ui-dist-5.32.14.tgz`
+- Integrity: `sha512-nOA2pSQhcmODMUQZpJHYKNuwniDUqcOWGNaSCOoZv12FdOSJ9JxV95HtyRGNMqEBj6h6lCNTy20TgZDYTSuUIg==`
 
 Served by the engine at `/api/docs` (via `engine/nasty-engine/src/swagger_ui.rs`)
 loading the spec from `/api/openapi.json`. Embedded into the engine binary at
