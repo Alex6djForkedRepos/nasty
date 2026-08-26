@@ -127,7 +127,12 @@ in
   # image — well over 100 MB of headroom — at the cost of a slightly
   # slower installer live-boot. The *installed* appliance runs from
   # bcachefs, not this squashfs, so runtime performance is unaffected.
-  isoImage.squashfsCompression = lib.mkForce "xz -Xdict-size 100%";
+  # The x86 BCJ filter keeps machine-code-heavy x86_64 images below the limit
+  # without removing anything from the installer closure.
+  isoImage.squashfsCompression = lib.mkForce (
+    "xz -Xdict-size 100%"
+    + lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 " -Xbcj x86"
+  );
 
   environment.systemPackages = with pkgs; [
     bcachefs-tools
