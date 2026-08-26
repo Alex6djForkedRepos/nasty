@@ -847,11 +847,11 @@ fn evaluate_rules(
                         // Mention the actionable remedy in the message
                         // so the user doesn't have to dig — the typical
                         // path is "trim old generations" not "resize ESP".
-                        // `nasty-cleanup` is the one-shot helper that
+                        // `nasty-cleanup all` is the one-shot helper that
                         // does delete-old-generations + nix-gc +
                         // switch-to-configuration boot in order.
                         message: format!(
-                            "/boot has {:.0} MB free (threshold: {:.0} MB). The next system update may fail to install its initrd. Run `nasty-cleanup` to reclaim space.",
+                            "/boot has {:.0} MB free (threshold: {:.0} MB). The next system update may fail to install its initrd. Run `nasty-cleanup all` to reclaim space.",
                             free_mb, rule.threshold
                         ),
                         current_value: free_mb,
@@ -2289,6 +2289,7 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].source, "/boot");
         assert!((alerts[0].current_value - 20.0).abs() < 0.001);
+        assert!(alerts[0].message.contains("nasty-cleanup all"));
         // None means "/boot not statvfs'able" (e.g. not a separate
         // mount) — no fire, silence is correct.
         let alerts = evaluate_rules(
