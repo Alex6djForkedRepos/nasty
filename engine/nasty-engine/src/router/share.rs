@@ -378,6 +378,7 @@ async fn authorize_block_destination(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorized_iscsi_target(
     req: &Request,
     state: &AppState,
@@ -434,6 +435,7 @@ async fn authorized_iscsi_target(
     Ok(target)
 }
 
+#[allow(clippy::result_large_err)]
 async fn authorized_nvmeof_subsystem(
     req: &Request,
     state: &AppState,
