@@ -2295,13 +2295,19 @@ mod tests {
     }
 
     async fn read_zip_entries(bytes: Vec<u8>) -> HashMap<String, Vec<u8>> {
-        let archive = async_zip::base::read::mem::ZipFileReader::new(bytes)
-            .await
-            .unwrap();
+        let mut archive = async_zip::base::read1::seek::ZipArchiveReader::open(
+            futures_util::io::Cursor::new(bytes),
+        )
+        .await
+        .unwrap();
         let mut entries = HashMap::new();
-        for (index, stored) in archive.file().entries().iter().enumerate() {
-            let name = stored.filename().as_str().unwrap().to_string();
-            let mut reader = archive.reader_without_entry(index).await.unwrap();
+        for index in 0..archive.cdrs().len() {
+            let name = archive.cdrs()[index]
+                .insecure_file_name
+                .as_str()
+                .unwrap()
+                .to_string();
+            let mut reader = archive.file(index).await.unwrap();
             let mut content = Vec::new();
             futures_util::io::AsyncReadExt::read_to_end(&mut reader, &mut content)
                 .await
