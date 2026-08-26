@@ -686,7 +686,7 @@
 						<div class="flex-1">
 							<div class="font-medium text-amber-200">Last update attempt failed</div>
 							<p class="mt-1 text-muted-foreground">
-								The most recent update didn't complete — the system kept running the previous generation. If disk space ran out, use <code class="font-mono text-xs">nasty-cleanup</code> to reclaim old generations and re-sync <code class="font-mono text-xs">/boot</code>. Then start the same action again: check and upgrade a development build, use Upgrade for a tagged release, or resubmit the selected Upstream inputs. The log below has the failed attempt's journal output.
+								The most recent update didn't complete — the system kept running the previous generation. If disk space ran out, use <code class="font-mono text-xs">nasty-cleanup all</code> to reclaim old generations and re-sync <code class="font-mono text-xs">/boot</code>. Then start the same action again: check and upgrade a development build, use Upgrade for a tagged release, or resubmit the selected Upstream inputs. The log below has the failed attempt's journal output.
 							</p>
 						</div>
 					</div>
@@ -1013,7 +1013,7 @@
 
 					{#if status?.state === 'failed'}
 						<p class="mt-4 text-xs text-muted-foreground">
-							Resolve the cause, then start the same action again above. For disk-space failures, run <code class="font-mono">nasty-cleanup</code> first.
+							Resolve the cause, then start the same action again above. For disk-space failures, run <code class="font-mono">nasty-cleanup all</code> first.
 						</p>
 						<div class="mt-3 flex gap-2">
 							<Button variant="secondary" size="sm" onclick={() => status = { state: 'idle', log: '', reboot_required: false, webui_changed: false }}>Dismiss</Button>

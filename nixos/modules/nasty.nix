@@ -658,14 +658,15 @@ in {
        nasty — built-in tools
          nasty-top                                  live IO, latency, tuning advisor
          nasty-report                               dump diagnostic info for bug reports
-         nasty-cleanup                              remove old generations + garbage collect
+         nasty-cleanup                              keep 3 generations + garbage collect
+         nasty-cleanup all                          keep current generation only
          nasty-rebuild                              force rebuild from current /etc/nixos
 
        NixOS — system management
          nixos-rebuild switch --flake /etc/nixos#nasty     rebuild and activate
          nixos-rebuild boot --flake /etc/nixos#nasty       rebuild, activate on next boot
          nix-env --list-generations -p /nix/var/nix/profiles/system   list generations
-         nix-env --delete-generations old -p /nix/var/nix/profiles/system   keep current only
+         nix-env --delete-generations +3 -p /nix/var/nix/profiles/system   keep last 3
 
        NixOS — flake management
          nix flake update nasty --flake /etc/nixos         pull latest NASty
@@ -864,10 +865,26 @@ in {
         ${pkgs.coreutils}/bin/env -u POSIXLY_CORRECT \
           ${pkgs.util-linux}/bin/renice -n 10 -p $$ >/dev/null
         ${pkgs.util-linux}/bin/ionice -c2 -n7 -p $$
-        echo "==> Removing non-current NixOS generations..."
-        # `old` also removes generations newer than current, which failed
-        # updates can leave behind after rolling the profile back.
-        nix-env --delete-generations old -p /nix/var/nix/profiles/system 2>/dev/null || true
+        if [ "$#" -gt 1 ]; then
+          echo "Usage: nasty-cleanup [all]" >&2
+          exit 2
+        fi
+        case "''${1:-}" in
+          "")
+            echo "==> Removing old NixOS generations (keeping last 3)..."
+            nix-env --delete-generations +3 -p /nix/var/nix/profiles/system 2>/dev/null || true
+            ;;
+          all)
+            echo "==> Removing all non-current NixOS generations..."
+            # `old` also removes generations newer than current, which failed
+            # updates can leave behind after rolling the profile back.
+            nix-env --delete-generations old -p /nix/var/nix/profiles/system 2>/dev/null || true
+            ;;
+          *)
+            echo "Usage: nasty-cleanup [all]" >&2
+            exit 2
+            ;;
+        esac
         echo "==> Running garbage collection..."
         nix-collect-garbage 2>&1
         # Re-sync /boot to match the surviving generations: GC removed
