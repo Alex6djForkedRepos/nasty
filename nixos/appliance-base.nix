@@ -110,6 +110,8 @@
     # Without this the units don't exist and enabling NUT fails with
     # "Unit nut-driver.service not found" (#512).
     nut.enable = true;
+    # Build the dormant watchdog unit; the Services toggle owns lifecycle.
+    watchdog.enable = true;
     tailscale.enable = true;
   };
 

@@ -5,10 +5,13 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
 const STATE_PATH: &str = "/var/lib/nasty/protocols.json";
 const SMB_NASTY_CONF: &str = "/etc/samba/smb.nasty.conf";
+
+static PROTOCOL_STATE_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -21,6 +24,7 @@ pub enum Protocol {
     Ssh,
     Avahi,
     Smart,
+    Watchdog,
     RestServer,
 }
 
@@ -34,6 +38,7 @@ impl Protocol {
         Protocol::Ssh,
         Protocol::Avahi,
         Protocol::Smart,
+        Protocol::Watchdog,
         Protocol::RestServer,
     ];
 
@@ -44,6 +49,7 @@ impl Protocol {
                 | Protocol::Ssh
                 | Protocol::Avahi
                 | Protocol::Smart
+                | Protocol::Watchdog
                 | Protocol::RestServer
         )
     }
@@ -58,6 +64,7 @@ impl Protocol {
             Protocol::Ssh => "ssh",
             Protocol::Avahi => "avahi",
             Protocol::Smart => "smart",
+            Protocol::Watchdog => "watchdog",
             Protocol::RestServer => "rest-server",
         }
     }
@@ -72,6 +79,7 @@ impl Protocol {
             Protocol::Ssh => "SSH",
             Protocol::Avahi => "mDNS (Avahi)",
             Protocol::Smart => "SMART",
+            Protocol::Watchdog => "Watchdog",
             Protocol::RestServer => "Backup Server",
         }
     }
@@ -101,6 +109,7 @@ impl Protocol {
             Protocol::Ssh => &["sshd.service"],
             Protocol::Avahi => &["avahi-daemon.service"],
             Protocol::Smart => &["smartd.service"],
+            Protocol::Watchdog => &["nasty-watchdog.service"],
             Protocol::RestServer => &["nasty-rest-server.service"],
         }
     }
@@ -115,6 +124,7 @@ impl Protocol {
             "ssh" => Some(Protocol::Ssh),
             "avahi" => Some(Protocol::Avahi),
             "smart" => Some(Protocol::Smart),
+            "watchdog" => Some(Protocol::Watchdog),
             "rest-server" => Some(Protocol::RestServer),
             _ => None,
         }
@@ -154,6 +164,8 @@ struct ProtocolState {
     #[serde(default = "default_true")]
     smart: bool,
     #[serde(default)]
+    watchdog: bool,
+    #[serde(default)]
     rest_server: bool,
 }
 
@@ -172,6 +184,7 @@ impl Default for ProtocolState {
             ssh: true,
             avahi: true,
             smart: true,
+            watchdog: false,
             rest_server: false,
         }
     }
@@ -188,6 +201,7 @@ impl ProtocolState {
             Protocol::Ssh => self.ssh,
             Protocol::Avahi => self.avahi,
             Protocol::Smart => self.smart,
+            Protocol::Watchdog => self.watchdog,
             Protocol::RestServer => self.rest_server,
         }
     }
@@ -202,6 +216,7 @@ impl ProtocolState {
             Protocol::Ssh => self.ssh = enabled,
             Protocol::Avahi => self.avahi = enabled,
             Protocol::Smart => self.smart = enabled,
+            Protocol::Watchdog => self.watchdog = enabled,
             Protocol::RestServer => self.rest_server = enabled,
         }
     }
@@ -230,7 +245,8 @@ impl ProtocolService {
     /// Restore enabled protocols except entries whose backing state failed
     /// safety validation during boot.
     pub async fn restore_excluding(&self, excluded: &std::collections::HashSet<Protocol>) {
-        let state = load_state().await;
+        let _state_guard = PROTOCOL_STATE_LOCK.lock().await;
+        let mut state = load_state().await;
 
         for &proto in Protocol::ALL {
             let enabled = state.get(proto);
@@ -252,12 +268,42 @@ impl ProtocolService {
                         }
                     }
                 }
+                if proto == Protocol::Watchdog {
+                    let _watchdog_guard = crate::watchdog::WATCHDOG_LIFECYCLE_LOCK.lock().await;
+                    if let Err(e) = crate::watchdog::stop_and_verify().await {
+                        error!("CRITICAL: disabled watchdog could not be stopped: {e}");
+                    }
+                }
                 continue;
             }
 
             info!("Restoring protocol: {}", proto.display_name());
 
-            prepare_protocol(proto).await;
+            let _watchdog_guard = if proto == Protocol::Watchdog {
+                Some(crate::watchdog::WATCHDOG_LIFECYCLE_LOCK.lock().await)
+            } else {
+                None
+            };
+
+            if let Err(error) = prepare_protocol(proto).await {
+                warn!(
+                    "Auto-disabling {} because its configuration is unsafe: {error}",
+                    proto.display_name()
+                );
+                state.set(proto, false);
+                if let Err(save_error) = save_state(&state).await {
+                    warn!(
+                        "auto-disable persistence for {} failed: {save_error}",
+                        proto.display_name()
+                    );
+                }
+                if proto == Protocol::Watchdog
+                    && let Err(stop_error) = crate::watchdog::stop_and_verify().await
+                {
+                    error!("CRITICAL: unsafe watchdog configuration remained active: {stop_error}");
+                }
+                continue;
+            }
 
             // Load kernel modules before starting services (iSCSI/NVMe-oF
             // services require the LIO/nvmet modules to already be present)
@@ -270,18 +316,33 @@ impl ProtocolService {
             // Start associated services — auto-disable if any fail
             let mut failed = false;
             for svc in proto.services() {
-                if let Err(e) = systemctl("start", svc).await {
-                    warn!("Failed to start {svc}: {e}");
+                let action = if proto == Protocol::Watchdog {
+                    "restart"
+                } else {
+                    "start"
+                };
+                let start_result = systemctl(action, svc).await;
+                let start_result = if start_result.is_ok() && proto == Protocol::Watchdog {
+                    crate::watchdog::verify_running().await
+                } else {
+                    start_result
+                };
+                if let Err(e) = start_result {
+                    warn!("Failed to {action} {svc}: {e}");
                     failed = true;
                     break;
                 }
             }
             if failed {
+                if proto == Protocol::Watchdog
+                    && let Err(stop_error) = crate::watchdog::stop_and_verify().await
+                {
+                    error!("CRITICAL: failed watchdog restore could not be stopped: {stop_error}");
+                }
                 warn!(
                     "Auto-disabling {} — service units not available",
                     proto.display_name()
                 );
-                let mut state = load_state().await;
                 state.set(proto, false);
                 if let Err(e) = save_state(&state).await {
                     // The in-memory state shows disabled, but at next
@@ -321,6 +382,7 @@ impl ProtocolService {
 
     /// List all protocols with their enabled/running status
     pub async fn is_enabled(&self, proto: Protocol) -> bool {
+        let _state_guard = PROTOCOL_STATE_LOCK.lock().await;
         load_state().await.get(proto)
     }
 
@@ -329,6 +391,7 @@ impl ProtocolService {
     }
 
     pub async fn list(&self) -> Vec<ProtocolStatus> {
+        let _state_guard = PROTOCOL_STATE_LOCK.lock().await;
         let state = load_state().await;
         let mut result = Vec::new();
 
@@ -348,6 +411,7 @@ impl ProtocolService {
 
     /// Enable a protocol: start its services and persist state
     pub async fn enable(&self, name: &str) -> Result<ProtocolStatus, String> {
+        let _state_guard = PROTOCOL_STATE_LOCK.lock().await;
         let proto = Protocol::from_name(name).ok_or_else(|| format!("unknown protocol: {name}"))?;
 
         // A hosted AD domain's samba-dc.service already serves SMB (shares
@@ -368,7 +432,27 @@ impl ProtocolService {
         state.set(proto, true);
         save_state(&state).await?;
 
-        prepare_protocol(proto).await;
+        let _watchdog_guard = if proto == Protocol::Watchdog {
+            Some(crate::watchdog::WATCHDOG_LIFECYCLE_LOCK.lock().await)
+        } else {
+            None
+        };
+
+        if let Err(error) = prepare_protocol(proto).await {
+            state.set(proto, false);
+            let mut failure = format!("failed to prepare {}: {error}", proto.display_name());
+            if proto == Protocol::Watchdog
+                && let Err(stop_error) = crate::watchdog::stop_and_verify().await
+            {
+                failure.push_str(&format!(
+                    "; failed to stop watchdog during rollback: {stop_error}"
+                ));
+            }
+            if let Err(save_error) = save_state(&state).await {
+                failure.push_str(&format!("; state rollback failed: {save_error}"));
+            }
+            return Err(failure);
+        }
 
         // Load kernel modules before starting services
         for module in protocol_modules(proto).await {
@@ -385,8 +469,15 @@ impl ProtocolService {
                 "Starting service {svc} for protocol {}",
                 proto.display_name()
             );
-            if let Err(e) = systemctl("start", svc).await {
+            let start_result = systemctl("start", svc).await;
+            let start_result = if start_result.is_ok() && proto == Protocol::Watchdog {
+                crate::watchdog::verify_running().await
+            } else {
+                start_result
+            };
+            if let Err(e) = start_result {
                 warn!("Failed to start {svc}: {e}");
+                let mut failure = format!("Failed to start {}: {e}", proto.display_name());
                 // Roll back: stop any services we already started.
                 // systemctl() already logs spawn / non-zero failures
                 // internally; this loop just makes sure we attempt
@@ -396,6 +487,13 @@ impl ProtocolService {
                         warn!("rollback stop of {started_svc} failed: {stop_err}");
                     }
                 }
+                if proto == Protocol::Watchdog
+                    && let Err(stop_error) = crate::watchdog::stop_and_verify().await
+                {
+                    failure.push_str(&format!(
+                        "; failed to stop watchdog during rollback: {stop_error}"
+                    ));
+                }
                 // Roll back persistent state. A failure here means
                 // the protocol stays "enabled" in saved state but the
                 // services aren't actually running — at next engine
@@ -404,12 +502,9 @@ impl ProtocolService {
                 // didn't take.
                 state.set(proto, false);
                 if let Err(save_err) = save_state(&state).await {
-                    warn!(
-                        "rollback persistence for {} failed: {save_err}",
-                        proto.display_name()
-                    );
+                    failure.push_str(&format!("; state rollback failed: {save_err}"));
                 }
-                return Err(format!("Failed to start {}: {e}", proto.display_name()));
+                return Err(failure);
             }
             started.push(*svc);
         }
@@ -448,11 +543,33 @@ impl ProtocolService {
 
     /// Disable a protocol: stop its services and persist state
     pub async fn disable(&self, name: &str) -> Result<ProtocolStatus, String> {
+        let _state_guard = PROTOCOL_STATE_LOCK.lock().await;
         let proto = Protocol::from_name(name).ok_or_else(|| format!("unknown protocol: {name}"))?;
 
         let mut state = load_state().await;
         state.set(proto, false);
         save_state(&state).await?;
+
+        let _watchdog_guard = if proto == Protocol::Watchdog {
+            Some(crate::watchdog::WATCHDOG_LIFECYCLE_LOCK.lock().await)
+        } else {
+            None
+        };
+
+        if proto == Protocol::Watchdog {
+            crate::watchdog::stop_and_verify().await.map_err(|error| {
+                format!(
+                    "Watchdog is disabled in persistent state but could not be stopped: {error}"
+                )
+            })?;
+            return Ok(ProtocolStatus {
+                name: proto.name().to_string(),
+                display_name: proto.display_name().to_string(),
+                enabled: false,
+                running: false,
+                system_service: true,
+            });
+        }
 
         // Stop associated services
         for svc in proto.services() {
@@ -495,12 +612,13 @@ async fn is_protocol_running(proto: Protocol) -> bool {
         Protocol::Ssh => systemctl_is_active("sshd.service").await,
         Protocol::Avahi => systemctl_is_active("avahi-daemon.service").await,
         Protocol::Smart => systemctl_is_active("smartd.service").await,
+        Protocol::Watchdog => systemctl_is_active("nasty-watchdog.service").await,
         Protocol::RestServer => systemctl_is_active("nasty-rest-server.service").await,
     }
 }
 
 /// Ensure prerequisites exist before starting a protocol's services.
-async fn prepare_protocol(proto: Protocol) {
+async fn prepare_protocol(proto: Protocol) -> Result<(), String> {
     if proto == Protocol::Smb {
         // Samba config includes smb.nasty.conf — must exist or smbd fails to start
         if !std::path::Path::new(SMB_NASTY_CONF).exists() {
@@ -517,6 +635,11 @@ async fn prepare_protocol(proto: Protocol) {
             warn!("Failed to write NUT config files: {e}");
         }
     }
+    if proto == Protocol::Watchdog {
+        let config = crate::watchdog::load_config().await;
+        crate::watchdog::preflight(&config).await?;
+        crate::watchdog::write_config_file_locked(&config).await?;
+    }
     if proto == Protocol::RestServer {
         // The rest-server systemd unit requires an htpasswd file
         // (no more --no-auth). Generate the credentials before
@@ -530,6 +653,7 @@ async fn prepare_protocol(proto: Protocol) {
             );
         }
     }
+    Ok(())
 }
 
 /// Kernel modules a protocol needs before its services start. The
@@ -635,9 +759,8 @@ async fn load_state() -> ProtocolState {
 }
 
 async fn save_state(state: &ProtocolState) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| format!("failed to serialize protocol state: {e}"))?;
-    tokio::fs::write(STATE_PATH, json)
+    nasty_common::StateDir::new("/var/lib/nasty")
+        .save("protocols", state)
         .await
         .map_err(|e| format!("failed to write protocol state: {e}"))
 }
@@ -657,5 +780,13 @@ mod tests {
         assert!(svcs.contains(&"samba-smbd.service"));
         assert!(svcs.contains(&"samba-nmbd.service"));
         assert!(svcs.contains(&"samba-wsdd.service"));
+    }
+
+    #[test]
+    fn watchdog_is_a_disabled_system_service() {
+        assert!(Protocol::Watchdog.is_system_service());
+        assert_eq!(Protocol::Watchdog.name(), "watchdog");
+        assert_eq!(Protocol::Watchdog.services(), &["nasty-watchdog.service"]);
+        assert!(!ProtocolState::default().get(Protocol::Watchdog));
     }
 }

@@ -4,7 +4,7 @@
 	import { getClient } from '$lib/client';
 	import { withToast, error } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus } from '$lib/types';
+	import type { ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus, WatchdogConfig } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
@@ -99,6 +99,64 @@
 		await loadNut();
 	}
 
+	// Linux watchdog config
+	let watchdogConfig: WatchdogConfig | null = $state(null);
+	let savingWatchdog = $state(false);
+	let watchdogLoad1 = $state(''); let watchdogLoad5 = $state(''); let watchdogLoad15 = $state('');
+	let watchdogMinMemory = $state(''); let watchdogPingHosts = $state('');
+
+	function setWatchdogForm(config: WatchdogConfig) {
+		watchdogConfig = config;
+		watchdogLoad1 = config.max_load_1.toString();
+		watchdogLoad5 = config.max_load_5.toString();
+		watchdogLoad15 = config.max_load_15.toString();
+		watchdogMinMemory = config.min_memory_mib.toString();
+		watchdogPingHosts = config.ping_hosts.join('\n');
+	}
+
+	async function loadWatchdog() {
+		if (watchdogConfig) return;
+		setWatchdogForm(await client.call<WatchdogConfig>('system.watchdog.config.get'));
+	}
+
+	function parseNonNegativeInteger(value: string): number | null {
+		if (!/^\d+$/.test(value.trim())) return null;
+		const parsed = Number(value);
+		return Number.isSafeInteger(parsed) ? parsed : null;
+	}
+
+	const watchdogValidationError = $derived.by((): string | null => {
+		const loads = [watchdogLoad1, watchdogLoad5, watchdogLoad15].map(parseNonNegativeInteger);
+		if (loads.some(value => value === null)) return 'Load thresholds must be whole numbers.';
+		const enabledLoads = loads.filter(value => value !== 0);
+		if (enabledLoads.length !== 0 && enabledLoads.length !== 3) {
+			return 'Set all three load thresholds, or set all three to 0.';
+		}
+		if (enabledLoads.some(value => value! < 2)) return 'Enabled load thresholds must be at least 2.';
+		if (parseNonNegativeInteger(watchdogMinMemory) === null) {
+			return 'Minimum free memory must be a whole number.';
+		}
+		return null;
+	});
+
+	async function saveWatchdog() {
+		if (watchdogValidationError) return;
+		savingWatchdog = true;
+		const pingHosts = watchdogPingHosts.split(/[\s,]+/).filter(Boolean);
+		const saved = await withToast(
+			() => client.call<WatchdogConfig>('system.watchdog.config.update', {
+				max_load_1: parseNonNegativeInteger(watchdogLoad1),
+				max_load_5: parseNonNegativeInteger(watchdogLoad5),
+				max_load_15: parseNonNegativeInteger(watchdogLoad15),
+				min_memory_mib: parseNonNegativeInteger(watchdogMinMemory),
+				ping_hosts: pingHosts,
+			}),
+			'Watchdog configuration saved'
+		);
+		if (saved) setWatchdogForm(saved);
+		savingWatchdog = false;
+	}
+
 	// SSH config
 	let sshKeys: string[] = $state([]);
 	let sshPasswordAuth = $state(true);
@@ -176,6 +234,7 @@
 		if (['nfs', 'smb', 'iscsi'].includes(name)) loadTuning();
 		if (['iscsi', 'nvmeof'].includes(name)) loadBaseNames();
 		if (name === 'nut') loadNut();
+		if (name === 'watchdog') loadWatchdog();
 		if (name === 'ssh') loadSsh();
 		if (name === 'rest-server' && !restConfigLoaded) loadRestConfig();
 	}
@@ -321,6 +380,10 @@
 	function handleEvent(_: string, params: unknown) {
 		const p = params as { collection?: string };
 		if (p?.collection === 'protocol') refresh();
+		if (p?.collection === 'watchdog' && watchdogConfig) {
+			watchdogConfig = null;
+			if (configOpen === 'watchdog') loadWatchdog();
+		}
 	}
 
 	// Page-scoped handles for the post-enable Docker-status poll so onDestroy
@@ -385,6 +448,10 @@
 	}
 
 	async function toggle(proto: ProtocolStatus) {
+		if (proto.name === 'watchdog' && !proto.enabled && !await confirm(
+			'Enable watchdog?',
+			'Low-memory failures can reboot immediately; persistent load or ping failures can also reboot this appliance. Every ping target must remain reachable.',
+		)) return;
 		const action = proto.enabled ? 'disable' : 'enable';
 		await withToast(
 			() => client.call(`service.protocol.${action}`, { name: proto.name }),
@@ -420,7 +487,7 @@
 							>
 								{proto.enabled ? 'Disable' : 'Enable'}
 							</Button>
-							{#if ['nfs', 'smb', 'iscsi', 'nvmeof', 'nut', 'ssh', 'rest-server'].includes(proto.name)}
+							{#if ['nfs', 'smb', 'iscsi', 'nvmeof', 'nut', 'watchdog', 'ssh', 'rest-server'].includes(proto.name)}
 								<Button variant="secondary" size="xs" onclick={() => toggleConfig(proto.name)}>
 									{configOpen === proto.name ? 'Close' : 'Configure'}
 								</Button>
@@ -532,6 +599,44 @@
 									</div>
 								</div>
 								<Button size="sm" class="mt-3" onclick={saveNut} disabled={savingNut}>{savingNut ? 'Saving...' : 'Save'}</Button>
+							{:else if proto.name === 'watchdog' && watchdogConfig}
+								<div class="max-w-2xl space-y-4">
+									<div class="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
+										These checks are reboot policies, not alerts. Low-memory failures can reboot immediately; load and ping failures are retried before reboot. The daemon also detects severe process and file-table failures. Hardware watchdog devices are not claimed automatically.
+									</div>
+									<div>
+										<p class="mb-2 text-xs font-semibold text-muted-foreground">Maximum load average</p>
+										<div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
+											<div>
+												<label for="s-watchdog-load1" class="mb-1 block text-xs text-muted-foreground">1 minute</label>
+												<input id="s-watchdog-load1" type="text" inputmode="numeric" bind:value={watchdogLoad1} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm" />
+											</div>
+											<div>
+												<label for="s-watchdog-load5" class="mb-1 block text-xs text-muted-foreground">5 minutes</label>
+												<input id="s-watchdog-load5" type="text" inputmode="numeric" bind:value={watchdogLoad5} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm" />
+											</div>
+											<div>
+												<label for="s-watchdog-load15" class="mb-1 block text-xs text-muted-foreground">15 minutes</label>
+												<input id="s-watchdog-load15" type="text" inputmode="numeric" bind:value={watchdogLoad15} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm" />
+											</div>
+										</div>
+										<p class="mt-1 text-[0.65rem] text-muted-foreground">Set all three to 0 to disable load monitoring. Enabled thresholds must be at least 2.</p>
+									</div>
+									<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+										<div>
+											<label for="s-watchdog-memory" class="mb-1 block text-xs text-muted-foreground">Minimum reclaimable memory (MiB)</label>
+											<input id="s-watchdog-memory" type="text" inputmode="numeric" bind:value={watchdogMinMemory} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm" />
+											<p class="mt-1 text-[0.65rem] text-muted-foreground">0 disables the check. Falling below a non-zero value triggers an immediate reboot.</p>
+										</div>
+										<div>
+											<label for="s-watchdog-ping" class="mb-1 block text-xs text-muted-foreground">IPv4 ping targets</label>
+											<textarea id="s-watchdog-ping" rows="3" bind:value={watchdogPingHosts} placeholder="192.168.1.1" class="w-full rounded-md border border-input bg-background px-2 py-1.5 font-mono text-sm"></textarea>
+											<p class="mt-1 text-[0.65rem] text-muted-foreground">One numeric IPv4 address per line. Every target must respond.</p>
+										</div>
+									</div>
+									{#if watchdogValidationError}<p class="text-xs text-destructive">{watchdogValidationError}</p>{/if}
+									<Button size="sm" onclick={saveWatchdog} disabled={savingWatchdog || watchdogValidationError !== null}>{savingWatchdog ? 'Saving...' : 'Save'}</Button>
+								</div>
 							{:else if proto.name === 'ssh' && sshLoaded}
 								<div class="max-w-xl space-y-3">
 									<label class="flex items-center gap-2 text-sm cursor-pointer">

@@ -234,6 +234,7 @@ in {
     iscsi.enable = mkEnableOption "iSCSI target (LIO) for NASty" // { default = true; };
     nvmeof.enable = mkEnableOption "NVMe-oF target for NASty" // { default = true; };
     nut.enable = mkEnableOption "NUT (Network UPS Tools) for NASty";
+    watchdog.enable = mkEnableOption "Linux watchdog service for NASty";
 
     # VPN — not enabled by default (requires Tailscale auth key)
     tailscale = {
@@ -1606,6 +1607,7 @@ in {
       ++ lib.optionals cfg.iscsi.enable [ targetcli-fixed ]
       ++ lib.optionals cfg.nvmeof.enable [ nvme-cli ]
       ++ lib.optionals cfg.nut.enable [ pkgs.nut ]
+      ++ lib.optionals cfg.watchdog.enable [ pkgs.watchdog ]
       ++ lib.optionals cfg.tailscale.enable [ cfg.tailscale.package ];
 
     # ── State directory ────────────────────────────────────────
@@ -1796,6 +1798,7 @@ in {
         ++ lib.optionals cfg.iscsi.enable [ targetcli-fixed ]
         ++ lib.optionals cfg.nvmeof.enable [ nvme-cli ]
         ++ lib.optionals cfg.nut.enable [ pkgs.nut ]
+        ++ lib.optionals cfg.watchdog.enable [ pkgs.iputils ]
         ++ lib.optionals cfg.tailscale.enable [ cfg.tailscale.package ];
 
       environment = {
@@ -2133,6 +2136,28 @@ in {
         ExecStop = "${pkgs.nut}/sbin/upsmon -c stop";
         Environment = "NUT_CONFPATH=/var/lib/nasty/nut";
       };
+      wantedBy = lib.mkForce [];
+    };
+
+    # ── Linux watchdog ───────────────────────────────────────────
+    # The classic watchdog daemon provides load, memory, and ICMP checks.
+    # Hardware watchdog access is deliberately omitted: claiming
+    # /dev/watchdog safely requires device-specific operator testing.
+    systemd.services.nasty-watchdog = mkIf cfg.watchdog.enable {
+      description = "NASty system watchdog";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      unitConfig = {
+        StartLimitIntervalSec = 60;
+        StartLimitBurst = 3;
+      };
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${pkgs.watchdog}/bin/watchdog --foreground --config-file /var/lib/nasty/watchdog.conf";
+        Restart = "on-failure";
+        RestartSec = 10;
+      };
+      # The engine owns lifecycle through the Services toggle.
       wantedBy = lib.mkForce [];
     };
 

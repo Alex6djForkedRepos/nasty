@@ -19,6 +19,7 @@ let
     import ssl
     import subprocess
     import sys
+    import time
     import urllib.parse
     import urllib.request
     import websocket
@@ -134,6 +135,41 @@ let
         assert smart["enabled"] is True and smart["running"] is True, smart
         smart = call(ws, "service.protocol.disable", 21, {"name": "smart"})
         assert smart["enabled"] is False and smart["running"] is False, smart
+
+        watchdog = call(ws, "system.watchdog.config.get", 22)
+        assert watchdog == {
+            "max_load_1": 0,
+            "max_load_5": 0,
+            "max_load_15": 0,
+            "min_memory_mib": 0,
+            "ping_hosts": [],
+        }, watchdog
+        watchdog = call(ws, "system.watchdog.config.update", 23, {
+            "ping_hosts": ["127.0.0.1"],
+        })
+        assert watchdog["ping_hosts"] == ["127.0.0.1"], watchdog
+        watchdog_status = call(ws, "service.protocol.enable", 24, {"name": "watchdog"})
+        assert watchdog_status["enabled"] is True and watchdog_status["running"] is True, watchdog_status
+        watchdog_pid = subprocess.check_output([
+            "systemctl", "show", "nasty-watchdog.service", "-p", "MainPID", "--value",
+        ], text=True).strip()
+        assert watchdog_pid not in ("", "0"), watchdog_pid
+        time.sleep(12)
+        watchdog_protocol = next(
+            protocol for protocol in call(ws, "service.protocol.list", 25)
+            if protocol["name"] == "watchdog"
+        )
+        assert watchdog_protocol["running"] is True, watchdog_protocol
+        stable_pid = subprocess.check_output([
+            "systemctl", "show", "nasty-watchdog.service", "-p", "MainPID", "--value",
+        ], text=True).strip()
+        restarts = subprocess.check_output([
+            "systemctl", "show", "nasty-watchdog.service", "-p", "NRestarts", "--value",
+        ], text=True).strip()
+        assert stable_pid == watchdog_pid, (watchdog_pid, stable_pid)
+        assert restarts == "0", restarts
+        watchdog_status = call(ws, "service.protocol.disable", 26, {"name": "watchdog"})
+        assert watchdog_status["enabled"] is False and watchdog_status["running"] is False, watchdog_status
 
         # Apps require their Docker data root on a managed bcachefs pool.
         # Create one through the public RPC so the later apps smoke exercises
@@ -325,6 +361,7 @@ pkgs.testers.runNixOSTest {
       smb.enable = false;
       iscsi.enable = false;
       nvmeof.enable = false;
+      watchdog.enable = true;
     };
 
     # Docker is needed for the apps-ingress assertion.  The engine's
@@ -407,6 +444,9 @@ pkgs.testers.runNixOSTest {
     machine.fail("systemctl is-active --quiet smartd.service")
     protocols = json.loads(machine.succeed("cat /var/lib/nasty/protocols.json"))
     assert protocols["smart"] is False, protocols
+    assert protocols["watchdog"] is False, protocols
+    machine.fail("systemctl is-active --quiet nasty-watchdog.service")
+    machine.succeed("test ! -e /etc/systemd/system/multi-user.target.wants/nasty-watchdog.service")
     machine.wait_for_unit("avahi-daemon.service")
 
     dynamic_firewall = machine.succeed("nft list table inet nasty")
@@ -546,6 +586,8 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         f"${pythonWithWs}/bin/python3 ${rpcSmoke} {shlex.quote(login_obj['token'])}"
     )
+    machine.succeed("grep -Fqx 'ping = 127.0.0.1' /var/lib/nasty/watchdog.conf")
+    machine.fail("systemctl is-active --quiet nasty-watchdog.service")
 
     # ── /apps/<name>/ ingress through Caddy ───────────────────────
     # rpc-smoke just installed an app called "smoke" mapped to

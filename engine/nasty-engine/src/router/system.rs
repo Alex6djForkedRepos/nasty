@@ -632,6 +632,21 @@ pub(super) async fn try_route(
             Err(e) => invalid(req, e),
         },
         "system.nut.status" => ok(req, state.nut.status().await),
+        "system.watchdog.config.get" => ok(req, state.watchdog.get_config().await),
+        "system.watchdog.config.update" => {
+            if let Some(response) = require_root_equivalent(req, session, "watchdog_reboot_policy")
+            {
+                response
+            } else {
+                match parse_params(req) {
+                    Ok(p) => match state.watchdog.update_config(p).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    },
+                    Err(e) => invalid(req, e),
+                }
+            }
+        }
         "system.tailscale.get" => ok(req, state.tailscale.get().await),
         "system.tailscale.connect" => match parse_params(req) {
             Ok(p) => match state.tailscale.connect(p).await {

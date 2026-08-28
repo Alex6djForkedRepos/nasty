@@ -276,6 +276,7 @@ fn is_read_only(method: &str) -> bool {
                 | "system.tuning.get"
                 | "system.nut.config.get"
                 | "system.nut.status"
+                | "system.watchdog.config.get"
                 | "system.tailscale.get"
                 | "system.acme.status"
                 | "system.tls.local_ca_root"
@@ -370,6 +371,7 @@ fn collection_for_method(method: &str) -> Option<&'static str> {
         m if m.starts_with("system.settings.") && !is_read_only(m) => Some("settings"),
         m if m.starts_with("system.tuning.") && !is_read_only(m) => Some("tuning"),
         m if m.starts_with("system.nut.") && !is_read_only(m) => Some("nut"),
+        m if m.starts_with("system.watchdog.") && !is_read_only(m) => Some("watchdog"),
         m if m.starts_with("system.tailscale.") && !is_read_only(m) => Some("tailscale"),
         m if m.starts_with("alert.") && !is_read_only(m) => Some("alert"),
         _ => None,

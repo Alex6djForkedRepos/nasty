@@ -1257,6 +1257,14 @@ export interface UpsStatus {
 	raw: Record<string, string>;
 }
 
+export interface WatchdogConfig {
+	max_load_1: number;
+	max_load_5: number;
+	max_load_15: number;
+	min_memory_mib: number;
+	ping_hosts: string[];
+}
+
 export interface TuningConfig {
 	nfs_threads: number;
 	nfs_lease_time: number;

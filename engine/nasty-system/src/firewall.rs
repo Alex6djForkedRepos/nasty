@@ -326,7 +326,8 @@ pub fn ports_for_protocol(proto: Protocol) -> Vec<PortSpec> {
         Protocol::Nut => vec![tcp(3493)],
         Protocol::Ssh => vec![tcp(22)],
         Protocol::Avahi => vec![udp(5353)],
-        Protocol::Smart => vec![], // no network port
+        Protocol::Smart => vec![],    // no network port
+        Protocol::Watchdog => vec![], // outbound ICMP only
         Protocol::RestServer => vec![tcp(8000)],
     }
 }
