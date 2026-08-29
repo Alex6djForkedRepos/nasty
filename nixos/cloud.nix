@@ -58,6 +58,7 @@ in
     # managed, only run when toggled on). Valid on cloud for remote-mode
     # monitoring of a network UPS. See #512.
     nut.enable = true;
+    watchdog.enable = true;
   };
 
   # No mDNS/Avahi on cloud — no local network discovery needed

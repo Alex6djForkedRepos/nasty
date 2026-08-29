@@ -85,6 +85,12 @@ pub(super) async fn try_route(
                     {
                         return Some(response);
                     }
+                    if proto == nasty_system::protocol::Protocol::Watchdog
+                        && let Some(response) =
+                            require_root_equivalent(req, session, "watchdog_reboot_policy")
+                    {
+                        return Some(response);
+                    }
                     if matches!(
                         proto,
                         nasty_system::protocol::Protocol::Iscsi

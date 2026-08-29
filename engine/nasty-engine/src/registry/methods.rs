@@ -73,6 +73,7 @@ use nasty_system::update::{
     Generation, ReleaseChannel, UpdateBuildDirConfig, UpdateInfo, UpdateStatus, VersionInfo,
     VersionSwitchRequest, VersionTaggedReleaseStatus,
 };
+use nasty_system::watchdog::{WatchdogConfig, WatchdogConfigUpdate};
 use nasty_system::{DiskHealth, Operation, SystemHealth, SystemInfo, SystemStats, SystemStatus};
 use nasty_vm::{
     CloneVmRequest, CreateVmRequest, SnapshotVmRequest, UpdateVmRequest, VmCapabilities, VmConfig,
@@ -437,11 +438,11 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "service.protocol.enable",
-                    desc: "Enable a protocol service. Available names: `nfs`, `smb`, `iscsi`, `nvmeof`, `ssh`, `avahi`, `smart`.",
+                    desc: "Enable a protocol or system service. Available names: `nfs`, `smb`, `iscsi`, `nvmeof`, `nut`, `ssh`, `avahi`, `smart`, `watchdog`, `rest-server`. Arming `watchdog` requires an unscoped Admin.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "name",
-                        "Protocol name (nfs, smb, iscsi, nvmeof, ssh, avahi, smart).",
+                        "Service name (nfs, smb, iscsi, nvmeof, nut, ssh, avahi, smart, watchdog, rest-server).",
                     )),
                     result: Some(gen_schema::<ProtocolStatus>(generator)),
                 },
@@ -451,7 +452,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "name",
-                        "Protocol name (nfs, smb, iscsi, nvmeof, ssh, avahi, smart).",
+                        "Service name (nfs, smb, iscsi, nvmeof, nut, ssh, avahi, smart, watchdog, rest-server).",
                     )),
                     result: Some(gen_schema::<ProtocolStatus>(generator)),
                 },
@@ -1591,6 +1592,26 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<UpsStatus>(generator)),
+                },
+            ],
+        ),
+        // ── System: watchdog ─────────────────────────────────────────────
+        (
+            "System Watchdog",
+            vec![
+                Method {
+                    name: "system.watchdog.config.get",
+                    desc: "Return the persisted load, memory, and IPv4 ping watchdog configuration.",
+                    role: MethodRole::Any,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<WatchdogConfig>(generator)),
+                },
+                Method {
+                    name: "system.watchdog.config.update",
+                    desc: "Validate and apply a partial watchdog configuration update. Active checks can reboot the appliance when their failure persists.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<WatchdogConfigUpdate>(generator)),
+                    result: Some(gen_schema::<WatchdogConfig>(generator)),
                 },
             ],
         ),

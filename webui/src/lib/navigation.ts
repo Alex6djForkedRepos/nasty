@@ -115,7 +115,7 @@ const NAVIGATION: NavEntry[] = [
 		label: 'System',
 		icon: Wrench,
 		children: [
-			item('services', '/services', 'Services', Server, ['service', 'protocol', 'nfs', 'smb', 'iscsi', 'smart', 'avahi', 'mdns', 'enable', 'disable', 'rest server', 'backup server', 'receiver', 'htpasswd', 'docker', 'container', 'runtime', 'ups', 'nut', 'battery', 'power', 'shutdown', 'uninterruptible']),
+			item('services', '/services', 'Services', Server, ['service', 'protocol', 'nfs', 'smb', 'iscsi', 'smart', 'avahi', 'mdns', 'enable', 'disable', 'rest server', 'backup server', 'receiver', 'htpasswd', 'docker', 'container', 'runtime', 'ups', 'nut', 'battery', 'power', 'shutdown', 'uninterruptible', 'watchdog', 'load', 'memory', 'ping', 'reboot']),
 			item('hardware', '/hardware', 'Hardware', CircuitBoard, ['hardware', 'pci', 'iommu', 'group', 'passthrough', 'vfio', 'gpu', 'device', 'driver', 'lspci', 'tpm', 'tpm2', 'secure boot', 'secureboot', 'cpu', 'memory', 'ram', 'dmi', 'bios', 'firmware', 'motherboard', 'mainboard', 'usb', 'nic']),
 			item('logs', '/logs', 'Logs', ScrollText, ['log', 'journal', 'systemd', 'debug', 'error', 'follow', 'stream', 'filter', 'level', 'tail', 'kernel', 'dmesg'], { commonRank: 8 }),
 			item('update', '/update', 'Update', RefreshCw, ['update', 'upgrade', 'version', 'release', 'nixos', 'rebuild', 'generation', 'nasty', 'nixpkgs', 'bcachefs', 'flake', 'lock', 'rollback', 'pin']),
