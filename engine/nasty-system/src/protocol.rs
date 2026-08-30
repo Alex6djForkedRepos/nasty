@@ -238,15 +238,22 @@ impl ProtocolService {
     /// Restore enabled protocol services on startup.
     /// Starts daemons and loads kernel modules for protocols the user enabled.
     pub async fn restore(&self) {
-        self.restore_excluding(&std::collections::HashSet::new())
+        let _ = self
+            .restore_excluding(&std::collections::HashSet::new())
             .await;
     }
 
     /// Restore enabled protocols except entries whose backing state failed
-    /// safety validation during boot.
-    pub async fn restore_excluding(&self, excluded: &std::collections::HashSet<Protocol>) {
+    /// safety validation during boot. Returns only protocols whose live
+    /// services were successfully restored so firewall reconciliation never
+    /// relies on desired state alone.
+    pub async fn restore_excluding(
+        &self,
+        excluded: &std::collections::HashSet<Protocol>,
+    ) -> std::collections::HashSet<Protocol> {
         let _state_guard = PROTOCOL_STATE_LOCK.lock().await;
         let mut state = load_state().await;
+        let mut restored = std::collections::HashSet::new();
 
         for &proto in Protocol::ALL {
             let enabled = state.get(proto);
@@ -367,7 +374,11 @@ impl ProtocolService {
             {
                 warn!("NFS-over-RDMA activation failed (TCP NFS unaffected): {e}");
             }
+            if !failed {
+                restored.insert(proto);
+            }
         }
+        restored
     }
 
     /// Stop a protocol's live services without changing the operator's

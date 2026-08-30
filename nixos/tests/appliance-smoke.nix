@@ -430,6 +430,12 @@ pkgs.testers.runNixOSTest {
     machine.wait_for_unit("sshd.service")
     machine.succeed("test \"$(systemctl show nasty-engine.service -p Nice --value)\" = -5")
     machine.succeed(
+        "test \"$(systemctl show nasty-engine.service -p TimeoutStartUSec --value)\" = infinity"
+    )
+    machine.succeed(
+        "systemctl show sshd.service -p Before --value | tr ' ' '\\n' | grep -Fxq nasty-engine.service"
+    )
+    machine.succeed(
         "test \"$(systemctl show nasty-engine.service -p CPUSchedulingResetOnFork --value)\" = no"
     )
     machine.succeed(
