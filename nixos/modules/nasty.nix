@@ -1748,7 +1748,7 @@ in {
       # (vs `requires`) means a broken Caddy doesn't block the engine
       # from running — the admin-API client has retry/backoff and
       # logs a warn! if it can't reach :2019.
-      after = [ "network.target" "nftables.service" "nasty-metrics.service" "caddy.service" ];
+      after = [ "network.target" "nftables.service" "nasty-metrics.service" "caddy.service" "sshd.service" ];
       requires = [ "nftables.service" ];
       partOf = [ "nftables.service" ];
       wants = [ "nasty-metrics.service" "caddy.service" ];
@@ -1836,6 +1836,11 @@ in {
         ExecStart = "${cfg.engine.package}/bin/nasty-engine";
         Restart = "always";
         RestartSec = 5;
+        # bcachefs recovery can legitimately exceed systemd's manager-wide
+        # startup deadline. The engine applies the persisted management
+        # firewall before mounting, so configured SSH remains available while
+        # an unclean filesystem finishes recovery.
+        TimeoutStartSec = "infinity";
         StateDirectory = "nasty";
 
         # Keep authentication, RPC dispatch, and status polling responsive
@@ -2658,6 +2663,9 @@ in {
     systemd.services.nftables.serviceConfig.ExecReload = lib.mkForce "";
     systemd.services.sshd = mkIf config.services.openssh.enable {
       after = [ "nftables.service" ];
+      # Stop the engine before SSH during shutdown so a stalled storage or
+      # update teardown does not remove the configured recovery path first.
+      before = [ "nasty-engine.service" ];
       requires = [ "nftables.service" ];
       partOf = [ "nftables.service" ];
     };

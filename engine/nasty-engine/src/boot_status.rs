@@ -178,6 +178,37 @@ impl BootStatusTracker {
         }
     }
 
+    /// Run a phase without cancelling it at an arbitrary wall-clock deadline.
+    ///
+    /// This is reserved for operations such as bcachefs recovery where dropping
+    /// the future can leave an in-kernel mount attempt running without an owner.
+    pub async fn run_phase_unbounded<T, F>(&self, name: &str, fut: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.mark_running(name).await;
+        let started = Instant::now();
+        let value = fut.await;
+        let elapsed = started.elapsed();
+        info!(
+            "boot phase '{name}' completed in {} ms",
+            elapsed.as_millis()
+        );
+        self.mark_finished(name, elapsed, None).await;
+        value
+    }
+
+    /// Replace a completed phase's successful status with a semantic failure.
+    /// Some restore APIs return a report of failed resources rather than an
+    /// error, so completion alone does not mean the subsystem is healthy.
+    pub async fn mark_failed(&self, name: &str, error: impl Into<String>) {
+        let mut snap = self.inner.write().await;
+        if let Some(phase) = snap.phases.iter_mut().find(|phase| phase.name == name) {
+            phase.state = PhaseState::Failed;
+            phase.error = Some(error.into());
+        }
+    }
+
     async fn mark_running(&self, name: &str) {
         let now_ms = self.elapsed_ms();
         let mut snap = self.inner.write().await;
@@ -267,6 +298,32 @@ mod tests {
         assert!(p.finished_at_ms.is_some());
         assert!(p.duration_ms.is_some());
         assert!(p.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn unbounded_phase_transitions_pending_to_ok() {
+        let t = BootStatusTracker::new(&["recovery"]);
+        let result = t.run_phase_unbounded("recovery", async { 42 }).await;
+        assert_eq!(result, 42);
+        let snap = t.snapshot().await;
+        assert_eq!(snap.phases[0].state, PhaseState::Ok);
+        assert!(snap.phases[0].finished_at_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn completed_phase_can_be_marked_semantically_failed() {
+        let t = BootStatusTracker::new(&["restore"]);
+        let _: () = t.run_phase_unbounded("restore", async {}).await;
+        t.mark_failed("restore", "media failed to mount").await;
+        t.mark_ready().await;
+
+        let snap = t.snapshot().await;
+        assert_eq!(snap.phases[0].state, PhaseState::Failed);
+        assert_eq!(
+            snap.phases[0].error.as_deref(),
+            Some("media failed to mount")
+        );
+        assert_eq!(snap.overall, OverallState::ReadyWithErrors);
     }
 
     #[tokio::test]

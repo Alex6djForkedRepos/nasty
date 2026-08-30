@@ -110,6 +110,33 @@ pub struct AppState {
 /// Base URL for the nasty-metrics service.
 pub const METRICS_BASE: &str = "http://127.0.0.1:2138";
 
+fn boot_firewall_protocol_enabled(
+    protocol: nasty_system::protocol::Protocol,
+    desired: bool,
+) -> bool {
+    desired && protocol != nasty_system::protocol::Protocol::Nfs
+}
+
+fn protocol_restore_exclusions(
+    nfs_safe: bool,
+    iscsi_safe: bool,
+    nvmeof_safe: bool,
+) -> std::collections::HashSet<nasty_system::protocol::Protocol> {
+    use nasty_system::protocol::Protocol;
+
+    let mut excluded = std::collections::HashSet::new();
+    if !nfs_safe {
+        excluded.insert(Protocol::Nfs);
+    }
+    if !iscsi_safe {
+        excluded.insert(Protocol::Iscsi);
+    }
+    if !nvmeof_safe {
+        excluded.insert(Protocol::Nvmeof);
+    }
+    excluded
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
@@ -253,13 +280,13 @@ async fn main() -> anyhow::Result<()> {
         boot_status: boot_status::BootStatusTracker::new(&[
             "io_scheduler.migrate_legacy",
             "io_scheduler.restore",
+            "network.restore_pending_revert",
+            "network.reconcile_orphans",
+            "firewall.init",
             "filesystems.restore_mounts",
             "subvolumes.restore_block_devices",
             "nvmeof.remap_device_paths",
             "iscsi.remap_device_paths",
-            "network.restore_pending_revert",
-            "network.reconcile_orphans",
-            "firewall.init",
             "protocols.restore",
             "smb.scaffold_config",
             "domain.restore",
@@ -283,24 +310,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore state from previous session:
     // 1. Migrate and restore physical-device I/O scheduler overrides
-    // 2. Mount filesystems tracked in fs-state.json
-    // 3. Re-attach loop devices for block subvolumes
-    // 4. Start enabled protocols (services + kernel modules)
-    // 5. Restore NVMe-oF configfs (volatile, needs modules from step 4)
+    // 2. Restore networking and the persisted firewall policy
+    // 3. Mount filesystems tracked in fs-state.json
+    // 4. Re-attach loop devices for block subvolumes
+    // 5. Start enabled protocols (services + kernel modules)
+    // 6. Restore NVMe-oF configfs (volatile, needs modules from step 5)
     //
-    // Every restoration step gets a wall-clock budget via `run_phase`
+    // Most restoration steps get a wall-clock budget via `run_phase`
     // so a single misbehaving subsystem (a hung mount, a slow Tailscale
     // login, an unreachable Docker socket) can't take the whole engine
-    // down via systemd's `TimeoutStartSec`. See #299 for the design.
+    // down. Filesystem recovery is deliberately exempt: cancelling a
+    // bcachefs mount can leave the kernel operation running without an
+    // owner, so systemd also gives the engine no aggregate startup deadline.
     //
     // Budgets are per-phase, sized for the worst realistic case
     // (many filesystems, many VMs/apps, big subvolume tree) rather
-    // than the median, with generous headroom above that. If the
-    // sum of every phase hitting its ceiling exceeds systemd's
-    // default `TimeoutStartSec` (90 s), the engine still reaches
-    // READY because each phase fires its own timeout independently
-    // and we keep going — but the actual common-case boot is in
-    // seconds and the ceilings are never reached.
+    // than the median, with generous headroom above that. The actual
+    // common-case boot is in seconds and these ceilings are
+    // rarely reached. See #299 and #802 for the timeout tradeoffs.
     use std::time::Duration;
     let secs = Duration::from_secs;
 
@@ -321,20 +348,138 @@ async fn main() -> anyhow::Result<()> {
         )
         .await;
 
-    let mount_failures = state
+    // Settle any interrupted network transaction and install the persisted
+    // firewall policy before storage recovery. This keeps configured SSH
+    // reachable while an unclean bcachefs filesystem replays its journal.
+    state
         .boot_status
         .run_phase(
+            "network.restore_pending_revert",
+            secs(60), // file check is instant; revert path runs nmcli
+            state.network.restore_pending_revert(),
+        )
+        .await;
+    state
+        .boot_status
+        .run_phase(
+            "network.reconcile_orphans",
+            secs(30), // a handful of NM connection deletes at most
+            state.network.reconcile_orphans(),
+        )
+        .await;
+
+    // Install the persisted policy before storage recovery, but hold NFS
+    // closed until every configured filesystem has been checked. The
+    // declarative baseline remains default-drop until this transaction
+    // succeeds; failure is fatal so systemd retries instead of exposing
+    // services behind an incomplete firewall.
+    let firewall_result = state
+        .boot_status
+        .run_phase("firewall.init", secs(15), {
+            let state = state.clone();
+            async move {
+                use nasty_system::protocol::Protocol;
+                let result = async {
+                    let mut proto_states = Vec::new();
+                    for proto in Protocol::ALL {
+                        proto_states.push((
+                            *proto,
+                            boot_firewall_protocol_enabled(
+                                *proto,
+                                state.protocols.is_enabled(*proto).await,
+                            ),
+                        ));
+                    }
+                    let dc_enabled = nasty_system::dc::DcService::load_config().await.is_some();
+                    let (iscsi_ports, nvmeof_ports) =
+                        router::share::portal_firewall_ports(&state).await?;
+                    let published = match tokio::time::timeout(
+                        secs(5),
+                        router::apps::published_firewall_ports(&state),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            warn!(
+                                "Docker app-port discovery exceeded 5s during firewall initialization; \
+                                 starting fail-closed with app ports blocked until app restoration reconciles them"
+                            );
+                            Vec::new()
+                        }
+                    };
+                    state
+                        .firewall
+                        .init(
+                            &proto_states,
+                            false,
+                            dc_enabled,
+                            iscsi_ports,
+                            nvmeof_ports,
+                            published,
+                        )
+                        .await?;
+                    Ok::<(), String>(())
+                }
+                .await;
+                Some(result)
+            }
+        })
+        .await;
+    match firewall_result {
+        Some(Ok(())) => {}
+        Some(Err(e)) => return Err(anyhow::anyhow!("firewall initialization failed: {e}")),
+        None => return Err(anyhow::anyhow!("firewall initialization timed out")),
+    }
+
+    // An engine-only restart can inherit a running NFS daemon from the prior
+    // process. Keep its external rule closed and stop it before mounting so it
+    // cannot serve a fallback directory while bcachefs recovery is in flight.
+    let nfs_quiesced = match tokio::time::timeout(
+        secs(30),
+        state
+            .protocols
+            .quiesce(nasty_system::protocol::Protocol::Nfs),
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            error!(
+                "CRITICAL: failed to quiesce NFS before storage recovery: {error}; \
+                 its firewall rules will remain closed"
+            );
+            false
+        }
+        Err(_) => {
+            error!(
+                "CRITICAL: timed out quiescing NFS before storage recovery; \
+                 its firewall rules will remain closed"
+            );
+            false
+        }
+    };
+
+    let mount_failures = state
+        .boot_status
+        .run_phase_unbounded(
             "filesystems.restore_mounts",
-            secs(300), // per-FS 60s device-wait × multi-disk pools, plus mount + possible fsck
             state.filesystems.restore_mounts(),
         )
         .await;
-    if !mount_failures.is_empty() {
-        error!(
-            "CRITICAL: {} filesystem(s) failed to mount: {}",
+    let storage_restore_failed = !mount_failures.is_empty();
+    let nfs_safe = nfs_quiesced && !storage_restore_failed;
+    if storage_restore_failed {
+        let failure = format!(
+            "{} filesystem(s) failed to mount: {}",
             mount_failures.len(),
             mount_failures.join(", ")
         );
+        error!("CRITICAL: {failure}; NFS restore will remain deferred until storage is repaired");
+        state
+            .boot_status
+            .mark_failed("filesystems.restore_mounts", failure)
+            .await;
         *state.mount_failures.lock().await = mount_failures;
     }
     // Re-attach loop devices and resolve persisted sharing state by immutable
@@ -388,91 +533,13 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|error| anyhow::anyhow!("failed to quiesce unsafe NVMe-oF state: {error}"))?;
     }
 
-    // Settle any interrupted network transaction and remove orphaned profiles
-    // before rendering interface-restricted firewall rules.
-    let mut excluded_protocols = std::collections::HashSet::new();
-    if !iscsi_remap.safe_to_restore {
-        excluded_protocols.insert(nasty_system::protocol::Protocol::Iscsi);
-    }
-    if !nvmeof_remap.safe_to_restore {
-        excluded_protocols.insert(nasty_system::protocol::Protocol::Nvmeof);
-    }
-    state
-        .boot_status
-        .run_phase(
-            "network.restore_pending_revert",
-            secs(60), // file check is instant; revert path runs nmcli
-            state.network.restore_pending_revert(),
-        )
-        .await;
-    state
-        .boot_status
-        .run_phase(
-            "network.reconcile_orphans",
-            secs(30), // a handful of NM connection deletes at most
-            state.network.reconcile_orphans(),
-        )
-        .await;
+    let excluded_protocols = protocol_restore_exclusions(
+        nfs_safe,
+        iscsi_remap.safe_to_restore,
+        nvmeof_remap.safe_to_restore,
+    );
 
-    // Install the complete dynamic policy before restoring any listener,
-    // VM, app, or VPN. The declarative NixOS baseline remains default-drop
-    // until this transaction succeeds; failure is fatal so systemd retries
-    // instead of exposing services behind an incomplete firewall.
-    let firewall_result = state
-        .boot_status
-        .run_phase("firewall.init", secs(15), {
-            let state = state.clone();
-            async move {
-                use nasty_system::protocol::Protocol;
-                let result = async {
-                    let mut proto_states = Vec::new();
-                    for proto in Protocol::ALL {
-                        proto_states.push((*proto, state.protocols.is_enabled(*proto).await));
-                    }
-                    let rdma_enabled = nasty_system::rdma::enabled().await;
-                    let dc_enabled = nasty_system::dc::DcService::load_config().await.is_some();
-                    let (iscsi_ports, nvmeof_ports) =
-                        router::share::portal_firewall_ports(&state).await?;
-                    let published = match tokio::time::timeout(
-                        secs(5),
-                        router::apps::published_firewall_ports(&state),
-                    )
-                    .await
-                    {
-                        Ok(result) => result?,
-                        Err(_) => {
-                            warn!(
-                                "Docker app-port discovery exceeded 5s during firewall initialization; \
-                                 starting fail-closed with app ports blocked until app restoration reconciles them"
-                            );
-                            Vec::new()
-                        }
-                    };
-                    state
-                        .firewall
-                        .init(
-                            &proto_states,
-                            rdma_enabled,
-                            dc_enabled,
-                            iscsi_ports,
-                            nvmeof_ports,
-                            published,
-                        )
-                        .await?;
-                    Ok::<(), String>(())
-                }
-                .await;
-                Some(result)
-            }
-        })
-        .await;
-    match firewall_result {
-        Some(Ok(())) => {}
-        Some(Err(e)) => return Err(anyhow::anyhow!("firewall initialization failed: {e}")),
-        None => return Err(anyhow::anyhow!("firewall initialization timed out")),
-    }
-
-    state
+    let restored_protocols = state
         .boot_status
         .run_phase(
             "protocols.restore",
@@ -480,6 +547,15 @@ async fn main() -> anyhow::Result<()> {
             state.protocols.restore_excluding(&excluded_protocols),
         )
         .await;
+    if !nfs_quiesced {
+        state
+            .boot_status
+            .mark_failed(
+                "protocols.restore",
+                "NFS could not be quiesced safely before storage recovery",
+            )
+            .await;
+    }
     // Protocol restore disables persisted entries whose daemons fail to start.
     // Close those rules as one follow-up transaction before restoring anything
     // else that could independently bring a listener back.
@@ -489,7 +565,7 @@ async fn main() -> anyhow::Result<()> {
         for proto in Protocol::ALL {
             actual_states.push((
                 *proto,
-                !excluded_protocols.contains(proto) && state.protocols.is_enabled(*proto).await,
+                !excluded_protocols.contains(proto) && restored_protocols.contains(proto),
             ));
         }
         state
@@ -497,6 +573,25 @@ async fn main() -> anyhow::Result<()> {
             .set_protocol_states(&actual_states)
             .await
             .map_err(|e| anyhow::anyhow!("firewall protocol reconciliation failed: {e}"))?;
+    }
+    let nfs_desired = state
+        .protocols
+        .is_enabled(nasty_system::protocol::Protocol::Nfs)
+        .await;
+    let nfs_restored =
+        !nfs_desired || restored_protocols.contains(&nasty_system::protocol::Protocol::Nfs);
+    if nasty_system::rdma::enabled().await && nfs_safe && nfs_restored {
+        state
+            .firewall
+            .open_rdma()
+            .await
+            .map_err(|e| anyhow::anyhow!("firewall RDMA reconciliation failed: {e}"))?;
+    } else {
+        state
+            .firewall
+            .close_rdma()
+            .await
+            .map_err(|e| anyhow::anyhow!("firewall RDMA reconciliation failed: {e}"))?;
     }
 
     // Rebuild the smb.nasty.conf include chain before anything AD-related
@@ -4765,6 +4860,36 @@ fn spawn_alert_notifier(state: Arc<AppState>) {
             ),
         }
     });
+}
+
+#[cfg(test)]
+mod boot_restore_tests {
+    use super::{boot_firewall_protocol_enabled, protocol_restore_exclusions};
+    use nasty_system::protocol::Protocol;
+
+    #[test]
+    fn boot_firewall_holds_nfs_closed_but_preserves_management_policy() {
+        assert!(!boot_firewall_protocol_enabled(Protocol::Nfs, true));
+        assert!(boot_firewall_protocol_enabled(Protocol::Ssh, true));
+        assert!(!boot_firewall_protocol_enabled(Protocol::Ssh, false));
+    }
+
+    #[test]
+    fn mount_failure_defers_nfs_without_blocking_unrelated_protocols() {
+        let excluded = protocol_restore_exclusions(false, true, true);
+
+        assert_eq!(excluded.len(), 1);
+        assert!(excluded.contains(&Protocol::Nfs));
+    }
+
+    #[test]
+    fn unsafe_block_share_state_adds_its_protocols() {
+        let excluded = protocol_restore_exclusions(true, false, false);
+
+        assert!(!excluded.contains(&Protocol::Nfs));
+        assert!(excluded.contains(&Protocol::Iscsi));
+        assert!(excluded.contains(&Protocol::Nvmeof));
+    }
 }
 
 #[cfg(test)]
