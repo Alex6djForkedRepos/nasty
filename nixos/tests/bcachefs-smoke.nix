@@ -20,6 +20,9 @@ pkgs.testers.runNixOSTest {
     machine.start()
     machine.wait_for_unit("multi-user.target")
 
+    machine.succeed("bcachefs version | grep -F 1.39.3")
+    machine.succeed("test -x /etc/systemd/system-generators/bcachefs-mount-generator")
+
     # Format the empty 1 GiB disk and mount it.
     machine.succeed("bcachefs format /dev/vdb")
     machine.succeed("mkdir -p /mnt/test")
