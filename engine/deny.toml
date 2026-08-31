@@ -72,29 +72,30 @@ ignore = [
     # release.
     "RUSTSEC-2023-0071",
 
-    # RUSTSEC-2025-0052 — `async-std` is discontinued. An
-    # error[unmaintained], NOT a vulnerability: the crate still works,
-    # it just won't get future fixes.
+    # RUSTSEC-2025-0052 — `async-std` is discontinued.
+    # RUSTSEC-2026-0271 — `suppaftp` permits CRLF command injection in
+    # FTP control-channel arguments before 10.0.2.
     #
     # Reach in our codebase:
     #   rustic_backend → opendal (services-ftp) → opendal-service-ftp
     #     → suppaftp → async-std
     #
-    # We do NOT use the FTP backend. nasty-backup drives opendal via
-    # s3 / sftp / b2 plus the rest/rclone backends only; the FTP service
-    # is pulled in because rustic_backend 0.7.x hardcodes `services-ftp`
-    # into its own opendal feature set (not behind a feature flag we can
-    # disable — verified against rustic_backend 0.7.0's Cargo.toml). So
-    # the async-std code is linked into the binary but never executed;
-    # the runtime risk is zero. cargo-deny can't reason about
-    # reachability, only the dep graph.
+    # We do NOT use the FTP backend. BackupTarget is a closed enum with
+    # no FTP variant, and its private conversion maps only local, S3,
+    # SFTP, REST, and B2 targets. The FTP service is pulled in because
+    # rustic_backend 0.7.x hardcodes `services-ftp` into its own opendal
+    # feature set (not behind a feature flag we can disable — verified
+    # against rustic_backend 0.7.0's Cargo.toml). No FTP control channel
+    # can therefore be constructed from NASty input, so neither finding
+    # is reachable at runtime. cargo-deny sees only the dependency graph.
     #
-    # Suppressed so rustic_backend / rustic_core security patches aren't
-    # held back by a discontinued transitive we don't run. Remove when
-    # opendal's FTP backend migrates off suppaftp/async-std, or when
-    # rustic_backend exposes per-service opendal features. Tracked in
-    # issue #386.
+    # No compatible patched release exists: opendal-service-ftp 0.58.2
+    # requires suppaftp ^8.0.3, while the injection fix is in 10.0.2.
+    # OpenDAL main has upgraded, so remove both exceptions once that is
+    # released and adopted by rustic_backend, or when rustic_backend
+    # exposes per-service opendal features. History: issue #386.
     "RUSTSEC-2025-0052",
+    "RUSTSEC-2026-0271",
 ]
 
 [licenses]
