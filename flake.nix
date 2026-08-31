@@ -10,10 +10,10 @@
     tailscale-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     # ── bcachefs override (optional) ──────────────────────────────
-    # Pinned to v1.39.3 release tag.
+    # Pinned to v1.39.4 release tag.
     # To revert to pure nixpkgs: comment out these two lines.
     # No other changes needed — bcachefs.nix defaults to pkgs.bcachefs-tools.
-    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.39.3";
+    bcachefs-tools.url = "github:koverstreet/bcachefs-tools/v1.39.4";
     bcachefs-tools.inputs.nixpkgs.follows = "nixpkgs";
 
     # ── lanzaboote (Secure Boot for NixOS) ─────────────────────────
@@ -188,11 +188,7 @@
       base = pkgs.bcachefs-tools.overrideAttrs (old: let
         sourceVersion = (builtins.fromTOML (builtins.readFile "${bcachefs-tools}/Cargo.toml")).package.version;
       in {
-        # The v1.39.3 tag forgot to bump Cargo.toml. Scope the correction to
-        # that exact source so operator-provided input overrides stay truthful.
-        version = if (bcachefs-tools.rev or null) == "9cc4c780893928cc4f043e4c1110d58bbed28550"
-          then "1.39.3"
-          else sourceVersion;
+        version = sourceVersion;
         src = bcachefs-tools;
         cargoDeps = pkgs.rustPlatform.importCargoLock {
           lockFile = "${bcachefs-tools}/Cargo.lock";
