@@ -1,6 +1,7 @@
-export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v2';
+export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v3';
+export const LEGACY_DASHBOARD_V2_PREFERENCES_KEY = 'nasty:dashboard:v2';
 export const LEGACY_DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v1';
-export const DASHBOARD_PREFERENCES_VERSION = 2;
+export const DASHBOARD_PREFERENCES_VERSION = 3;
 export const DASHBOARD_VIEW_NAME_MAX_LENGTH = 40;
 
 export const dashboardWidgetIds = [
@@ -18,11 +19,13 @@ export type DashboardWidgetId = (typeof dashboardWidgetIds)[number];
 export type DashboardPreset = 'overview' | 'storage' | 'monitoring' | 'custom';
 export type DashboardDensity = 'comfortable' | 'compact';
 export type DashboardWidgetWidth = 'half' | 'full';
+export type DashboardWidgetPresentation = 'standard' | 'tiny';
 
 export interface DashboardWidgetConfig {
 	id: DashboardWidgetId;
 	visible: boolean;
 	width: DashboardWidgetWidth;
+	presentation: DashboardWidgetPresentation;
 }
 
 export interface DashboardCustomView {
@@ -39,26 +42,30 @@ export interface DashboardPreferences {
 	customViews: DashboardCustomView[];
 }
 
-export const dashboardWidgetMeta: Record<DashboardWidgetId, { label: string; description: string }> = {
-	alerts: { label: 'Alerts', description: 'Active warnings and critical conditions.' },
-	system: { label: 'System status', description: 'Host identity, uptime, and service health.' },
-	summary: { label: 'Resource summary', description: 'CPU, memory, temperature, and total storage.' },
-	operations: { label: 'Active operations', description: 'Scrubs, evacuations, and reconciliation work.' },
-	storage: { label: 'Compact storage', description: 'Filesystems and member devices in a dense table.' },
-	history: { label: 'CPU and memory history', description: 'Resource history for the selected time range.' },
-	network: { label: 'Network', description: 'Interface status, throughput, and traffic history.' },
-	disk_io: { label: 'Disk I/O', description: 'Per-device read and write activity.' },
+export const dashboardWidgetMeta: Record<DashboardWidgetId, { label: string; description: string; supportsTiny: boolean }> = {
+	alerts: { label: 'Alerts', description: 'Active warnings and critical conditions.', supportsTiny: true },
+	system: { label: 'System status', description: 'Host identity, uptime, and service health.', supportsTiny: true },
+	summary: { label: 'Resource summary', description: 'CPU, memory, temperature, and total storage.', supportsTiny: false },
+	operations: { label: 'Active operations', description: 'Scrubs, evacuations, and reconciliation work.', supportsTiny: true },
+	storage: { label: 'Compact storage', description: 'Filesystems and member devices in a dense table.', supportsTiny: false },
+	history: { label: 'CPU and memory history', description: 'Resource history for the selected time range.', supportsTiny: true },
+	network: { label: 'Network', description: 'Interface status, throughput, and traffic history.', supportsTiny: false },
+	disk_io: { label: 'Disk I/O', description: 'Per-device read and write activity.', supportsTiny: false },
 };
 
+export function dashboardWidgetSupportsTiny(id: DashboardWidgetId): boolean {
+	return dashboardWidgetMeta[id].supportsTiny;
+}
+
 const defaultCustomWidgets: DashboardWidgetConfig[] = [
-	{ id: 'alerts', visible: true, width: 'full' },
-	{ id: 'system', visible: true, width: 'full' },
-	{ id: 'summary', visible: true, width: 'full' },
-	{ id: 'operations', visible: true, width: 'full' },
-	{ id: 'storage', visible: true, width: 'full' },
-	{ id: 'history', visible: true, width: 'full' },
-	{ id: 'network', visible: true, width: 'half' },
-	{ id: 'disk_io', visible: true, width: 'half' },
+	{ id: 'alerts', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'system', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'summary', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'operations', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'storage', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'history', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'network', visible: true, width: 'half', presentation: 'standard' },
+	{ id: 'disk_io', visible: true, width: 'half', presentation: 'standard' },
 ];
 
 type FixedPreset = Exclude<DashboardPreset, 'custom'>;
@@ -129,6 +136,7 @@ function normalizeWidgets(value: unknown): DashboardWidgetConfig[] {
 			id,
 			visible: candidate.visible !== false,
 			width: candidate.width === 'half' ? 'half' : 'full',
+			presentation: candidate.presentation === 'tiny' && dashboardWidgetSupportsTiny(id) ? 'tiny' : 'standard',
 		});
 	}
 
@@ -211,7 +219,7 @@ function migrateLegacyPreferences(value: Record<string, unknown>): DashboardPref
 function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 	if (!isRecord(value)) return defaultDashboardPreferences();
 	if (value.version === 1) return migrateLegacyPreferences(value);
-	if (value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
+	if (value.version !== 2 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
 
 	const customViews = normalizeCustomViews(value.customViews);
 	const requestedActiveViewId = typeof value.activeViewId === 'string' ? value.activeViewId.trim() : '';
@@ -239,6 +247,7 @@ export function parseDashboardPreferences(raw: string | null): DashboardPreferen
 export function loadDashboardPreferences(storage: Pick<Storage, 'getItem'>): DashboardPreferences {
 	return parseDashboardPreferences(
 		storage.getItem(DASHBOARD_PREFERENCES_KEY)
+		?? storage.getItem(LEGACY_DASHBOARD_V2_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_PREFERENCES_KEY)
 	);
 }

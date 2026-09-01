@@ -36,6 +36,7 @@
 	import AlertsWidget from '$lib/components/dashboard/alerts-widget.svelte';
 	import CustomizeDialog from '$lib/components/dashboard/customize-dialog.svelte';
 	import DiskIoWidget from '$lib/components/dashboard/disk-io-widget.svelte';
+	import HistoryControls from '$lib/components/dashboard/history-controls.svelte';
 	import HistoryWidget from '$lib/components/dashboard/history-widget.svelte';
 	import NetworkWidget from '$lib/components/dashboard/network-widget.svelte';
 	import OperationsWidget from '$lib/components/dashboard/operations-widget.svelte';
@@ -473,6 +474,9 @@
 	}
 
 	async function applyPreferences(preferences: DashboardPreferences) {
+		if (resolveDashboardWidgets(preferences).some((widget) => widget.id === 'history' && widget.presentation === 'tiny')) {
+			metricsOffset = 0;
+		}
 		dashboardPrefs.set(preferences);
 		await tick();
 		await loadVisibleData(false);
@@ -533,26 +537,36 @@
 				ondragover={(event) => targetWidgetDrag(event, widget.id)}
 				ondrop={(event) => dropWidget(event, widget.id)}
 			>
-				{#if dashboardPrefs.value.preset === 'custom'}
-					<div class="mb-1 flex items-center justify-end gap-1 text-muted-foreground">
-						<span class="mr-auto text-[0.65rem] font-medium uppercase tracking-wide">{dashboardWidgetMeta[widget.id].label}</span>
-						<button type="button" onclick={() => moveCustomWidget(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
-						<button type="button" onclick={() => moveCustomWidget(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
-						<button type="button" draggable={true} onclick={() => moveCustomWidget(widget.id, widgets.at(-1)?.id === widget.id ? -1 : 1)} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="cursor-grab rounded p-1 hover:bg-accent hover:text-foreground active:cursor-grabbing" aria-label={`Drag ${dashboardWidgetMeta[widget.id].label} to swap positions, or activate to move it ${widgets.at(-1)?.id === widget.id ? 'earlier' : 'later'}`} title="Drag to swap positions"><GripVertical class="h-3.5 w-3.5" /></button>
+				{#if dashboardPrefs.value.preset === 'custom' || (widget.id === 'history' && widget.presentation === 'standard')}
+					<div class="mb-1 flex min-h-8 flex-wrap items-center gap-1 text-muted-foreground xl:flex-nowrap">
+						<span class="text-[0.65rem] font-medium uppercase tracking-wide">{dashboardPrefs.value.preset === 'custom' ? `${dashboardWidgetMeta[widget.id].label}${widget.id === 'history' && historyLoading ? ' - loading' : ''}` : `History${historyLoading ? ' - loading' : ''}`}</span>
+						{#if widget.id === 'history' && widget.presentation === 'standard'}
+							{#if metricsOffset > 0}
+								<span class="ml-1 min-w-0 truncate text-xs normal-case tracking-normal" title={`${new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - ${new Date(Date.now() - metricsOffset).toLocaleString()}`}>{new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - {new Date(Date.now() - metricsOffset).toLocaleString()}</span>
+							{/if}
+							<HistoryControls range={metricsRange} offset={metricsOffset} loading={historyLoading} class="ml-auto" onRange={(range) => void changeRange(range)} onBack={() => void navigateBack()} onForward={() => void navigateForward()} onLive={() => void navigateLive()} />
+						{/if}
+						{#if dashboardPrefs.value.preset === 'custom'}
+							<div class={widget.id === 'history' && widget.presentation === 'standard' ? 'flex' : 'ml-auto flex'}>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
+								<button type="button" draggable={true} onclick={() => moveCustomWidget(widget.id, widgets.at(-1)?.id === widget.id ? -1 : 1)} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="cursor-grab rounded p-1 hover:bg-accent hover:text-foreground active:cursor-grabbing" aria-label={`Drag ${dashboardWidgetMeta[widget.id].label} to swap positions, or activate to move it ${widgets.at(-1)?.id === widget.id ? 'earlier' : 'later'}`} title="Drag to swap positions"><GripVertical class="h-3.5 w-3.5" /></button>
+							</div>
+						{/if}
 					</div>
 				{/if}
 				{#if widget.id === 'alerts'}
-					<AlertsWidget {alerts} loaded={alertsLoaded} {density} />
+					<AlertsWidget {alerts} loaded={alertsLoaded} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'system'}
-					<SystemWidget {info} {health} loaded={infoLoaded || healthLoaded} {density} />
+					<SystemWidget {info} {health} {infoLoaded} {healthLoaded} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'summary' && stats}
 					<SummaryWidget {stats} {filesystems} width={widget.width} {density} />
 				{:else if widget.id === 'operations'}
-					<OperationsWidget operations={systemStatus?.operations ?? []} loaded={operationsLoaded} {density} />
+					<OperationsWidget operations={systemStatus?.operations ?? []} loaded={operationsLoaded} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'storage'}
 					<StorageWidget {filesystems} usages={filesystemUsages} health={diskHealth} rates={diskRates} {density} />
 				{:else if widget.id === 'history'}
-					<HistoryWidget cpuSamples={cpuSamples} memorySamples={memorySamples} range={metricsRange} offset={metricsOffset} rangeDuration={rangeDurations[metricsRange]} loading={historyLoading} width={widget.width} {density} onRange={(range) => void changeRange(range)} onBack={() => void navigateBack()} onForward={() => void navigateForward()} onLive={() => void navigateLive()} />
+					<HistoryWidget cpuSamples={cpuSamples} memorySamples={memorySamples} range={metricsRange} loading={historyLoading} width={widget.width} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'network' && stats}
 					<NetworkWidget interfaces={stats.network} rates={networkRates} samples={networkSamples} {density} />
 				{:else if widget.id === 'disk_io' && stats}

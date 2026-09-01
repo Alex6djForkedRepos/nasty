@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { DashboardDensity, DashboardWidgetWidth } from '$lib/dashboard.svelte';
+	import type { DashboardDensity, DashboardWidgetPresentation, DashboardWidgetWidth } from '$lib/dashboard.svelte';
 	import { Card, CardContent, CardHeader, CardTitle } from '$lib/components/ui/card';
 	import IoChart from '$lib/components/io-chart.svelte';
 
@@ -10,50 +10,58 @@
 		cpuSamples,
 		memorySamples,
 		range,
-		offset,
-		rangeDuration,
 		density,
 		width,
 		loading,
-		onRange,
-		onBack,
-		onForward,
-		onLive,
+		presentation,
 	}: {
 		cpuSamples: Sample[];
 		memorySamples: Sample[];
 		range: MetricsRange;
-		offset: number;
-		rangeDuration: number;
 		density: DashboardDensity;
 		width: DashboardWidgetWidth;
 		loading: boolean;
-		onRange: (range: MetricsRange) => void;
-		onBack: () => void;
-		onForward: () => void;
-		onLive: () => void;
+		presentation: DashboardWidgetPresentation;
 	} = $props();
+
+	function summarize(samples: Sample[]): { current: number; peak: number } | null {
+		if (samples.length === 0) return null;
+		return {
+			current: samples.at(-1)!.in,
+			peak: Math.max(...samples.map((sample) => sample.in)),
+		};
+	}
+
+	let cpu = $derived(summarize(cpuSamples));
+	let memory = $derived(summarize(memorySamples));
 </script>
 
-<div>
-	<div class="mb-3 flex flex-wrap items-center justify-between gap-2">
-		<div class="flex items-center gap-2">
-			<span class="text-sm font-semibold">History{loading ? ' - loading' : ''}</span>
-			{#if offset > 0}
-				<span class="text-xs text-muted-foreground">{new Date(Date.now() - offset - rangeDuration).toLocaleString()} - {new Date(Date.now() - offset).toLocaleString()}</span>
-			{/if}
-		</div>
-		<div class="flex max-w-full items-center gap-1 overflow-x-auto pb-1">
-			{#if offset > 0}<button type="button" onclick={onLive} disabled={loading} class="rounded-md border border-border px-2 py-1 text-xs font-medium text-primary hover:bg-accent disabled:opacity-40">Live</button>{/if}
-			<button type="button" onclick={onBack} disabled={loading} class="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40" aria-label="Earlier history">&larr;</button>
-			<div class="flex rounded-md border border-border">
-				{#each (['5m', '1h', '1d', '7d', '30d'] as const) as option}
-					<button type="button" onclick={() => onRange(option)} disabled={loading} aria-pressed={range === option} class="px-2.5 py-1 text-xs font-medium first:rounded-l-md last:rounded-r-md disabled:opacity-40 {range === option ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}">{option}</button>
-				{/each}
-			</div>
-			<button type="button" onclick={onForward} disabled={offset === 0 || loading} class="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:cursor-default disabled:opacity-30" aria-label="Later history">&rarr;</button>
-		</div>
+{#if presentation === 'tiny'}
+	<div class="grid grid-cols-2 gap-3">
+		<Card>
+			<CardContent class="px-4 py-3">
+				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">CPU usage</CardTitle>
+				{#if cpu}
+					<div class="mt-1 text-2xl font-bold tabular-nums">{cpu.current.toFixed(1)}%</div>
+					<div class="mt-1 text-xs text-muted-foreground">{range} peak {cpu.peak.toFixed(1)}%</div>
+				{:else}
+					<div class="mt-2 text-sm font-medium text-muted-foreground" role="status">{loading ? 'Loading...' : 'Unavailable'}</div>
+				{/if}
+			</CardContent>
+		</Card>
+		<Card>
+			<CardContent class="px-4 py-3">
+				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">Memory usage</CardTitle>
+				{#if memory}
+					<div class="mt-1 text-2xl font-bold tabular-nums">{memory.current.toFixed(1)}%</div>
+					<div class="mt-1 text-xs text-muted-foreground">{range} peak {memory.peak.toFixed(1)}%</div>
+				{:else}
+					<div class="mt-2 text-sm font-medium text-muted-foreground" role="status">{loading ? 'Loading...' : 'Unavailable'}</div>
+				{/if}
+			</CardContent>
+		</Card>
 	</div>
+{:else}
 	<div class="grid grid-cols-1 gap-3 {width === 'full' ? 'sm:grid-cols-2' : ''}">
 		<Card>
 			<CardHeader class={density === 'compact' ? 'px-4 py-2.5' : 'pb-2'}><CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">CPU usage</CardTitle></CardHeader>
@@ -64,4 +72,4 @@
 			<CardContent class={density === 'compact' ? 'px-4 pb-3' : ''}><IoChart samples={memorySamples} inLabel="Used" inColor="var(--chart-5)" yFormat={(value) => value.toFixed(0) + '%'} tooltipFormat={(value) => value.toFixed(1) + '%'} ariaLabel="Memory usage history" emptyMessage={loading ? 'Loading data...' : 'No data for selected interval.'} /></CardContent>
 		</Card>
 	</div>
-</div>
+{/if}

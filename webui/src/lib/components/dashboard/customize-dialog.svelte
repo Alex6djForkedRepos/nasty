@@ -6,6 +6,7 @@
 		dashboardPresets,
 		dashboardViewNameAvailable,
 		dashboardWidgetMeta,
+		dashboardWidgetSupportsTiny,
 		defaultDashboardPreferences,
 		deleteDashboardView,
 		getActiveDashboardView,
@@ -249,9 +250,12 @@
 
 				<div class="mt-3 divide-y divide-border rounded-lg border border-border">
 					{#each activeView.widgets as widget, index (widget.id)}
-						<div class="flex items-center gap-3 px-3 py-2.5">
+						<div class="flex flex-wrap items-center gap-3 px-3 py-2.5">
 							<input type="checkbox" checked={widget.visible} disabled={widget.visible && activeView.widgets.filter((candidate) => candidate.visible).length === 1} onchange={(event) => updateWidget(index, { visible: event.currentTarget.checked })} aria-label={`Show ${dashboardWidgetMeta[widget.id].label}`} class="h-4 w-4 accent-primary disabled:opacity-40" />
-							<div class="min-w-0 flex-1"><div class="text-sm font-medium">{dashboardWidgetMeta[widget.id].label}</div><div class="truncate text-xs text-muted-foreground">{dashboardWidgetMeta[widget.id].description}</div></div>
+							<div class="min-w-40 flex-1"><div class="text-sm font-medium">{dashboardWidgetMeta[widget.id].label}</div><div class="truncate text-xs text-muted-foreground">{dashboardWidgetMeta[widget.id].description}</div></div>
+							{#if dashboardWidgetSupportsTiny(widget.id)}
+								<select value={widget.presentation} disabled={!widget.visible} onchange={(event) => updateWidget(index, { presentation: event.currentTarget.value === 'tiny' ? 'tiny' : 'standard' })} aria-label={`${dashboardWidgetMeta[widget.id].label} presentation`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="standard">Standard</option><option value="tiny">Tiny</option></select>
+							{/if}
 							<select value={widget.width} disabled={!widget.visible} onchange={(event) => updateWidget(index, { width: event.currentTarget.value === 'half' ? 'half' : 'full' })} aria-label={`${dashboardWidgetMeta[widget.id].label} width`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="full">Full</option><option value="half">Half</option></select>
 							<div class="flex">
 								<Button variant="ghost" size="icon-sm" disabled={index === 0} onclick={() => moveWidget(index, -1)} aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp /></Button>
