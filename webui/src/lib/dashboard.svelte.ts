@@ -151,6 +151,20 @@ export function resolveDashboardDensity(preferences: DashboardPreferences): Dash
 		: dashboardPresets[preferences.preset].density;
 }
 
+export function swapDashboardWidgets(
+	widgets: DashboardWidgetConfig[],
+	source: DashboardWidgetId,
+	target: DashboardWidgetId,
+): DashboardWidgetConfig[] {
+	const sourceIndex = widgets.findIndex((widget) => widget.id === source);
+	const targetIndex = widgets.findIndex((widget) => widget.id === target);
+	if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return cloneWidgets(widgets);
+
+	const next = cloneWidgets(widgets);
+	[next[sourceIndex], next[targetIndex]] = [next[targetIndex], next[sourceIndex]];
+	return next;
+}
+
 function createDashboardPrefs() {
 	let value = $state<DashboardPreferences>(parseDashboardPreferences(
 		typeof localStorage !== 'undefined' ? localStorage.getItem(DASHBOARD_PREFERENCES_KEY) : null

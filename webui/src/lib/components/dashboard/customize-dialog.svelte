@@ -82,7 +82,7 @@
 
 			{#if draft.preset === 'custom'}
 				<div class="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-5">
-					<div><h3 class="text-sm font-semibold">Custom widgets</h3><p class="text-xs text-muted-foreground">Half-width widgets share a row on wide screens and stack on mobile.</p></div>
+					<div><h3 class="text-sm font-semibold">Custom widgets</h3><p class="text-xs text-muted-foreground">Half-width widgets pack into open column space on wide screens. Full-width widgets start a new row.</p></div>
 					<div class="flex items-center gap-2">
 						<label for="dashboard-density" class="text-xs font-medium text-muted-foreground">Density</label>
 						<select id="dashboard-density" value={draft.density} onchange={(event) => draft = { ...draft, density: (event.currentTarget as HTMLSelectElement).value === 'compact' ? 'compact' : 'comfortable' }} class="h-8 rounded-md border border-border bg-background px-2 text-xs">

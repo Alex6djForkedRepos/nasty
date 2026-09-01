@@ -7,8 +7,10 @@
 	import {
 		dashboardPrefs,
 		dashboardPresets,
+		dashboardWidgetMeta,
 		resolveDashboardDensity,
 		resolveDashboardWidgets,
+		swapDashboardWidgets,
 		type DashboardPreferences,
 		type DashboardWidgetId,
 		type DashboardWidgetWidth,
@@ -37,7 +39,7 @@
 	import StorageWidget from '$lib/components/dashboard/storage-widget.svelte';
 	import SummaryWidget from '$lib/components/dashboard/summary-widget.svelte';
 	import SystemWidget from '$lib/components/dashboard/system-widget.svelte';
-	import { Settings2 } from '@lucide/svelte';
+	import { ArrowDown, ArrowUp, GripVertical, Settings2 } from '@lucide/svelte';
 
 	type MetricsRange = '5m' | '1h' | '1d' | '7d' | '30d';
 	type DiskRate = { readRate: number; writeRate: number };
@@ -92,6 +94,9 @@
 	let memorySamples = $state<ChartSample[]>([]);
 	let historyLoading = $state(false);
 	let historyRequest = 0;
+	let draggedWidget = $state<DashboardWidgetId | null>(null);
+	let dragTargetWidget = $state<DashboardWidgetId | null>(null);
+	let movementAnnouncement = $state('');
 
 	const networkHistory = createIoHistory();
 	const diskHistory = createIoHistory();
@@ -120,6 +125,70 @@
 
 	function widgetClass(width: DashboardWidgetWidth): string {
 		return width === 'full' ? 'min-w-0 xl:col-span-2' : 'min-w-0 xl:col-span-1';
+	}
+
+	function masonryItem(node: HTMLElement) {
+		let frame = 0;
+		const update = () => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(() => {
+				const gridStyle = getComputedStyle(node.parentElement!);
+				const rowHeight = Number.parseFloat(gridStyle.gridAutoRows) || 8;
+				const gap = Number.parseFloat(gridStyle.rowGap) || 0;
+				const rows = Math.ceil((node.getBoundingClientRect().height + gap) / (rowHeight + gap));
+				node.style.gridRowEnd = `span ${Math.max(1, rows)}`;
+			});
+		};
+		const observer = new ResizeObserver(update);
+		observer.observe(node);
+		update();
+		return {
+			destroy() {
+				cancelAnimationFrame(frame);
+				observer.disconnect();
+			},
+		};
+	}
+
+	function swapCustomWidgets(source: DashboardWidgetId, target: DashboardWidgetId) {
+		const preferences = dashboardPrefs.value;
+		if (preferences.preset !== 'custom' || source === target) return;
+		dashboardPrefs.set({
+			...preferences,
+			widgets: swapDashboardWidgets(preferences.widgets, source, target),
+		});
+		movementAnnouncement = `${dashboardWidgetMeta[source].label} swapped with ${dashboardWidgetMeta[target].label}.`;
+	}
+
+	function moveCustomWidget(id: DashboardWidgetId, direction: -1 | 1) {
+		const index = widgets.findIndex((widget) => widget.id === id);
+		const target = widgets[index + direction];
+		if (index < 0 || !target) return;
+		swapCustomWidgets(id, target.id);
+	}
+
+	function startWidgetDrag(event: DragEvent, id: DashboardWidgetId) {
+		draggedWidget = id;
+		event.dataTransfer?.setData('text/plain', id);
+		if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+	}
+
+	function targetWidgetDrag(event: DragEvent, id: DashboardWidgetId) {
+		if (!draggedWidget || draggedWidget === id) return;
+		event.preventDefault();
+		dragTargetWidget = id;
+		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+	}
+
+	function dropWidget(event: DragEvent, target: DashboardWidgetId) {
+		event.preventDefault();
+		if (draggedWidget) swapCustomWidgets(draggedWidget, target);
+		endWidgetDrag();
+	}
+
+	function endWidgetDrag() {
+		draggedWidget = null;
+		dragTargetWidget = null;
 	}
 
 	function handleEvent(_: string, params: unknown) {
@@ -409,6 +478,7 @@
 	</div>
 	<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Customize</Button>
 </div>
+<div class="sr-only" aria-live="polite">{movementAnnouncement}</div>
 
 {#if filesystemsLoaded && filesystems.length === 0}
 	<Card class="mb-4 border-primary/30 bg-primary/5">
@@ -422,9 +492,24 @@
 {#if loading}
 	<Card><CardContent class="py-10 text-center text-sm text-muted-foreground">Loading dashboard...</CardContent></Card>
 {:else}
-	<div class="grid grid-cols-1 gap-4 xl:grid-cols-2">
+	<div class="grid grid-cols-1 auto-rows-[8px] gap-4 xl:grid-cols-2">
 		{#each widgets as widget (widget.id)}
-			<div class={widgetClass(widget.width)}>
+			<div
+				use:masonryItem
+				role="group"
+				aria-label={dashboardWidgetMeta[widget.id].label}
+				class="self-start rounded-lg transition-shadow {widgetClass(widget.width)} {dragTargetWidget === widget.id ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}"
+				ondragover={(event) => targetWidgetDrag(event, widget.id)}
+				ondrop={(event) => dropWidget(event, widget.id)}
+			>
+				{#if dashboardPrefs.value.preset === 'custom'}
+					<div class="mb-1 flex items-center justify-end gap-1 text-muted-foreground">
+						<span class="mr-auto text-[0.65rem] font-medium uppercase tracking-wide">{dashboardWidgetMeta[widget.id].label}</span>
+						<button type="button" onclick={() => moveCustomWidget(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
+						<button type="button" onclick={() => moveCustomWidget(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
+						<button type="button" draggable={true} onclick={() => moveCustomWidget(widget.id, widgets.at(-1)?.id === widget.id ? -1 : 1)} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="cursor-grab rounded p-1 hover:bg-accent hover:text-foreground active:cursor-grabbing" aria-label={`Drag ${dashboardWidgetMeta[widget.id].label} to swap positions, or activate to move it ${widgets.at(-1)?.id === widget.id ? 'earlier' : 'later'}`} title="Drag to swap positions"><GripVertical class="h-3.5 w-3.5" /></button>
+					</div>
+				{/if}
 				{#if widget.id === 'alerts'}
 					<AlertsWidget {alerts} loaded={alertsLoaded} {density} />
 				{:else if widget.id === 'system'}

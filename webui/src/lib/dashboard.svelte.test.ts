@@ -6,6 +6,7 @@ import {
 	parseDashboardPreferences,
 	resolveDashboardDensity,
 	resolveDashboardWidgets,
+	swapDashboardWidgets,
 } from './dashboard.svelte';
 
 beforeEach(() => {
@@ -62,5 +63,16 @@ describe('dashboard preferences', () => {
 			preset: 'custom',
 			density: 'compact',
 		});
+	});
+
+	test('swaps custom widgets without mutating the saved layout', () => {
+		const preferences = defaultDashboardPreferences();
+		const swapped = swapDashboardWidgets(preferences.widgets, 'alerts', 'storage');
+
+		expect(swapped.map((widget) => widget.id)).toEqual([
+			'storage', 'system', 'summary', 'operations', 'alerts', 'history', 'network', 'disk_io',
+		]);
+		expect(preferences.widgets[0].id).toBe('alerts');
+		expect(swapDashboardWidgets(preferences.widgets, 'alerts', 'alerts')).not.toBe(preferences.widgets);
 	});
 });
