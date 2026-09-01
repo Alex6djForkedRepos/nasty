@@ -1,6 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, test } from 'vitest';
 import AlertsWidget from './alerts-widget.svelte';
+import HealthWidget from './health-widget.svelte';
 import HistoryWidget from './history-widget.svelte';
 import OperationsWidget from './operations-widget.svelte';
 import SystemWidget from './system-widget.svelte';
@@ -110,5 +111,76 @@ describe('tiny dashboard widgets', () => {
 		expect(body).toContain('5m peak 12.0%');
 		expect(body).toContain('45.0%');
 		expect(body).not.toContain('role="img"');
+	});
+});
+
+describe('dashboard health widget', () => {
+	test('renders linked service and managed container counts with explicit health states', () => {
+		const body = render(HealthWidget, {
+			props: {
+				services: { enabled: 3, running: 2 },
+				servicesFreshness: 'current',
+				containers: { runtime: 'running', expected: 2, running: 2 },
+				containersFreshness: 'current',
+				density: 'comfortable',
+				width: 'full',
+			},
+		}).body;
+
+		expect(body).toContain('href="/services"');
+		expect(body).toContain('3 enabled');
+		expect(body).toContain('2 running');
+		expect(body).toContain('1 enabled service not running.');
+		expect(body).toContain('href="/apps"');
+		expect(body).toContain('2 expected');
+		expect(body).toContain('All expected containers are running.');
+		expect(body).toContain('Simple apps count once; Compose service instances count individually.');
+		expect(body).toContain('md:grid-cols-2');
+		expect(body).toContain('px-5 py-4');
+	});
+
+	test('distinguishes disabled, loading, unavailable, and stale states in text', () => {
+		const disabled = render(HealthWidget, {
+			props: {
+				services: null,
+				servicesFreshness: 'loading',
+				containers: { runtime: 'disabled', expected: null, running: null },
+				containersFreshness: 'current',
+				density: 'compact',
+				width: 'half',
+			},
+		}).body;
+		const stale = render(HealthWidget, {
+			props: {
+				services: { enabled: 1, running: 1 },
+				servicesFreshness: 'stale',
+				containers: null,
+				containersFreshness: 'unavailable',
+				density: 'compact',
+				width: 'half',
+			},
+		}).body;
+		const refreshing = render(HealthWidget, {
+			props: {
+				services: { enabled: 1, running: 1 },
+				servicesFreshness: 'refreshing',
+				containers: { runtime: 'running', expected: 1, running: 1 },
+				containersFreshness: 'refreshing',
+				density: 'compact',
+				width: 'half',
+			},
+		}).body;
+
+		expect(disabled).toContain('Checking enabled services.');
+		expect(disabled).toContain('Docker runtime is disabled.');
+		expect(disabled).toContain('px-4 py-3');
+		expect(disabled).not.toContain('md:grid-cols-2');
+		expect(stale).toContain('Stale - healthy');
+		expect(stale).toContain('Refresh failed; showing last known healthy state.');
+		expect(stale).toContain('Managed container health could not be loaded.');
+		expect(stale).toContain('role="status"');
+		expect(refreshing).toContain('Refreshing - healthy');
+		expect(refreshing).toContain('Refreshing; showing last known healthy state.');
+		expect(refreshing).not.toContain('Refresh failed');
 	});
 });

@@ -1855,6 +1855,11 @@ pub struct App {
     pub created: String,
     /// App kind: "simple" or "compose".
     pub kind: String,
+    /// Container instances expected from persisted configuration. Simple apps
+    /// contain their app name; compose service names repeat for configured
+    /// replicas, while services behind inactive profiles are excluded.
+    #[serde(default)]
+    pub expected_containers: Option<Vec<String>>,
     /// Individual containers (for compose apps with multiple services).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub containers: Vec<AppContainer>,
@@ -1882,6 +1887,88 @@ pub struct App {
     /// The app's IP on that network, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_ip: Option<String>,
+}
+
+fn parse_compose_inventory(
+    content: &str,
+    active_services: Option<&std::collections::HashSet<String>>,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let parsed: serde_json::Value = serde_yaml_ng::from_str(content).ok()?;
+    let services = parsed.get("services")?.as_object()?;
+    let mut names = Vec::new();
+    for (name, service) in services {
+        let active = active_services.map_or_else(
+            || {
+                !service
+                    .get("profiles")
+                    .and_then(|profiles| profiles.as_array())
+                    .is_some_and(|profiles| !profiles.is_empty())
+            },
+            |active| active.contains(name),
+        );
+        if !active {
+            continue;
+        }
+        let replicas = service
+            .get("scale")
+            .and_then(|scale| scale.as_u64())
+            .or_else(|| service.get("deploy")?.get("replicas")?.as_u64())
+            .unwrap_or(1);
+        for _ in 0..replicas {
+            names.push(name.clone());
+        }
+    }
+    names.sort();
+    let mut images: Vec<String> = services
+        .values()
+        .filter_map(|service| service.get("image")?.as_str().map(String::from))
+        .collect();
+    images.sort();
+    Some((names, images))
+}
+
+async fn compose_config_output(
+    compose_path: &std::path::Path,
+    args: &[&str],
+) -> Result<String, AppsError> {
+    let path = compose_path.to_string_lossy();
+    let mut command = Command::new("docker");
+    command.args(["compose", "-f", path.as_ref(), "config"]);
+    command.args(args);
+    if let Some(parent) = compose_path.parent() {
+        command.current_dir(parent);
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|error| AppsError::CommandFailed(error.to_string()))?;
+    if !output.status.success() {
+        return Err(AppsError::DockerFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn effective_compose_inventory(
+    compose_path: &std::path::Path,
+) -> Result<(Vec<String>, Vec<String>), AppsError> {
+    let (config, services) = tokio::try_join!(
+        compose_config_output(compose_path, &["--format", "json"]),
+        compose_config_output(compose_path, &["--services"]),
+    )?;
+    let active_services = services
+        .lines()
+        .map(str::trim)
+        .filter(|service| !service.is_empty())
+        .map(String::from)
+        .collect();
+    parse_compose_inventory(&config, Some(&active_services)).ok_or_else(|| {
+        AppsError::CommandFailed(format!(
+            "parse effective compose inventory for {}",
+            compose_path.display()
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3498,7 +3585,7 @@ impl AppsService {
             return self.list_internal().await;
         }
         // Docker not running — return offline list from filesystem
-        Self::list_offline().await
+        Self::list_offline(true).await
     }
 
     /// Live resource usage for every NASty-managed app that has at
@@ -3622,7 +3709,7 @@ impl AppsService {
     /// List apps from on-disk state when Docker is not running.
     /// Compose apps are detected by docker-compose.yml files.
     /// Simple apps are detected by {name}.json manifest files.
-    async fn list_offline() -> Result<Vec<App>, AppsError> {
+    async fn list_offline(include_compose: bool) -> Result<Vec<App>, AppsError> {
         let apps_dir = std::path::Path::new(COMPOSE_DIR);
         if !apps_dir.is_dir() {
             return Ok(Vec::new());
@@ -3636,6 +3723,9 @@ impl AppsService {
             let name = entry.file_name().to_string_lossy().to_string();
 
             if path.is_dir() {
+                if !include_compose {
+                    continue;
+                }
                 if let Err(e) = validate_app_name(&name) {
                     warn!("apps: ignoring unsafe compose directory name '{name}': {e}");
                     continue;
@@ -3643,24 +3733,23 @@ impl AppsService {
                 // Compose app: directory with docker-compose.yml
                 let compose_path = path.join("docker-compose.yml");
                 if compose_path.exists() {
-                    let images: Vec<String> = tokio::fs::read_to_string(&compose_path)
+                    let raw_inventory = tokio::fs::read_to_string(&compose_path)
                         .await
                         .ok()
-                        .and_then(|content| {
-                            let parsed: serde_json::Value =
-                                serde_yaml_ng::from_str(&content).ok()?;
-                            Some(
-                                parsed
-                                    .get("services")?
-                                    .as_object()?
-                                    .values()
-                                    .filter_map(|svc| {
-                                        svc.get("image")?.as_str().map(|s| s.to_string())
-                                    })
-                                    .collect(),
-                            )
-                        })
-                        .unwrap_or_default();
+                        .and_then(|content| parse_compose_inventory(&content, None));
+                    let (expected_containers, images) =
+                        match effective_compose_inventory(&compose_path).await {
+                            Ok((expected, images)) => (Some(expected), images),
+                            Err(error) => {
+                                warn!(
+                                    "apps: effective compose inventory for '{name}' failed: {error}"
+                                );
+                                (
+                                    None,
+                                    raw_inventory.map(|(_, images)| images).unwrap_or_default(),
+                                )
+                            }
+                        };
                     let image = if images.len() == 1 {
                         images[0].clone()
                     } else {
@@ -3679,6 +3768,7 @@ impl AppsService {
                         status: "stopped".to_string(),
                         created: String::new(),
                         kind: "compose".to_string(),
+                        expected_containers,
                         containers: Vec::new(),
                         ports: Vec::new(),
                         unsafe_mode,
@@ -3731,11 +3821,12 @@ impl AppsService {
                         .and_then(|s| s.as_str())
                         .map(String::from);
                     apps.push(App {
-                        name: app_name,
+                        name: app_name.clone(),
                         image,
                         status: "stopped".to_string(),
                         created: String::new(),
                         kind: "simple".to_string(),
+                        expected_containers: Some(vec![app_name.clone()]),
                         containers: Vec::new(),
                         ports: Vec::new(),
                         unsafe_mode,
@@ -3809,11 +3900,12 @@ impl AppsService {
                 })
                 .or_else(|| labels.and_then(|l| l.get(LABEL_APP_NETWORK_IP)).cloned());
             apps.push(App {
-                name: app_name,
+                name: app_name.clone(),
                 image: c.image.as_deref().unwrap_or("").to_string(),
                 status: container_status_str(c),
                 created: c.created.map(chrono_from_timestamp).unwrap_or_default(),
                 kind,
+                expected_containers: Some(vec![app_name.clone()]),
                 containers: vec![],
                 ports: extract_ports(c),
                 unsafe_mode,
@@ -3821,6 +3913,14 @@ impl AppsService {
                 network,
                 network_ip,
             });
+        }
+
+        // A managed simple app remains expected even if its Docker container was
+        // removed out of band. Merge persisted manifests that live discovery missed.
+        for offline in Self::list_offline(false).await? {
+            if offline.kind == "simple" && seen_names.insert(offline.name.clone()) {
+                apps.push(offline);
+            }
         }
 
         // Discover compose apps from the compose directory. Once Docker is
@@ -3833,6 +3933,9 @@ impl AppsService {
         };
         if let Some(entries) = entries.as_mut() {
             while let Some(entry) = entries.next_entry().await.map_err(AppsError::Io)? {
+                if !entry.path().is_dir() {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if seen_names.contains(&name) {
                     continue;
@@ -3845,6 +3948,7 @@ impl AppsService {
                 if !compose_path.exists() {
                     continue;
                 }
+                let (expected_containers, _) = effective_compose_inventory(&compose_path).await?;
 
                 // Find all containers from this compose project
                 let mut pf = HashMap::new();
@@ -3926,6 +4030,7 @@ impl AppsService {
                     status: overall_status,
                     created,
                     kind: "compose".to_string(),
+                    expected_containers: Some(expected_containers),
                     containers,
                     ports: all_ports,
                     unsafe_mode,
@@ -6854,9 +6959,9 @@ async fn fetch_manifest_json(
 mod tests {
     use super::{
         AppVolume, InstallAppRequest, StartupConfig, completes_ok_within, compose_file_args,
-        docker_data_root_status, extract_user_env, render_env_file, render_startup_override,
-        validate_app_name, validate_new_app_name, validate_new_app_request,
-        validate_simple_volumes, validate_volume_name,
+        docker_data_root_status, extract_user_env, parse_compose_inventory, render_env_file,
+        render_startup_override, validate_app_name, validate_new_app_name,
+        validate_new_app_request, validate_simple_volumes, validate_volume_name,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -6995,6 +7100,38 @@ mod tests {
         let empty = render_startup_override(&[]);
         assert!(empty.contains("services:\n"));
         assert!(!empty.contains("restart:"));
+    }
+
+    #[test]
+    fn compose_inventory_reports_declared_service_names() {
+        let compose = r#"
+services:
+  web:
+    image: example/web:latest
+  worker:
+    build: .
+    scale: 2
+  db:
+    image: postgres:18
+    deploy:
+      replicas: 2
+  debug:
+    image: example/debug:latest
+    profiles: [debug]
+"#;
+        let (services, images) =
+            parse_compose_inventory(compose, None).expect("valid compose inventory");
+
+        assert_eq!(services, ["db", "db", "web", "worker", "worker"]);
+        assert_eq!(
+            images,
+            ["example/debug:latest", "example/web:latest", "postgres:18"]
+        );
+
+        let active = std::collections::HashSet::from(["debug".to_string(), "web".to_string()]);
+        let (active_services, _) =
+            parse_compose_inventory(compose, Some(&active)).expect("effective inventory");
+        assert_eq!(active_services, ["debug", "web"]);
     }
 
     #[test]

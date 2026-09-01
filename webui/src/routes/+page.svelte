@@ -20,23 +20,35 @@
 	} from '$lib/dashboard.svelte';
 	import type {
 		ActiveAlert,
+		App,
+		AppsStatus,
 		DiskHealth,
 		DiskIoStats,
 		Filesystem,
 		FsUsage,
 		NetIfStats,
+		ProtocolStatus,
 		ResourceHistory,
 		SystemHealth,
 		SystemInfo,
 		SystemStats,
 		SystemStatus,
 	} from '$lib/types';
+	import {
+		shouldPollDashboardHealth,
+		summarizeEnabledServices,
+		summarizeManagedContainers,
+		type DashboardHealthFreshness,
+		type ManagedContainerHealthSummary,
+		type ServiceHealthSummary,
+	} from '$lib/dashboard-health';
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import AlertsWidget from '$lib/components/dashboard/alerts-widget.svelte';
 	import CustomizeDialog from '$lib/components/dashboard/customize-dialog.svelte';
 	import DiskIoWidget from '$lib/components/dashboard/disk-io-widget.svelte';
 	import HistoryControls from '$lib/components/dashboard/history-controls.svelte';
+	import HealthWidget from '$lib/components/dashboard/health-widget.svelte';
 	import HistoryWidget from '$lib/components/dashboard/history-widget.svelte';
 	import NetworkWidget from '$lib/components/dashboard/network-widget.svelte';
 	import OperationsWidget from '$lib/components/dashboard/operations-widget.svelte';
@@ -73,6 +85,10 @@
 	let healthLoaded = $state(false);
 	let alertsLoaded = $state(false);
 	let operationsLoaded = $state(false);
+	let serviceHealth = $state<ServiceHealthSummary | null>(null);
+	let serviceHealthFreshness = $state<DashboardHealthFreshness>('loading');
+	let containerHealth = $state<ManagedContainerHealthSummary | null>(null);
+	let containerHealthFreshness = $state<DashboardHealthFreshness>('loading');
 	let customizeOpen = $state(false);
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	let refreshTick = 0;
@@ -84,6 +100,7 @@
 	let healthRequest = 0;
 	let alertsRequest = 0;
 	let operationsRequest = 0;
+	let dashboardHealthInFlight: Promise<void> | null = null;
 
 	let metricsRange = $state<MetricsRange>('5m');
 	let metricsOffset = $state(0);
@@ -131,6 +148,10 @@
 
 	function needsMetricsHistory(): boolean {
 		return widgets.some((widget) => ['history', 'network', 'disk_io'].includes(widget.id));
+	}
+
+	function healthPollingEnabled(): boolean {
+		return shouldPollDashboardHealth(hasWidget('health'), document.hidden);
 	}
 
 	function widgetClass(width: DashboardWidgetWidth): string {
@@ -207,10 +228,15 @@
 
 	onMount(() => {
 		client.onEvent(handleEvent);
+		const handleVisibilityChange = () => {
+			if (healthPollingEnabled()) void loadDashboardHealth(true);
+		};
+		document.addEventListener('visibilitychange', handleVisibilityChange);
 		void loadVisibleData(true).finally(() => loading = false);
 		refreshTimer = setInterval(refreshVisibleData, 15_000);
 		return () => {
 			client.offEvent(handleEvent);
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
 			if (refreshTimer) clearInterval(refreshTimer);
 		};
 	});
@@ -236,6 +262,7 @@
 			}
 			if (hasWidget('alerts')) tasks.push(loadAlerts());
 			if (hasWidget('operations')) tasks.push(loadOperations());
+			if (healthPollingEnabled()) tasks.push(loadDashboardHealth(true));
 			const results = await Promise.allSettled(tasks);
 			if (hasWidget('storage')) await loadStorageDetails();
 			if (needsMetricsHistory()) await loadMetrics();
@@ -289,6 +316,59 @@
 		operationsLoaded = true;
 	}
 
+	function loadDashboardHealth(markExistingRefreshing = false): Promise<void> {
+		if (dashboardHealthInFlight) return dashboardHealthInFlight;
+		if (markExistingRefreshing && serviceHealth) serviceHealthFreshness = 'refreshing';
+		if (markExistingRefreshing && containerHealth) containerHealthFreshness = 'refreshing';
+		if (!serviceHealth) serviceHealthFreshness = 'loading';
+		if (!containerHealth) containerHealthFreshness = 'loading';
+
+		const request = Promise.all([loadServiceHealth(), loadContainerHealth()]).then(() => undefined);
+		dashboardHealthInFlight = request;
+		void request.finally(() => {
+			if (dashboardHealthInFlight === request) dashboardHealthInFlight = null;
+		});
+		return request;
+	}
+
+	async function loadServiceHealth() {
+		try {
+			serviceHealth = summarizeEnabledServices(await client.call<ProtocolStatus[]>('service.protocol.list'));
+			serviceHealthFreshness = 'current';
+		} catch {
+			serviceHealthFreshness = serviceHealth ? 'stale' : 'unavailable';
+		}
+	}
+
+	async function loadContainerHealth() {
+		let status: AppsStatus;
+		try {
+			status = await client.call<AppsStatus>('apps.status');
+		} catch {
+			containerHealthFreshness = containerHealth ? 'stale' : 'unavailable';
+			return;
+		}
+
+		if (!status.enabled) {
+			containerHealth = summarizeManagedContainers(status, []);
+			containerHealthFreshness = 'current';
+			return;
+		}
+		if (!status.running) {
+			containerHealth = { runtime: 'down', expected: null, running: 0 };
+			containerHealthFreshness = 'current';
+		}
+
+		try {
+			containerHealth = summarizeManagedContainers(status, await client.call<App[]>('apps.list'));
+			containerHealthFreshness = 'current';
+		} catch {
+			if (status.running) {
+				containerHealthFreshness = containerHealth ? 'stale' : 'unavailable';
+			}
+		}
+	}
+
 	async function loadFilesystemData() {
 		try {
 			await fetchFilesystemInventory();
@@ -328,6 +408,7 @@
 			if (needsStats()) tasks.push(refreshStats());
 			if (hasWidget('alerts')) tasks.push(loadAlerts());
 			if (hasWidget('operations')) tasks.push(loadOperations());
+			if (healthPollingEnabled()) tasks.push(loadDashboardHealth());
 			if (hasWidget('system') && refreshTick % 4 === 0) {
 				tasks.push(loadSystemHealth());
 				if (!infoLoaded) tasks.push(loadSystemInfo());
@@ -493,28 +574,46 @@
 		if (next === preferences) return;
 		await applyPreferences(next);
 	}
+
+	function handleDashboardTabKeydown(event: KeyboardEvent) {
+		if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+		const target = event.currentTarget as HTMLButtonElement;
+		const tabs = Array.from(target.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? []);
+		const current = tabs.indexOf(target);
+		if (current < 0 || tabs.length === 0) return;
+		const next = event.key === 'Home' ? 0
+			: event.key === 'End' ? tabs.length - 1
+			: (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+		event.preventDefault();
+		tabs[next].focus();
+		tabs[next].click();
+	}
 </script>
 
-<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-	<div>
-		<div class="text-sm font-semibold">{presetLabel} dashboard</div>
-		<div class="text-xs text-muted-foreground">{widgets.length} visible widget{widgets.length === 1 ? '' : 's'} - {density} density</div>
-	</div>
-	<div class="flex w-full flex-wrap items-center gap-2 sm:w-auto">
-		<label for="dashboard-view-switcher" class="sr-only">Dashboard view</label>
-		<select id="dashboard-view-switcher" value={dashboardSelection} onchange={(event) => void switchDashboard(event.currentTarget.value)} class="h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-3 text-sm sm:max-w-48">
-			<optgroup label="Presets">
-				{#each Object.entries(dashboardPresets) as [id, preset]}<option value={id}>{preset.label}</option>{/each}
-			</optgroup>
-			<optgroup label="Custom views">
-				{#each dashboardPrefs.value.customViews as view (view.id)}<option value={`custom:${view.id}`}>{view.name}</option>{/each}
-			</optgroup>
-		</select>
+<div class="mb-4">
+	<div class="flex flex-wrap items-center justify-between gap-3">
+		<div>
+			<div class="text-sm font-semibold">{presetLabel} dashboard</div>
+			<div class="text-xs text-muted-foreground">{widgets.length} visible widget{widgets.length === 1 ? '' : 's'} - {density} density</div>
+		</div>
 		<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Customize</Button>
+	</div>
+	<div class="mt-3 overflow-x-auto border-b border-border">
+		<div class="flex min-w-max items-end" role="tablist" aria-label="Dashboard views">
+			{#each Object.entries(dashboardPresets) as [id, preset]}
+				<button type="button" role="tab" aria-selected={dashboardSelection === id} aria-controls="dashboard-panel" tabindex={dashboardSelection === id ? 0 : -1} onclick={() => void switchDashboard(id)} onkeydown={handleDashboardTabKeydown} class="-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors {dashboardSelection === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'}">{preset.label}</button>
+			{/each}
+			<span class="mx-1 mb-2 h-5 w-px bg-border" aria-hidden="true"></span>
+			{#each dashboardPrefs.value.customViews as view (view.id)}
+				{@const selection = `custom:${view.id}`}
+				<button type="button" role="tab" aria-selected={dashboardSelection === selection} aria-controls="dashboard-panel" tabindex={dashboardSelection === selection ? 0 : -1} onclick={() => void switchDashboard(selection)} onkeydown={handleDashboardTabKeydown} class="-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors {dashboardSelection === selection ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'}">{view.name}</button>
+			{/each}
+		</div>
 	</div>
 </div>
 <div class="sr-only" aria-live="polite">{movementAnnouncement}</div>
 
+<div id="dashboard-panel" role="tabpanel" aria-label={`${presetLabel} dashboard`}>
 {#if filesystemsLoaded && filesystems.length === 0}
 	<Card class="mb-4 border-primary/30 bg-primary/5">
 		<CardContent class="flex flex-wrap items-center gap-6 py-6">
@@ -559,6 +658,8 @@
 					<AlertsWidget {alerts} loaded={alertsLoaded} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'system'}
 					<SystemWidget {info} {health} {infoLoaded} {healthLoaded} {density} presentation={widget.presentation} />
+				{:else if widget.id === 'health'}
+					<HealthWidget services={serviceHealth} servicesFreshness={serviceHealthFreshness} containers={containerHealth} containersFreshness={containerHealthFreshness} {density} width={widget.width} />
 				{:else if widget.id === 'summary' && stats}
 					<SummaryWidget {stats} {filesystems} width={widget.width} {density} />
 				{:else if widget.id === 'operations'}
@@ -578,5 +679,6 @@
 		{/each}
 	</div>
 {/if}
+</div>
 
 <CustomizeDialog bind:open={customizeOpen} preferences={dashboardPrefs.value} onSave={(preferences) => void applyPreferences(preferences)} />
