@@ -8,9 +8,12 @@
 		dashboardPrefs,
 		dashboardPresets,
 		dashboardWidgetMeta,
+		getActiveDashboardView,
 		resolveDashboardDensity,
 		resolveDashboardWidgets,
+		selectDashboardView,
 		swapDashboardWidgets,
+		updateActiveDashboardView,
 		type DashboardPreferences,
 		type DashboardWidgetId,
 		type DashboardWidgetWidth,
@@ -105,10 +108,16 @@
 
 	let widgets = $derived(resolveDashboardWidgets(dashboardPrefs.value));
 	let density = $derived(resolveDashboardDensity(dashboardPrefs.value));
+	let activeCustomView = $derived(getActiveDashboardView(dashboardPrefs.value));
 	let presetLabel = $derived(
 		dashboardPrefs.value.preset === 'custom'
-			? 'Custom'
+			? activeCustomView.name
 			: dashboardPresets[dashboardPrefs.value.preset].label
+	);
+	let dashboardSelection = $derived(
+		dashboardPrefs.value.preset === 'custom'
+			? `custom:${activeCustomView.id}`
+			: dashboardPrefs.value.preset
 	);
 
 	function hasWidget(id: DashboardWidgetId): boolean {
@@ -153,10 +162,9 @@
 	function swapCustomWidgets(source: DashboardWidgetId, target: DashboardWidgetId) {
 		const preferences = dashboardPrefs.value;
 		if (preferences.preset !== 'custom' || source === target) return;
-		dashboardPrefs.set({
-			...preferences,
-			widgets: swapDashboardWidgets(preferences.widgets, source, target),
-		});
+		dashboardPrefs.set(updateActiveDashboardView(preferences, {
+			widgets: swapDashboardWidgets(getActiveDashboardView(preferences).widgets, source, target),
+		}));
 		movementAnnouncement = `${dashboardWidgetMeta[source].label} swapped with ${dashboardWidgetMeta[target].label}.`;
 	}
 
@@ -469,6 +477,18 @@
 		await tick();
 		await loadVisibleData(false);
 	}
+
+	async function switchDashboard(selection: string) {
+		const preferences = dashboardPrefs.value;
+		let next: DashboardPreferences = preferences;
+		if (selection.startsWith('custom:')) {
+			next = selectDashboardView(preferences, selection.slice('custom:'.length));
+		} else if (selection === 'storage' || selection === 'monitoring' || selection === 'overview') {
+			next = { ...preferences, preset: selection };
+		}
+		if (next === preferences) return;
+		await applyPreferences(next);
+	}
 </script>
 
 <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -476,7 +496,18 @@
 		<div class="text-sm font-semibold">{presetLabel} dashboard</div>
 		<div class="text-xs text-muted-foreground">{widgets.length} visible widget{widgets.length === 1 ? '' : 's'} - {density} density</div>
 	</div>
-	<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Customize</Button>
+	<div class="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+		<label for="dashboard-view-switcher" class="sr-only">Dashboard view</label>
+		<select id="dashboard-view-switcher" value={dashboardSelection} onchange={(event) => void switchDashboard(event.currentTarget.value)} class="h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-3 text-sm sm:max-w-48">
+			<optgroup label="Presets">
+				{#each Object.entries(dashboardPresets) as [id, preset]}<option value={id}>{preset.label}</option>{/each}
+			</optgroup>
+			<optgroup label="Custom views">
+				{#each dashboardPrefs.value.customViews as view (view.id)}<option value={`custom:${view.id}`}>{view.name}</option>{/each}
+			</optgroup>
+		</select>
+		<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Customize</Button>
+	</div>
 </div>
 <div class="sr-only" aria-live="polite">{movementAnnouncement}</div>
 
