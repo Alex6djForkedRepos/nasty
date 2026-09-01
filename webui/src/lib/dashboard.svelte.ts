@@ -7,6 +7,7 @@ export const DASHBOARD_VIEW_NAME_MAX_LENGTH = 40;
 export const dashboardWidgetIds = [
 	'alerts',
 	'system',
+	'health',
 	'summary',
 	'operations',
 	'storage',
@@ -45,6 +46,7 @@ export interface DashboardPreferences {
 export const dashboardWidgetMeta: Record<DashboardWidgetId, { label: string; description: string; supportsTiny: boolean }> = {
 	alerts: { label: 'Alerts', description: 'Active warnings and critical conditions.', supportsTiny: true },
 	system: { label: 'System status', description: 'Host identity, uptime, and service health.', supportsTiny: true },
+	health: { label: 'Service and container health', description: 'Enabled services and expected managed containers currently running.', supportsTiny: false },
 	summary: { label: 'Resource summary', description: 'CPU, memory, temperature, and total storage.', supportsTiny: false },
 	operations: { label: 'Active operations', description: 'Scrubs, evacuations, and reconciliation work.', supportsTiny: true },
 	storage: { label: 'Compact storage', description: 'Filesystems and member devices in a dense table.', supportsTiny: false },
@@ -60,6 +62,7 @@ export function dashboardWidgetSupportsTiny(id: DashboardWidgetId): boolean {
 const defaultCustomWidgets: DashboardWidgetConfig[] = [
 	{ id: 'alerts', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'system', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'health', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'summary', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'operations', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'storage', visible: true, width: 'full', presentation: 'standard' },

@@ -53,7 +53,7 @@ describe('dashboard preferences', () => {
 			density: 'compact',
 		});
 		expect(getActiveDashboardView(parsed).widgets[0]).toEqual({ id: 'storage', visible: false, width: 'half', presentation: 'standard' });
-		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(8);
+		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(9);
 	});
 
 	test('migrates v2 named views to standard widget presentations', () => {
@@ -127,7 +127,7 @@ describe('dashboard preferences', () => {
 		expect(parsed.activeViewId).toBe('ops');
 		expect(parsed.customViews.map((view) => view.id)).toEqual(['ops', 'custom-1']);
 		expect(parsed.customViews.map((view) => view.name)).toEqual(['Operations', 'operations 2']);
-		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(8);
+		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(9);
 		expect(resolveDashboardWidgets(parsed)).not.toContainEqual(expect.objectContaining({ id: 'storage' }));
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'storage')?.presentation).toBe('standard');
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'alerts')?.presentation).toBe('tiny');
@@ -223,7 +223,7 @@ describe('dashboard preferences', () => {
 		const swapped = swapDashboardWidgets(widgets, 'alerts', 'storage');
 
 		expect(swapped.map((widget) => widget.id)).toEqual([
-			'storage', 'system', 'summary', 'operations', 'alerts', 'history', 'network', 'disk_io',
+			'storage', 'system', 'health', 'summary', 'operations', 'alerts', 'history', 'network', 'disk_io',
 		]);
 		expect(widgets[0].id).toBe('alerts');
 		expect(swapDashboardWidgets(widgets, 'alerts', 'alerts')).not.toBe(widgets);

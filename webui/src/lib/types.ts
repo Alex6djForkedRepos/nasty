@@ -1811,6 +1811,8 @@ export interface App {
 	status: string;
 	created: string;
 	kind: string; // "simple" or "compose"
+	/** Expected container instances; Compose service names repeat for replicas. */
+	expected_containers?: string[] | null;
 	containers?: AppContainer[];
 	ports?: MappedPort[];
 	/** True if deployed with allow_unsafe (elevated privileges). */
