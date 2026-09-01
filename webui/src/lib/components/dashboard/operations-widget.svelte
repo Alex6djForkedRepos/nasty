@@ -1,0 +1,38 @@
+<script lang="ts">
+	import type { ActiveOperation } from '$lib/types';
+	import type { DashboardDensity } from '$lib/dashboard.svelte';
+	import { Card, CardContent, CardHeader, CardTitle } from '$lib/components/ui/card';
+	import { Activity, CheckCircle2, TriangleAlert } from '@lucide/svelte';
+
+	let { operations, loaded, density }: { operations: ActiveOperation[]; loaded: boolean; density: DashboardDensity } = $props();
+
+	function kindLabel(kind: string): string {
+		return ({ scrub: 'Scrub', evacuate: 'Evacuate', reconcile: 'Reconcile', copygc: 'Copy-GC' } as Record<string, string>)[kind] ?? kind;
+	}
+</script>
+
+<Card>
+	<CardHeader class={density === 'compact' ? 'px-4 py-2.5' : 'pb-2'}>
+		<CardTitle class="flex items-center justify-between gap-3 text-xs uppercase tracking-wide text-muted-foreground">
+			<span class="flex items-center gap-2">{#if !loaded}<TriangleAlert class="h-4 w-4 text-muted-foreground" />{:else if operations.length > 0}<Activity class="h-4 w-4 text-amber-400" />{:else}<CheckCircle2 class="h-4 w-4 text-emerald-400" />{/if} Active operations</span>
+			<a href="/operations" class="normal-case tracking-normal text-primary hover:underline">Open operations</a>
+		</CardTitle>
+	</CardHeader>
+	<CardContent class={density === 'compact' ? 'px-4 pb-3' : ''}>
+		{#if !loaded}
+			<p class="text-sm text-muted-foreground">Operation status is unavailable.</p>
+		{:else if operations.length === 0}
+			<p class="text-sm text-muted-foreground">No scrub, evacuation, or reconciliation work is active.</p>
+		{:else}
+			<div class="grid gap-2 md:grid-cols-2">
+				{#each operations as operation}
+					<div class="rounded-md border border-border px-3 py-2">
+						<div class="flex items-center gap-2"><span class="text-sm font-semibold">{kindLabel(operation.kind)}</span><span class="font-mono text-xs text-muted-foreground">{operation.fs}</span>{#if operation.progress_percent != null}<span class="ml-auto text-xs tabular-nums text-amber-400">{operation.progress_percent.toFixed(0)}%</span>{/if}</div>
+						<p class="mt-1 truncate text-xs text-muted-foreground" title={operation.detail}>{operation.detail}</p>
+						{#if operation.progress_percent != null}<div class="mt-2 h-1.5 overflow-hidden rounded bg-muted"><div class="h-full bg-amber-500" style="width: {Math.max(0, Math.min(100, operation.progress_percent))}%"></div></div>{/if}
+					</div>
+				{/each}
+			</div>
+		{/if}
+	</CardContent>
+</Card>
