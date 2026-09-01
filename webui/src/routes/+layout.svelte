@@ -14,7 +14,7 @@
 	import LauncherSidebarNav from '$lib/components/LauncherSidebarNav.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type { AuthResult } from '$lib/rpc';
-	import type { BackupProfile, BootStatus, BootPhase, SecureBootReadinessReport, SystemStatus } from '$lib/types';
+	import type { BackupProfile, BootStatus, BootPhase, SecureBootReadinessReport, SystemStatus, UpdateInfo } from '$lib/types';
 	import favicon from '$lib/assets/favicon.svg';
 	import logoLight from '$lib/assets/nasty.svg';
 	import logoDark from '$lib/assets/nasty-white.svg';
@@ -64,6 +64,7 @@
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
 	import { theme } from '$lib/theme.svelte';
 	import { terminalStatus } from '$lib/terminalStatus.svelte';
+	import { RELEASE_UPDATE_CHANGED_EVENT, releaseUpdateDisplay, requestReleaseUpdateCheck, shouldCheckReleaseUpdate, type ReleaseUpdateChangedDetail, type ReleaseUpdateRequestState } from '$lib/release-update';
 	import { isManagementRole, isStandardUser, redirectForRole } from '$lib/access';
 	import { CORE_RECOVERY_PATHS, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
 
@@ -302,6 +303,15 @@
 
 	// Version info (loaded once after connect)
 	let sysInfo: { hostname: string; version: string; kernel: string; bcachefs_version: string; bcachefs_commit: string | null; bcachefs_pinned_ref: string | null; bcachefs_recommended_ref: string | null; bcachefs_is_custom: boolean; bcachefs_debug_checks: boolean; kvm_available: boolean; is_virtual: boolean } | null = $state(null);
+	let releaseInfo: UpdateInfo | null = $state(null);
+	let releaseRequestState: ReleaseUpdateRequestState = $state('idle');
+	let releaseRequest = 0;
+	let releaseUpdate = $derived(releaseUpdateDisplay(releaseInfo, releaseRequestState));
+	let releaseUpdateClass = $derived(
+		releaseUpdate.kind === 'current' ? 'text-emerald-400'
+		: releaseUpdate.kind === 'available' ? 'text-amber-400'
+		: 'text-muted-foreground/60'
+	);
 	setContext(NAVIGATION_CONTEXT, {
 		get kvmAvailable() { return sysInfo?.kvm_available === true; },
 		get role() { return authInfo?.role; }
@@ -355,6 +365,34 @@
 			}).catch(() => {});
 		}
 	});
+
+	async function loadReleaseUpdate() {
+		const request = ++releaseRequest;
+		releaseRequestState = 'loading';
+		try {
+			let info = await getClient().call<UpdateInfo>('system.update.version');
+			if (request !== releaseRequest) return;
+			releaseInfo = info;
+			// The local endpoint is cheap and may gain a cached result later. Only
+			// fall through to the remote lookup when the status is still unknown.
+			if (shouldCheckReleaseUpdate(info)) {
+				info = await requestReleaseUpdateCheck(getClient());
+				if (request !== releaseRequest) return;
+				releaseInfo = info;
+			}
+			releaseRequestState = 'ready';
+		} catch {
+			if (request === releaseRequest) releaseRequestState = 'failed';
+		}
+	}
+
+	function handleReleaseUpdateChanged(event: Event) {
+		if (!connected || !isManagementRole(authInfo?.role)) return;
+		const detail = (event as CustomEvent<ReleaseUpdateChangedDetail>).detail;
+		releaseRequest++;
+		releaseInfo = detail.info;
+		releaseRequestState = detail.requestState;
+	}
 
 	async function checkAuth() {
 		if (!connected) return;
@@ -500,6 +538,7 @@
 		if (isPublicShare) return;
 		tryConnect();
 		window.addEventListener(RECOVERY_BACKUP_CHANGED_EVENT, checkConfigBackup);
+		window.addEventListener(RELEASE_UPDATE_CHANGED_EVENT, handleReleaseUpdateChanged);
 		const tick = setInterval(() => { now = new Date(); }, 1000);
 		const rebootPoll = setInterval(checkRebootRequired, 30_000);
 		const statusPoll = setInterval(refreshSystemStatus, 20_000);
@@ -519,6 +558,7 @@
 			clearInterval(statusPoll);
 			clearInterval(authPoll);
 			window.removeEventListener(RECOVERY_BACKUP_CHANGED_EVENT, checkConfigBackup);
+			window.removeEventListener(RELEASE_UPDATE_CHANGED_EVENT, handleReleaseUpdateChanged);
 		};
 	});
 
@@ -567,6 +607,7 @@
 			if (isManagementRole(authInfo.role)) {
 				checkSshStatus();
 				checkConfigBackup();
+				void loadReleaseUpdate();
 			}
 			// Capture engine commit on first connect for reconnect version check
 			if (!initialCommit) {
@@ -671,6 +712,9 @@
 		connected = false;
 		authInfo = null;
 		sysInfo = null;
+		releaseRequest++;
+		releaseInfo = null;
+		releaseRequestState = 'idle';
 		systemStatus = null;
 		statusExpanded = false;
 		sshPasswordAuth = false;
@@ -1069,7 +1113,15 @@
 					{#if sysInfo}
 						<div class="flex items-center justify-between">
 							<a href="/licenses" class="text-[0.68rem] text-muted-foreground/50 hover:text-muted-foreground transition-colors">NASty</a>
-							<span class="text-[0.68rem] font-mono text-muted-foreground/70">{sysInfo.version}</span>
+							{#if releaseUpdate.kind === 'available'}
+								<a href="/update#version" class="ml-2 flex min-w-0 items-center gap-1 text-[0.68rem] font-mono text-amber-400 transition-colors hover:text-amber-300" title={releaseUpdate.title} aria-label={`${sysInfo.version}. ${releaseUpdate.title}`}>
+									<span class="truncate">{sysInfo.version}</span><span class="shrink-0 font-sans">{releaseUpdate.label}</span><ExternalLink size={10} class="shrink-0" />
+								</a>
+							{:else}
+								<span class="ml-2 flex min-w-0 items-center gap-1 text-[0.68rem] font-mono {releaseUpdateClass}" title={releaseUpdate.title}>
+									<span class="truncate">{sysInfo.version}</span><span class="shrink-0 font-sans">{releaseUpdate.label}</span>
+								</span>
+							{/if}
 						</div>
 						<div class="flex items-center justify-between mt-0.5">
 							<span class="text-[0.68rem] text-muted-foreground/50">kernel</span>

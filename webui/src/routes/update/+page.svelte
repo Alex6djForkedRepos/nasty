@@ -28,6 +28,7 @@
 		shouldShowUpdateStatus,
 		versionUpdatePhases
 	} from '$lib/update-progress';
+	import { publishReleaseUpdate, requestReleaseUpdateCheck } from '$lib/release-update';
 
 	type Tab = 'version' | 'generations' | 'firmware';
 	type VersionRow = {
@@ -452,10 +453,13 @@
 
 	async function checkForUpdates() {
 		checking = true;
+		publishReleaseUpdate(checkInfo ?? info, 'loading');
 		try {
-			checkInfo = await client.call<UpdateInfo>('system.update.check');
+			checkInfo = await requestReleaseUpdateCheck(client);
+			publishReleaseUpdate(checkInfo, 'ready');
 		} catch {
 			checkInfo = null;
+			publishReleaseUpdate(null, 'failed');
 		}
 		checking = false;
 	}
