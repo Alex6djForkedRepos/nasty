@@ -30,6 +30,7 @@ import {
 	selectDashboardView,
 	setDashboardPresetTabVisible,
 	updateActiveDashboardView,
+	updateDashboardWidgetAppearance,
 	type DashboardWidgetConfig,
 } from './dashboard.svelte';
 
@@ -285,6 +286,19 @@ describe('dashboard preferences', () => {
 		expect(dashboardWidgetWidthClass('service_health', 'half')).toContain('md:col-span-6');
 		expect(dashboardWidgetWidthClass('compute', 'quarter')).toContain('xl:col-span-3');
 		expect(dashboardWidgetWidthClass('cpu_load', 'quarter')).toContain('lg:col-span-3');
+	});
+
+	test('updates widget appearance while enforcing presentation width constraints', () => {
+		const widgets: DashboardWidgetConfig[] = [
+			{ id: 'alerts', visible: true, width: 'quarter', presentation: 'tiny', column: 9, row: 0, priority: 0 },
+			{ id: 'storage', visible: true, width: 'full', presentation: 'standard', column: 0, row: 1, priority: 0 },
+		];
+
+		const standard = updateDashboardWidgetAppearance(widgets, 'alerts', { presentation: 'standard' });
+		expect(standard[0]).toMatchObject({ width: 'half', presentation: 'standard', column: 6 });
+		const unsupportedNarrow = updateDashboardWidgetAppearance(widgets, 'storage', { width: 'quarter' });
+		expect(unsupportedNarrow[1]).toMatchObject({ width: 'half', presentation: 'standard', column: 0 });
+		expect(widgets[0]).toMatchObject({ width: 'quarter', presentation: 'tiny', column: 9 });
 	});
 
 	test('hides any built-in preset tab and falls back to a custom view', () => {

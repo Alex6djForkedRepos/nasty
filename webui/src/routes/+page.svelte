@@ -19,6 +19,7 @@
 		resolveDashboardWidgets,
 		selectDashboardView,
 		updateActiveDashboardView,
+		updateDashboardWidgetAppearance,
 		type DashboardPreferences,
 		type DashboardFixedPreset,
 		type DashboardWidgetConfig,
@@ -64,7 +65,8 @@
 	import StorageWidget from '$lib/components/dashboard/storage-widget.svelte';
 	import SummaryWidget from '$lib/components/dashboard/summary-widget.svelte';
 	import SystemWidget from '$lib/components/dashboard/system-widget.svelte';
-	import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, GripVertical, Settings2 } from '@lucide/svelte';
+	import WidgetOptions from '$lib/components/dashboard/widget-options.svelte';
+	import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, GripVertical, Settings2 } from '@lucide/svelte';
 
 	type MetricsRange = '5m' | '1h' | '1d' | '7d' | '30d';
 	type DiskRate = { readRate: number; writeRate: number };
@@ -102,6 +104,9 @@
 	let vms = $state<VmStatus[] | null>(null);
 	let vmFreshness = $state<DashboardHealthFreshness>('loading');
 	let customizeOpen = $state(false);
+	let editingDashboard = $state(false);
+	let customizeButton = $state<HTMLButtonElement | null>(null);
+	let editDoneButton = $state<HTMLButtonElement | null>(null);
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	let refreshTick = 0;
 	let refreshInFlight = false;
@@ -219,6 +224,37 @@
 		dashboardPrefs.set(updateActiveDashboardView(preferences, {
 			widgets: placeDashboardWidget(getActiveDashboardView(preferences).widgets, id, column, row),
 		}));
+	}
+
+	function updateWidgetAppearance(
+		id: DashboardWidgetId,
+		patch: Partial<Pick<DashboardWidgetConfig, 'width' | 'presentation'>>,
+	) {
+		const preferences = dashboardPrefs.value;
+		if (preferences.preset !== 'custom') return;
+		const reloadHistory = id === 'history' && patch.presentation === 'tiny' && metricsOffset > 0;
+		if (reloadHistory) metricsOffset = 0;
+		dashboardPrefs.set(updateActiveDashboardView(preferences, {
+			widgets: updateDashboardWidgetAppearance(getActiveDashboardView(preferences).widgets, id, patch),
+		}));
+		if (reloadHistory) void loadMetrics(true);
+	}
+
+	async function beginDashboardEditing() {
+		if (dashboardPrefs.value.preset !== 'custom') {
+			customizeOpen = true;
+			return;
+		}
+		editingDashboard = true;
+		await tick();
+		editDoneButton?.focus();
+	}
+
+	async function finishDashboardEditing() {
+		editingDashboard = false;
+		endWidgetDrag();
+		await tick();
+		customizeButton?.focus();
 	}
 
 	function announceMovement(message: string) {
@@ -705,12 +741,17 @@
 		await loadMetrics(true);
 	}
 
-	async function applyPreferences(preferences: DashboardPreferences) {
+	async function applyPreferences(preferences: DashboardPreferences, enterEditing = false) {
 		if (resolveDashboardWidgets(preferences).some((widget) => widget.id === 'history' && widget.presentation === 'tiny')) {
 			metricsOffset = 0;
 		}
+		const wasEditing = editingDashboard;
 		dashboardPrefs.set(preferences);
+		editingDashboard = preferences.preset === 'custom' && (wasEditing || enterEditing);
 		await tick();
+		if (enterEditing) {
+			requestAnimationFrame(() => (editingDashboard ? editDoneButton : customizeButton)?.focus());
+		}
 		await loadVisibleData(false);
 	}
 
@@ -723,6 +764,7 @@
 			next = { ...preferences, preset: selection };
 		}
 		if (next === preferences) return;
+		if (next.preset !== 'custom') editingDashboard = false;
 		await applyPreferences(next);
 	}
 
@@ -746,9 +788,16 @@
 		<div>
 			<div class="text-sm font-semibold">{presetLabel} dashboard</div>
 			<div class="text-xs text-muted-foreground">{widgets.length} visible widget{widgets.length === 1 ? '' : 's'} - {density} density</div>
-			{#if dashboardPrefs.value.preset === 'custom'}<div class="hidden text-xs text-muted-foreground xl:block">Drag a widget handle into a highlighted grid lane, or use its direction controls.</div>{/if}
+			{#if editingDashboard}<div class="text-xs text-muted-foreground">Move widgets with the direction controls or drag handle. Use each options menu to change its size or presentation.</div>{/if}
 		</div>
-		<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Customize</Button>
+		{#if editingDashboard}
+			<div class="flex items-center gap-2">
+				<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Widgets & views</Button>
+				<Button bind:ref={editDoneButton} size="sm" onclick={() => void finishDashboardEditing()}><Check /> Done</Button>
+			</div>
+		{:else}
+			<Button bind:ref={customizeButton} variant="outline" size="sm" onclick={() => void beginDashboardEditing()}><Settings2 /> Customize</Button>
+		{/if}
 	</div>
 	<div class="mt-3 overflow-x-auto border-b border-border">
 		<div class="flex min-w-max items-end" role="tablist" aria-label="Dashboard views">
@@ -804,26 +853,29 @@
 				style={widgetGridStyle(widget)}
 				class="self-start rounded-lg transition-[opacity,box-shadow] {dashboardWidgetWidthClass(widget.id, widget.width)} {dashboardPrefs.value.preset === 'custom' ? 'dashboard-positioned' : ''} {draggedWidget === widget.id ? 'opacity-45' : ''}"
 			>
-				{#if dashboardPrefs.value.preset === 'custom' || (widget.id === 'history' && widget.presentation === 'standard')}
+				{#if editingDashboard || (widget.id === 'history' && widget.presentation === 'standard')}
 					<div class="mb-1 flex min-h-8 flex-wrap items-center gap-1 text-muted-foreground xl:flex-nowrap">
-						<span class="text-[0.65rem] font-medium uppercase tracking-wide">{dashboardPrefs.value.preset === 'custom' ? `${dashboardWidgetMeta[widget.id].label}${widget.id === 'history' && historyLoading ? ' - loading' : ''}` : `History${historyLoading ? ' - loading' : ''}`}</span>
+						<span class="text-[0.65rem] font-medium uppercase tracking-wide">{editingDashboard ? `${dashboardWidgetMeta[widget.id].label}${widget.id === 'history' && historyLoading ? ' - loading' : ''}` : `History${historyLoading ? ' - loading' : ''}`}</span>
 						{#if widget.id === 'history' && widget.presentation === 'standard'}
 							{#if metricsOffset > 0}
 								<span class="ml-1 min-w-0 truncate text-xs normal-case tracking-normal" title={`${new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - ${new Date(Date.now() - metricsOffset).toLocaleString()}`}>{new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - {new Date(Date.now() - metricsOffset).toLocaleString()}</span>
 							{/if}
 							<HistoryControls range={metricsRange} offset={metricsOffset} loading={historyLoading} class="ml-auto" onRange={(range) => void changeRange(range)} onBack={() => void navigateBack()} onForward={() => void navigateForward()} onLive={() => void navigateLive()} />
 						{/if}
-						{#if dashboardPrefs.value.preset === 'custom'}
-							<div class="ml-auto flex xl:hidden">
-								<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
-								<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
-							</div>
-							<div class="ml-auto hidden opacity-50 transition-opacity hover:opacity-100 focus-within:opacity-100 xl:flex">
-								<button type="button" onclick={() => moveCustomWidget(widget.id, -1, 0)} disabled={!position || position.column === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} left`}><ArrowLeft class="h-3.5 w-3.5" /></button>
-								<button type="button" onclick={() => moveCustomWidget(widget.id, 1, 0)} disabled={!position || position.column + position.columnSpan >= 12} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} right`}><ArrowRight class="h-3.5 w-3.5" /></button>
-								<button type="button" onclick={() => moveCustomWidget(widget.id, 0, -1)} disabled={!position || position.row === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp class="h-3.5 w-3.5" /></button>
-								<button type="button" onclick={() => moveCustomWidget(widget.id, 0, 1)} class="rounded p-1.5 hover:bg-accent hover:text-foreground" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown class="h-3.5 w-3.5" /></button>
-								<span draggable={true} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="inline-flex cursor-grab rounded p-1.5 hover:bg-accent hover:text-foreground active:cursor-grabbing" title="Drag to a grid position" aria-hidden="true"><GripVertical class="h-3.5 w-3.5" /></span>
+						{#if editingDashboard}
+							<div class="ml-auto flex items-center">
+								<div class="flex xl:hidden">
+									<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
+									<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
+								</div>
+								<div class="hidden opacity-50 transition-opacity hover:opacity-100 focus-within:opacity-100 xl:flex">
+									<button type="button" onclick={() => moveCustomWidget(widget.id, -1, 0)} disabled={!position || position.column === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} left`}><ArrowLeft class="h-3.5 w-3.5" /></button>
+									<button type="button" onclick={() => moveCustomWidget(widget.id, 1, 0)} disabled={!position || position.column + position.columnSpan >= 12} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} right`}><ArrowRight class="h-3.5 w-3.5" /></button>
+									<button type="button" onclick={() => moveCustomWidget(widget.id, 0, -1)} disabled={!position || position.row === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp class="h-3.5 w-3.5" /></button>
+									<button type="button" onclick={() => moveCustomWidget(widget.id, 0, 1)} class="rounded p-1.5 hover:bg-accent hover:text-foreground" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown class="h-3.5 w-3.5" /></button>
+									<span draggable={true} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="inline-flex cursor-grab rounded p-1.5 hover:bg-accent hover:text-foreground active:cursor-grabbing" title="Drag to a grid position" aria-hidden="true"><GripVertical class="h-3.5 w-3.5" /></span>
+								</div>
+								<WidgetOptions {widget} onChange={(patch) => updateWidgetAppearance(widget.id, patch)} />
 							</div>
 						{/if}
 					</div>
@@ -859,7 +911,7 @@
 {/if}
 </div>
 
-<CustomizeDialog bind:open={customizeOpen} preferences={dashboardPrefs.value} onSave={(preferences) => void applyPreferences(preferences)} />
+<CustomizeDialog bind:open={customizeOpen} preferences={dashboardPrefs.value} onSave={(preferences) => void applyPreferences(preferences, true)} />
 
 <style>
 	@media (min-width: 80rem) {
