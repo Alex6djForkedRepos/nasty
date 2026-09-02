@@ -1,12 +1,13 @@
 import { render } from 'svelte/server';
 import { describe, expect, test } from 'vitest';
 import AlertsWidget from './alerts-widget.svelte';
+import ComputeWidget from './compute-widget.svelte';
 import HealthWidget from './health-widget.svelte';
 import HistoryWidget from './history-widget.svelte';
 import OperationsWidget from './operations-widget.svelte';
 import SummaryWidget from './summary-widget.svelte';
 import SystemWidget from './system-widget.svelte';
-import type { ActiveAlert, Filesystem, SystemInfo, SystemStats } from '$lib/types';
+import type { ActiveAlert, AppsStatus, Filesystem, SystemInfo, SystemStats, VmStatus } from '$lib/types';
 
 const alert = (severity: ActiveAlert['severity'], message: string): ActiveAlert => ({
 	rule_id: message,
@@ -55,6 +56,28 @@ const filesystem: Filesystem = {
 	available_bytes: 300,
 	options: {} as Filesystem['options'],
 };
+
+const appsStatus: AppsStatus = {
+	enabled: true,
+	running: true,
+	app_count: 2,
+	storage_ok: true,
+};
+
+const vm = (name: string, running: boolean, cpus: number, memory_mib: number): VmStatus => ({
+	id: name,
+	name,
+	cpus,
+	memory_mib,
+	disks: [],
+	networks: [],
+	passthrough_devices: [],
+	cdroms: [],
+	boot_order: 'disk',
+	uefi: true,
+	autostart: false,
+	running,
+});
 
 describe('tiny dashboard widgets', () => {
 	test('keeps critical alert and active operation states explicit', () => {
@@ -209,6 +232,85 @@ describe('dashboard health widget', () => {
 		expect(refreshing).toContain('Refreshing - healthy');
 		expect(refreshing).toContain('Refreshing; showing last known healthy state.');
 		expect(refreshing).not.toContain('Refresh failed');
+	});
+});
+
+describe('dashboard compute widget', () => {
+	test('summarizes active VM allocations and Docker workloads with destination links', () => {
+		const body = render(ComputeWidget, {
+			props: {
+				vms: [vm('router', true, 2, 2048), vm('lab', false, 4, 4096)],
+				vmFreshness: 'current',
+				appsStatus,
+				containers: { runtime: 'running', expected: 4, running: 3 },
+				containerFreshness: 'current',
+				density: 'comfortable',
+			},
+		}).body;
+
+		expect(body).toContain('href="/vms"');
+		expect(body).toContain('1 <span class="text-base font-medium text-muted-foreground">/ 2</span>');
+		expect(body).toContain('2 vCPU - 2.0 GiB active');
+		expect(body).toContain('href="/apps"');
+		expect(body).toContain('3 / 4');
+		expect(body).toContain('2 apps - containers running');
+	});
+
+	test('keeps runtime and freshness failures explicit', () => {
+		const disabled = render(ComputeWidget, {
+			props: {
+				vms: [],
+				vmFreshness: 'stale',
+				appsStatus: { ...appsStatus, enabled: false, running: false, app_count: 0 },
+				containers: { runtime: 'disabled', expected: null, running: null },
+				containerFreshness: 'current',
+				density: 'compact',
+			},
+		}).body;
+		const unavailable = render(ComputeWidget, {
+			props: {
+				vms: null,
+				vmFreshness: 'unavailable',
+				appsStatus: null,
+				containers: null,
+				containerFreshness: 'unavailable',
+				density: 'compact',
+			},
+		}).body;
+
+		expect(disabled).toContain('Stale');
+		expect(disabled).toContain('Data stale.');
+		expect(disabled).toContain('No VMs defined');
+		expect(disabled).toContain('Docker runtime is disabled.');
+		expect(unavailable).toContain('VM inventory could not be loaded.');
+		expect(unavailable).toContain('Docker status could not be loaded.');
+		expect(unavailable).toContain('role="status"');
+	});
+
+	test('distinguishes loading and partial Docker inventory from failures', () => {
+		const loading = render(ComputeWidget, {
+			props: {
+				vmFreshness: 'loading',
+				containerFreshness: 'loading',
+				density: 'compact',
+			},
+		}).body;
+		const partial = render(ComputeWidget, {
+			props: {
+				vms: [],
+				vmFreshness: 'current',
+				appsStatus,
+				containers: { runtime: 'running', expected: null, running: null },
+				containerFreshness: 'unavailable',
+				density: 'compact',
+			},
+		}).body;
+
+		expect(loading).toContain('Checking VM inventory.');
+		expect(loading).toContain('Checking Docker runtime.');
+		expect(loading).not.toContain('could not be loaded');
+		expect(partial).toContain('Inventory unavailable');
+		expect(partial).toContain('2 configured apps.');
 	});
 });
 

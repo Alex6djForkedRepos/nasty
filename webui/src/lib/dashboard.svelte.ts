@@ -13,6 +13,7 @@ export const dashboardWidgetIds = [
 	'system',
 	'service_health',
 	'container_health',
+	'compute',
 	'cpu_load',
 	'memory_usage',
 	'cpu_status',
@@ -74,6 +75,7 @@ export const dashboardWidgetMeta: Record<DashboardWidgetId, { label: string; des
 	system: { label: 'System status', description: 'Host identity, uptime, and service health.', supportsTiny: true },
 	service_health: { label: 'Service health', description: 'Enabled services currently running.', supportsTiny: false },
 	container_health: { label: 'Container health', description: 'Expected managed containers currently running.', supportsTiny: false },
+	compute: { label: 'Compute', description: 'Virtual machines and Docker workloads at a glance.', supportsTiny: false },
 	cpu_load: { label: 'CPU load', description: 'Current load across available CPU cores.', supportsTiny: false },
 	memory_usage: { label: 'Memory', description: 'Current memory use and bcachefs cache.', supportsTiny: false },
 	cpu_status: { label: 'CPU status', description: 'CPU temperature, frequency, and governor.', supportsTiny: false },
@@ -93,7 +95,7 @@ export function dashboardWidgetSupportsNarrowWidth(
 	id: DashboardWidgetId,
 	presentation: DashboardWidgetPresentation,
 ): boolean {
-	return ['service_health', 'container_health', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
+	return ['service_health', 'container_health', 'compute', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
 		|| (dashboardWidgetSupportsTiny(id) && presentation === 'tiny');
 }
 
@@ -118,7 +120,7 @@ export function dashboardWidgetSnapColumn(width: DashboardWidgetWidth, requested
 }
 
 export function dashboardWidgetWidthClass(id: DashboardWidgetId, width: DashboardWidgetWidth): string {
-	const responsive = id === 'service_health' || id === 'container_health'
+	const responsive = id === 'service_health' || id === 'container_health' || id === 'compute'
 		? 'col-span-12 md:col-span-6'
 		: ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
 			? 'col-span-6 lg:col-span-3'
@@ -164,6 +166,7 @@ const defaultCustomWidgets: DashboardWidgetConfig[] = positionWidgets([
 	{ id: 'history', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'network', visible: true, width: 'half', presentation: 'standard' },
 	{ id: 'disk_io', visible: true, width: 'half', presentation: 'standard' },
+	{ id: 'compute', visible: false, width: 'half', presentation: 'standard' },
 ]);
 
 export const dashboardPresets: Record<DashboardFixedPreset, {

@@ -40,6 +40,7 @@
 		SystemInfo,
 		SystemStats,
 		SystemStatus,
+		VmStatus,
 	} from '$lib/types';
 	import {
 		shouldPollDashboardHealth,
@@ -52,6 +53,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import AlertsWidget from '$lib/components/dashboard/alerts-widget.svelte';
+	import ComputeWidget from '$lib/components/dashboard/compute-widget.svelte';
 	import CustomizeDialog from '$lib/components/dashboard/customize-dialog.svelte';
 	import DiskIoWidget from '$lib/components/dashboard/disk-io-widget.svelte';
 	import HistoryControls from '$lib/components/dashboard/history-controls.svelte';
@@ -96,6 +98,9 @@
 	let serviceHealthFreshness = $state<DashboardHealthFreshness>('loading');
 	let containerHealth = $state<ManagedContainerHealthSummary | null>(null);
 	let containerHealthFreshness = $state<DashboardHealthFreshness>('loading');
+	let appsStatus = $state<AppsStatus | null>(null);
+	let vms = $state<VmStatus[] | null>(null);
+	let vmFreshness = $state<DashboardHealthFreshness>('loading');
 	let customizeOpen = $state(false);
 	let refreshTimer: ReturnType<typeof setInterval> | null = null;
 	let refreshTick = 0;
@@ -109,6 +114,7 @@
 	let operationsRequest = 0;
 	let serviceHealthInFlight: Promise<void> | null = null;
 	let containerHealthInFlight: Promise<void> | null = null;
+	let vmHealthInFlight: Promise<void> | null = null;
 
 	let metricsRange = $state<MetricsRange>('5m');
 	let metricsOffset = $state(0);
@@ -175,7 +181,12 @@
 	}
 
 	function healthPollingEnabled(id: 'service_health' | 'container_health'): boolean {
-		return shouldPollDashboardHealth(hasWidget(id), document.hidden);
+		const visible = hasWidget(id) || (id === 'container_health' && hasWidget('compute'));
+		return shouldPollDashboardHealth(visible, document.hidden);
+	}
+
+	function vmPollingEnabled(): boolean {
+		return shouldPollDashboardHealth(hasWidget('compute'), document.hidden);
 	}
 
 	function masonryItem(node: HTMLElement, id: DashboardWidgetId) {
@@ -325,6 +336,7 @@
 		const handleVisibilityChange = () => {
 			if (healthPollingEnabled('service_health')) void loadServiceHealth(true);
 			if (healthPollingEnabled('container_health')) void loadContainerHealth(true);
+			if (vmPollingEnabled()) void loadVmHealth(true);
 		};
 		document.addEventListener('visibilitychange', handleVisibilityChange);
 		void loadVisibleData(true).finally(() => loading = false);
@@ -359,6 +371,7 @@
 			if (hasWidget('operations')) tasks.push(loadOperations());
 			if (healthPollingEnabled('service_health')) tasks.push(loadServiceHealth(true));
 			if (healthPollingEnabled('container_health')) tasks.push(loadContainerHealth(true));
+			if (vmPollingEnabled()) tasks.push(loadVmHealth(true));
 			const results = await Promise.allSettled(tasks);
 			if (hasWidget('storage')) await loadStorageDetails();
 			if (needsMetricsHistory()) await loadMetrics();
@@ -452,27 +465,56 @@
 		try {
 			status = await client.call<AppsStatus>('apps.status');
 		} catch {
-			containerHealthFreshness = containerHealth ? 'stale' : 'unavailable';
+			containerHealthFreshness = containerHealth && appsStatus ? 'stale' : 'unavailable';
 			return;
 		}
 
 		if (!status.enabled) {
+			appsStatus = status;
 			containerHealth = summarizeManagedContainers(status, []);
 			containerHealthFreshness = 'current';
 			return;
 		}
-		if (!status.running) {
-			containerHealth = { runtime: 'down', expected: null, running: 0 };
-			containerHealthFreshness = 'current';
-		}
 
 		try {
-			containerHealth = summarizeManagedContainers(status, await client.call<App[]>('apps.list'));
+			const nextContainerHealth = summarizeManagedContainers(status, await client.call<App[]>('apps.list'));
+			appsStatus = status;
+			containerHealth = nextContainerHealth;
 			containerHealthFreshness = 'current';
 		} catch {
-			if (status.running) {
-				containerHealthFreshness = containerHealth ? 'stale' : 'unavailable';
+			if (!status.running) {
+				appsStatus = status;
+				containerHealth = { runtime: 'down', expected: null, running: 0 };
+				containerHealthFreshness = 'current';
+			} else if (containerHealth?.expected != null && appsStatus?.enabled === status.enabled && appsStatus.running === status.running) {
+				containerHealthFreshness = 'stale';
+			} else {
+				appsStatus = status;
+				containerHealth = { runtime: 'running', expected: null, running: null };
+				containerHealthFreshness = 'unavailable';
 			}
+		}
+	}
+
+	function loadVmHealth(markExistingRefreshing = false): Promise<void> {
+		if (vmHealthInFlight) return vmHealthInFlight;
+		if (markExistingRefreshing && vms) vmFreshness = 'refreshing';
+		if (!vms) vmFreshness = 'loading';
+
+		const request = fetchVmHealth();
+		vmHealthInFlight = request;
+		void request.finally(() => {
+			if (vmHealthInFlight === request) vmHealthInFlight = null;
+		});
+		return request;
+	}
+
+	async function fetchVmHealth() {
+		try {
+			vms = await client.call<VmStatus[]>('vm.list');
+			vmFreshness = 'current';
+		} catch {
+			vmFreshness = vms ? 'stale' : 'unavailable';
 		}
 	}
 
@@ -509,6 +551,7 @@
 	async function refreshVisibleData() {
 		if (healthPollingEnabled('service_health')) void loadServiceHealth();
 		if (healthPollingEnabled('container_health')) void loadContainerHealth();
+		if (vmPollingEnabled()) void loadVmHealth();
 		if (refreshInFlight) return;
 		refreshInFlight = true;
 		refreshTick += 1;
@@ -793,6 +836,8 @@
 					<HealthWidget kind="services" services={serviceHealth} freshness={serviceHealthFreshness} {density} />
 				{:else if widget.id === 'container_health'}
 					<HealthWidget kind="containers" containers={containerHealth} freshness={containerHealthFreshness} {density} />
+				{:else if widget.id === 'compute'}
+					<ComputeWidget {vms} {appsStatus} containers={containerHealth} {vmFreshness} containerFreshness={containerHealthFreshness} {density} />
 				{:else if widget.id === 'cpu_load' || widget.id === 'memory_usage' || widget.id === 'cpu_status' || widget.id === 'storage_summary'}
 					<SummaryWidget kind={widget.id} {stats} {filesystems} {filesystemsLoaded} {density} />
 				{:else if widget.id === 'operations'}
