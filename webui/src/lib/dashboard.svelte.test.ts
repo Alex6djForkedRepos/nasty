@@ -64,7 +64,8 @@ describe('dashboard preferences', () => {
 			density: 'compact',
 		});
 		expect(getActiveDashboardView(parsed).widgets[0]).toEqual({ id: 'storage', visible: false, width: 'half', presentation: 'standard', column: 0, row: 0, priority: 0 });
-		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(13);
+		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(14);
+		expect(getActiveDashboardView(parsed).widgets.find((widget) => widget.id === 'compute')).toMatchObject({ visible: false, width: 'half' });
 	});
 
 	test('migrates v2 named views to standard widget presentations', () => {
@@ -196,6 +197,28 @@ describe('dashboard preferences', () => {
 		expect(widgets.find((widget) => widget.id === 'container_health')).toMatchObject({ column: 6, row: 0, priority: 0 });
 	});
 
+	test('adds Compute disabled without disturbing deployed v6 widget placement', () => {
+		const existingWidgets: DashboardWidgetConfig[] = [
+			{ id: 'alerts', visible: false, width: 'full', presentation: 'tiny', column: 0, row: 7, priority: 4 },
+			{ id: 'storage', visible: true, width: 'half', presentation: 'standard', column: 6, row: 3, priority: 2 },
+		];
+		const parsed = parseDashboardPreferences(JSON.stringify({
+			version: 6,
+			preset: 'custom',
+			hiddenPresetTabs: [],
+			activeViewId: 'deployed',
+			customViews: [{ id: 'deployed', name: 'Deployed', density: 'compact', widgets: existingWidgets }],
+		}));
+		const widgets = getActiveDashboardView(parsed).widgets;
+
+		expect(widgets.slice(0, existingWidgets.length)).toEqual(existingWidgets);
+		expect(widgets.find((widget) => widget.id === 'compute')).toMatchObject({
+			visible: false,
+			width: 'half',
+			presentation: 'standard',
+		});
+	});
+
 	test('normalizes named views, active selection, and newly added widget ids', () => {
 		const parsed = parseDashboardPreferences(JSON.stringify({
 			version: 3,
@@ -221,7 +244,7 @@ describe('dashboard preferences', () => {
 		expect(parsed.activeViewId).toBe('ops');
 		expect(parsed.customViews.map((view) => view.id)).toEqual(['ops', 'custom-1']);
 		expect(parsed.customViews.map((view) => view.name)).toEqual(['Operations', 'operations 2']);
-		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(13);
+		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(14);
 		expect(resolveDashboardWidgets(parsed)).not.toContainEqual(expect.objectContaining({ id: 'storage' }));
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'storage')?.presentation).toBe('standard');
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'alerts')?.presentation).toBe('tiny');
@@ -244,7 +267,7 @@ describe('dashboard preferences', () => {
 	test('limits narrow widths to compact-safe presentations', () => {
 		expect(dashboardWidgetSupportsNarrowWidth('alerts', 'standard')).toBe(false);
 		expect(dashboardWidgetSupportsNarrowWidth('alerts', 'tiny')).toBe(true);
-		for (const id of ['service_health', 'container_health', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'] as const) {
+		for (const id of ['service_health', 'container_health', 'compute', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'] as const) {
 			expect(dashboardWidgetSupportsNarrowWidth(id, 'standard')).toBe(true);
 		}
 		expect(dashboardWidgetSupportsNarrowWidth('storage', 'standard')).toBe(false);
@@ -260,6 +283,7 @@ describe('dashboard preferences', () => {
 		expect(dashboardWidgetWidthClass('alerts', 'third')).toContain('xl:col-span-4');
 		expect(dashboardWidgetWidthClass('alerts', 'quarter')).toContain('xl:col-span-3');
 		expect(dashboardWidgetWidthClass('service_health', 'half')).toContain('md:col-span-6');
+		expect(dashboardWidgetWidthClass('compute', 'quarter')).toContain('xl:col-span-3');
 		expect(dashboardWidgetWidthClass('cpu_load', 'quarter')).toContain('lg:col-span-3');
 	});
 
