@@ -64,7 +64,7 @@
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
 	import { theme } from '$lib/theme.svelte';
 	import { terminalStatus } from '$lib/terminalStatus.svelte';
-	import { RELEASE_UPDATE_CHANGED_EVENT, releaseUpdateDisplay, requestReleaseUpdateCheck, shouldCheckReleaseUpdate, type ReleaseUpdateChangedDetail, type ReleaseUpdateRequestState } from '$lib/release-update';
+	import { RELEASE_UPDATE_CHANGED_EVENT, publishReleaseUpdate, releaseUpdateDisplay, requestReleaseUpdateCheck, setReleaseUpdateSnapshot, shouldCheckReleaseUpdate, type ReleaseUpdateChangedDetail, type ReleaseUpdateRequestState } from '$lib/release-update';
 	import { isManagementRole, isStandardUser, redirectForRole } from '$lib/access';
 	import { CORE_RECOVERY_PATHS, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
 
@@ -369,6 +369,7 @@
 	async function loadReleaseUpdate() {
 		const request = ++releaseRequest;
 		releaseRequestState = 'loading';
+		setReleaseUpdateSnapshot(releaseInfo, 'loading');
 		try {
 			let info = await getClient().call<UpdateInfo>('system.update.version');
 			if (request !== releaseRequest) return;
@@ -381,8 +382,12 @@
 				releaseInfo = info;
 			}
 			releaseRequestState = 'ready';
+			publishReleaseUpdate(releaseInfo, 'ready');
 		} catch {
-			if (request === releaseRequest) releaseRequestState = 'failed';
+			if (request === releaseRequest) {
+				releaseRequestState = 'failed';
+				publishReleaseUpdate(releaseInfo, 'failed');
+			}
 		}
 	}
 

@@ -14,6 +14,7 @@ interface UpdateRpcClient {
 }
 
 let updateCheckInFlight: Promise<UpdateInfo> | null = null;
+let releaseUpdateSnapshot: ReleaseUpdateChangedDetail | null = null;
 const UPDATE_CHECK_TIMEOUT_MS = 180_000;
 
 export interface ReleaseUpdateDisplay {
@@ -32,10 +33,22 @@ export function publishReleaseUpdate(
 	info: UpdateInfo | null,
 	requestState: ReleaseUpdateRequestState,
 ) {
+	setReleaseUpdateSnapshot(info, requestState);
 	if (typeof window === 'undefined') return;
 	window.dispatchEvent(new CustomEvent<ReleaseUpdateChangedDetail>(RELEASE_UPDATE_CHANGED_EVENT, {
 		detail: { info, requestState },
 	}));
+}
+
+export function getReleaseUpdateSnapshot(): ReleaseUpdateChangedDetail | null {
+	return releaseUpdateSnapshot;
+}
+
+export function setReleaseUpdateSnapshot(
+	info: UpdateInfo | null,
+	requestState: ReleaseUpdateRequestState,
+) {
+	releaseUpdateSnapshot = { info, requestState };
 }
 
 export function requestReleaseUpdateCheck(client: UpdateRpcClient): Promise<UpdateInfo> {
@@ -47,6 +60,10 @@ export function requestReleaseUpdateCheck(client: UpdateRpcClient): Promise<Upda
 	};
 	request.then(clear, clear);
 	return request;
+}
+
+export function invalidateReleaseUpdateCheck() {
+	updateCheckInFlight = null;
 }
 
 export function releaseUpdateDisplay(

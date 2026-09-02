@@ -28,7 +28,7 @@
 		shouldShowUpdateStatus,
 		versionUpdatePhases
 	} from '$lib/update-progress';
-	import { publishReleaseUpdate, requestReleaseUpdateCheck } from '$lib/release-update';
+	import { getReleaseUpdateSnapshot, invalidateReleaseUpdateCheck, publishReleaseUpdate, RELEASE_UPDATE_CHANGED_EVENT, requestReleaseUpdateCheck, type ReleaseUpdateChangedDetail } from '$lib/release-update';
 
 	type Tab = 'version' | 'generations' | 'firmware';
 	type VersionRow = {
@@ -65,6 +65,7 @@
 
 	const client = getClient();
 	const VERSION_PAGE_ACTION_KEY = 'nasty.version-page.action';
+	const initialReleaseUpdate = getReleaseUpdateSnapshot();
 
 	let activeTab: Tab = $state(
 		typeof window !== 'undefined' && window.location.hash === '#generations' ? 'generations'
@@ -73,14 +74,16 @@
 	);
 
 	let info = $state<UpdateInfo | null>(null);
-	let checkInfo = $state<UpdateInfo | null>(null);
+	let checkInfo = $state<UpdateInfo | null>(
+		initialReleaseUpdate?.requestState === 'ready' ? initialReleaseUpdate.info : null
+	);
 	let buildDir = $state<UpdateBuildDirConfig | null>(null);
 	let buildDirDraft = $state<string>('');
 	let savingBuildDir = $state(false);
 	const summaryInputs: VersionInputInfo[] | null = $derived(
 		checkInfo?.inputs ?? info?.inputs ?? null
 	);
-	let checking = $state(false);
+	let checking = $state(initialReleaseUpdate?.requestState === 'loading');
 	let startingDevUpgrade = $state(false);
 	let taggedReleaseBanner: TaggedReleaseBannerState = $state({ kind: 'loading' });
 	let versionRows: VersionRow[] = $state([]);
@@ -98,6 +101,7 @@
 	let logEl: HTMLPreElement | undefined = $state();
 	let logCollapsed = $state(true);
 	let taggedReleaseBannerRequestId = 0;
+	let releaseCheckRequestId = 0;
 
 	let generations: Generation[] = $state([]);
 	let generationsLoading = $state(false);
@@ -184,6 +188,13 @@
 	});
 
 	onMount(() => {
+		const applyReleaseUpdate = (detail: ReleaseUpdateChangedDetail) => {
+			checking = detail.requestState === 'loading';
+			if (detail.requestState === 'ready') checkInfo = detail.info;
+		};
+		const handleReleaseUpdateChanged = (event: Event) => {
+			applyReleaseUpdate((event as CustomEvent<ReleaseUpdateChangedDetail>).detail);
+		};
 		const onReconnect = () => {
 			Promise.all([
 				loadVersionPage(),
@@ -200,9 +211,13 @@
 		});
 
 		client.onReconnect(onReconnect);
+		window.addEventListener(RELEASE_UPDATE_CHANGED_EVENT, handleReleaseUpdateChanged);
+		const releaseUpdate = getReleaseUpdateSnapshot();
+		if (releaseUpdate) applyReleaseUpdate(releaseUpdate);
 
 		return () => {
 			client.offReconnect(onReconnect);
+			window.removeEventListener(RELEASE_UPDATE_CHANGED_EVENT, handleReleaseUpdateChanged);
 		};
 	});
 
@@ -379,6 +394,7 @@
 		taggedReleaseBanner = { kind: 'switching' };
 		logCollapsed = false;
 		status = { state: 'running', log: '', reboot_required: false, webui_changed: false };
+		clearReleaseUpdateCheck();
 		const result = await withToast(
 			() => client.call('system.version.switch', {
 				inputs: versionRows.map((row) => ({
@@ -439,6 +455,7 @@
 		startingUpgrade = true;
 		logCollapsed = false;
 		status = { state: 'running', log: '', reboot_required: false, webui_changed: false };
+		clearReleaseUpdateCheck();
 		const result = await withToast(
 			() => client.call('system.version.upgrade_tagged_release', undefined, 120000),
 			'Tagged release upgrade started'
@@ -452,16 +469,29 @@
 	}
 
 	async function checkForUpdates() {
+		const requestId = ++releaseCheckRequestId;
 		checking = true;
 		publishReleaseUpdate(checkInfo ?? info, 'loading');
 		try {
-			checkInfo = await requestReleaseUpdateCheck(client);
+			const next = await requestReleaseUpdateCheck(client);
+			if (requestId !== releaseCheckRequestId) return;
+			checkInfo = next;
 			publishReleaseUpdate(checkInfo, 'ready');
 		} catch {
+			if (requestId !== releaseCheckRequestId) return;
 			checkInfo = null;
 			publishReleaseUpdate(null, 'failed');
+		} finally {
+			if (requestId === releaseCheckRequestId) checking = false;
 		}
+	}
+
+	function clearReleaseUpdateCheck() {
+		releaseCheckRequestId++;
+		invalidateReleaseUpdateCheck();
 		checking = false;
+		checkInfo = null;
+		publishReleaseUpdate(null, 'idle');
 	}
 
 	async function saveBuildDir() {
@@ -490,6 +520,7 @@
 		startingDevUpgrade = true;
 		logCollapsed = false;
 		status = { state: 'running', log: '', reboot_required: false, webui_changed: false };
+		clearReleaseUpdateCheck();
 		const result = await withToast(
 			() => client.call('system.version.switch', {
 				inputs: versionRows.map((row) => ({
@@ -523,7 +554,7 @@
 					status = await client.call<UpdateStatus>('system.update.status');
 					if (status && (status.state === 'success' || status.state === 'failed')) {
 						stopPolling();
-						checkInfo = null; // clear stale "available" after upgrade
+						clearReleaseUpdateCheck();
 						await loadVersionPage();
 						writeVersionPageAction(null);
 						// Nudge the layout's cached sysInfo so the top-bar
@@ -585,6 +616,7 @@
 
 		logCollapsed = false;
 		status = { state: 'running', log: '', reboot_required: false, webui_changed: false };
+		clearReleaseUpdateCheck();
 		const ok = await withToast(
 			() => client.call('system.generations.switch', { generation: gen }),
 			`Switching to generation ${gen}`

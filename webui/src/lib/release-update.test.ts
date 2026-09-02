@@ -1,11 +1,15 @@
 import { describe, expect, test } from 'vitest';
-import { releaseUpdateDisplay, requestReleaseUpdateCheck, shouldCheckReleaseUpdate } from './release-update';
+import type { UpdateInfo } from './types';
+import { getReleaseUpdateSnapshot, invalidateReleaseUpdateCheck, publishReleaseUpdate, releaseUpdateDisplay, requestReleaseUpdateCheck, setReleaseUpdateSnapshot, shouldCheckReleaseUpdate } from './release-update';
 
-const info = {
+const info: UpdateInfo = {
 	current_version: '1.2.3',
 	latest_version: '1.2.4',
 	update_available: null,
+	channel: 'mild',
+	last_attempt: null,
 	error: null,
+	inputs: null,
 };
 
 describe('release update display', () => {
@@ -46,6 +50,18 @@ describe('release update display', () => {
 		expect(shouldCheckReleaseUpdate({ ...info, error: 'offline' })).toBe(false);
 	});
 
+	test('retains the latest check state for routes mounted after it completes', () => {
+		setReleaseUpdateSnapshot(null, 'loading');
+		expect(getReleaseUpdateSnapshot()).toEqual({ info: null, requestState: 'loading' });
+
+		const available = { ...info, update_available: true };
+		publishReleaseUpdate(available, 'ready');
+		expect(getReleaseUpdateSnapshot()).toEqual({ info: available, requestState: 'ready' });
+
+		publishReleaseUpdate(null, 'idle');
+		expect(getReleaseUpdateSnapshot()).toEqual({ info: null, requestState: 'idle' });
+	});
+
 	test('deduplicates concurrent remote checks', async () => {
 		let resolve!: (value: typeof info) => void;
 		let calls = 0;
@@ -70,5 +86,27 @@ describe('release update display', () => {
 		expect(calls).toBe(2);
 		resolve(info);
 		await third;
+	});
+
+	test('starts a fresh check after the previous request is invalidated', async () => {
+		const resolvers: ((value: UpdateInfo) => void)[] = [];
+		let calls = 0;
+		const client = {
+			call: <T>() => {
+				calls++;
+				return new Promise<UpdateInfo>((resolve) => { resolvers.push(resolve); }) as Promise<T>;
+			},
+		};
+		const stale = requestReleaseUpdateCheck(client);
+		invalidateReleaseUpdateCheck();
+		const fresh = requestReleaseUpdateCheck(client);
+
+		expect(fresh).not.toBe(stale);
+		expect(calls).toBe(2);
+		resolvers[0](info);
+		await stale;
+		expect(requestReleaseUpdateCheck(client)).toBe(fresh);
+		resolvers[1](info);
+		await fresh;
 	});
 });
