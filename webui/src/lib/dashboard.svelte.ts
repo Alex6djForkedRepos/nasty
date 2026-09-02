@@ -131,6 +131,30 @@ export function dashboardWidgetWidthClass(id: DashboardWidgetId, width: Dashboar
 	return `min-w-0 ${responsive} xl:col-span-12`;
 }
 
+export function updateDashboardWidgetAppearance(
+	widgets: DashboardWidgetConfig[],
+	id: DashboardWidgetId,
+	patch: Partial<Pick<DashboardWidgetConfig, 'width' | 'presentation'>>,
+): DashboardWidgetConfig[] {
+	return widgets.map((widget) => {
+		if (widget.id !== id) return widget;
+		const presentation = patch.presentation === 'tiny' && dashboardWidgetSupportsTiny(id)
+			? 'tiny'
+			: patch.presentation === 'standard' ? 'standard' : widget.presentation;
+		const requestedWidth = patch.width ?? widget.width;
+		const width = (requestedWidth === 'quarter' || requestedWidth === 'third')
+			&& !dashboardWidgetSupportsNarrowWidth(id, presentation)
+			? 'half'
+			: requestedWidth;
+		return {
+			...widget,
+			width,
+			presentation,
+			column: dashboardWidgetSnapColumn(width, widget.column),
+		};
+	});
+}
+
 type DashboardWidgetDefinition = Omit<DashboardWidgetConfig, 'column' | 'row' | 'priority'>;
 
 function positionWidgets(widgets: DashboardWidgetDefinition[]): DashboardWidgetConfig[] {

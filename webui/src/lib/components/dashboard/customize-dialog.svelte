@@ -7,7 +7,6 @@
 		dashboardPresets,
 		dashboardViewNameAvailable,
 		dashboardWidgetMeta,
-		dashboardWidgetSnapColumn,
 		dashboardWidgetSupportsNarrowWidth,
 		dashboardWidgetSupportsTiny,
 		defaultDashboardPreferences,
@@ -16,6 +15,7 @@
 		renameDashboardView,
 		selectDashboardView,
 		setDashboardPresetTabVisible,
+		updateDashboardWidgetAppearance,
 		updateActiveDashboardView,
 		type DashboardPreferences,
 		type DashboardOptionalPreset,
@@ -106,13 +106,8 @@
 	function updatePresentation(index: number, value: string) {
 		const widget = activeView.widgets[index];
 		const presentation = value === 'tiny' && dashboardWidgetSupportsTiny(widget.id) ? 'tiny' : 'standard';
-		const width = (widget.width === 'quarter' || widget.width === 'third') && !dashboardWidgetSupportsNarrowWidth(widget.id, presentation)
-			? 'half'
-			: widget.width;
-		updateWidget(index, {
-			presentation,
-			width,
-			column: dashboardWidgetSnapColumn(width, widget.column),
+		draft = updateActiveDashboardView(draft, {
+			widgets: updateDashboardWidgetAppearance(activeView.widgets, widget.id, { presentation }),
 		});
 	}
 
@@ -129,7 +124,9 @@
 	function updateWidth(index: number, value: string) {
 		const widget = activeView.widgets[index];
 		const width = parseWidgetWidth(value);
-		updateWidget(index, { width, column: dashboardWidgetSnapColumn(width, widget.column) });
+		draft = updateActiveDashboardView(draft, {
+			widgets: updateDashboardWidgetAppearance(activeView.widgets, widget.id, { width }),
+		});
 	}
 
 	function resetCustom() {

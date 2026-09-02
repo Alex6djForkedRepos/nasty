@@ -7,6 +7,7 @@ import HistoryWidget from './history-widget.svelte';
 import OperationsWidget from './operations-widget.svelte';
 import SummaryWidget from './summary-widget.svelte';
 import SystemWidget from './system-widget.svelte';
+import WidgetOptions from './widget-options.svelte';
 import type { ActiveAlert, AppsStatus, Filesystem, SystemInfo, SystemStats, VmStatus } from '$lib/types';
 
 const alert = (severity: ActiveAlert['severity'], message: string): ActiveAlert => ({
@@ -344,5 +345,31 @@ describe('dashboard resource summary widgets', () => {
 		expect(status).toContain('CPU temperature and frequency are unavailable.');
 		expect(storage).toContain('No filesystems');
 		expect(unavailableStorage).toContain('Filesystem inventory could not be loaded.');
+	});
+});
+
+describe('dashboard widget options', () => {
+	test('offers supported widths and presentation modes', () => {
+		const configurable = render(WidgetOptions, {
+			props: {
+				widget: { id: 'alerts', visible: true, width: 'quarter', presentation: 'tiny', column: 0, row: 0, priority: 0 },
+				onChange: () => undefined,
+			},
+		}).body;
+		const standardOnly = render(WidgetOptions, {
+			props: {
+				widget: { id: 'storage', visible: true, width: 'full', presentation: 'standard', column: 0, row: 0, priority: 0 },
+				onChange: () => undefined,
+			},
+		}).body;
+
+		expect(configurable).toContain('Configure Alerts widget');
+		expect(configurable).toContain('1/4 width');
+		expect(configurable).toContain('Presentation');
+		expect(configurable).toContain('Tiny');
+		expect(standardOnly).toContain('Full width');
+		expect(standardOnly).toContain('1/2 width');
+		expect(standardOnly).not.toContain('1/4 width');
+		expect(standardOnly).not.toContain('Presentation');
 	});
 });
