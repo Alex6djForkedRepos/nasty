@@ -8,17 +8,22 @@
 		dashboardPrefs,
 		dashboardPresetTabVisible,
 		dashboardPresets,
+		dashboardWidgetColumnSpan,
 		dashboardWidgetMeta,
+		dashboardWidgetValidColumns,
 		dashboardWidgetWidthClass,
 		getActiveDashboardView,
+		layoutDashboardWidgets,
+		placeDashboardWidget,
 		resolveDashboardDensity,
 		resolveDashboardWidgets,
 		selectDashboardView,
-		swapDashboardWidgets,
 		updateActiveDashboardView,
 		type DashboardPreferences,
 		type DashboardFixedPreset,
+		type DashboardWidgetConfig,
 		type DashboardWidgetId,
+		type DashboardWidgetRowSpans,
 	} from '$lib/dashboard.svelte';
 	import type {
 		ActiveAlert,
@@ -57,7 +62,7 @@
 	import StorageWidget from '$lib/components/dashboard/storage-widget.svelte';
 	import SummaryWidget from '$lib/components/dashboard/summary-widget.svelte';
 	import SystemWidget from '$lib/components/dashboard/system-widget.svelte';
-	import { ArrowDown, ArrowUp, GripVertical, Settings2 } from '@lucide/svelte';
+	import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, GripVertical, Settings2 } from '@lucide/svelte';
 
 	type MetricsRange = '5m' | '1h' | '1d' | '7d' | '30d';
 	type DiskRate = { readRate: number; writeRate: number };
@@ -119,7 +124,11 @@
 	let historyLoading = $state(false);
 	let historyRequest = 0;
 	let draggedWidget = $state<DashboardWidgetId | null>(null);
-	let dragTargetWidget = $state<DashboardWidgetId | null>(null);
+	let dragTarget = $state<{ column: number; row: number } | null>(null);
+	let dragOrigin: { column: number; row: number } | null = null;
+	let dragOffset = { x: 0, y: 0 };
+	let dragRowMetrics = $state({ height: 8, gap: 16 });
+	let widgetRowSpans = $state<DashboardWidgetRowSpans>({});
 	let movementAnnouncement = $state('');
 
 	const networkHistory = createIoHistory();
@@ -130,6 +139,14 @@
 	let widgets = $derived(resolveDashboardWidgets(dashboardPrefs.value));
 	let density = $derived(resolveDashboardDensity(dashboardPrefs.value));
 	let activeCustomView = $derived(getActiveDashboardView(dashboardPrefs.value));
+	let gridLayout = $derived(layoutDashboardWidgets(widgets, widgetRowSpans));
+	let draggedConfig = $derived(widgets.find((widget) => widget.id === draggedWidget));
+	let validDropColumns = $derived(draggedConfig ? dashboardWidgetValidColumns(draggedConfig.width) : []);
+	let dragLayout = $derived(draggedWidget && dragTarget
+		? layoutDashboardWidgets(widgets, widgetRowSpans, { id: draggedWidget, ...dragTarget })
+		: null
+	);
+	let dragPreview = $derived(draggedWidget && dragLayout ? dragLayout[draggedWidget] : null);
 	let presetLabel = $derived(
 		dashboardPrefs.value.preset === 'custom'
 			? activeCustomView.name
@@ -161,7 +178,7 @@
 		return shouldPollDashboardHealth(hasWidget(id), document.hidden);
 	}
 
-	function masonryItem(node: HTMLElement) {
+	function masonryItem(node: HTMLElement, id: DashboardWidgetId) {
 		let frame = 0;
 		const update = () => {
 			cancelAnimationFrame(frame);
@@ -170,7 +187,8 @@
 				const rowHeight = Number.parseFloat(gridStyle.gridAutoRows) || 8;
 				const gap = Number.parseFloat(gridStyle.rowGap) || 0;
 				const rows = Math.ceil((node.getBoundingClientRect().height + gap) / (rowHeight + gap));
-				node.style.gridRowEnd = `span ${Math.max(1, rows)}`;
+				const rowSpan = Math.max(1, rows);
+				if (widgetRowSpans[id] !== rowSpan) widgetRowSpans = { ...widgetRowSpans, [id]: rowSpan };
 			});
 		};
 		const observer = new ResizeObserver(update);
@@ -184,44 +202,117 @@
 		};
 	}
 
-	function swapCustomWidgets(source: DashboardWidgetId, target: DashboardWidgetId) {
+	function saveWidgetPlacement(id: DashboardWidgetId, column: number, row: number) {
 		const preferences = dashboardPrefs.value;
-		if (preferences.preset !== 'custom' || source === target) return;
+		if (preferences.preset !== 'custom') return;
 		dashboardPrefs.set(updateActiveDashboardView(preferences, {
-			widgets: swapDashboardWidgets(getActiveDashboardView(preferences).widgets, source, target),
+			widgets: placeDashboardWidget(getActiveDashboardView(preferences).widgets, id, column, row),
 		}));
-		movementAnnouncement = `${dashboardWidgetMeta[source].label} swapped with ${dashboardWidgetMeta[target].label}.`;
 	}
 
-	function moveCustomWidget(id: DashboardWidgetId, direction: -1 | 1) {
-		const index = widgets.findIndex((widget) => widget.id === id);
-		const target = widgets[index + direction];
-		if (index < 0 || !target) return;
-		swapCustomWidgets(id, target.id);
+	function announceMovement(message: string) {
+		movementAnnouncement = '';
+		requestAnimationFrame(() => movementAnnouncement = message);
+	}
+
+	function moveCustomWidget(id: DashboardWidgetId, horizontal: -1 | 0 | 1, vertical: -1 | 0 | 1) {
+		const position = gridLayout[id];
+		const widget = widgets.find((candidate) => candidate.id === id);
+		if (!position || !widget) return;
+		const column = position.column + horizontal * dashboardWidgetColumnSpan(widget.width);
+		let row = vertical < 0
+			? Math.max(0, widget.row - position.rowSpan)
+			: position.row + vertical * position.rowSpan;
+		if (column < 0 || column + position.columnSpan > 12) return;
+		let proposed = layoutDashboardWidgets(widgets, widgetRowSpans, { id, column, row })[id];
+		while (vertical < 0 && proposed && proposed.row >= position.row && row > 0) {
+			row = Math.max(0, row - position.rowSpan);
+			proposed = layoutDashboardWidgets(widgets, widgetRowSpans, { id, column, row })[id];
+		}
+		if (!proposed || (proposed.column === position.column && proposed.row === position.row)) return;
+		saveWidgetPlacement(id, column, row);
+		announceMovement(`${dashboardWidgetMeta[id].label} moved ${horizontal < 0 ? 'left' : horizontal > 0 ? 'right' : vertical < 0 ? 'up' : 'down'}.`);
+	}
+
+	function moveCustomWidgetInOrder(id: DashboardWidgetId, direction: -1 | 1) {
+		const preferences = dashboardPrefs.value;
+		if (preferences.preset !== 'custom') return;
+		const target = widgets[widgets.findIndex((widget) => widget.id === id) + direction];
+		if (!target) return;
+		const activeWidgets = getActiveDashboardView(preferences).widgets.map((widget) => ({ ...widget }));
+		const sourceIndex = activeWidgets.findIndex((widget) => widget.id === id);
+		const targetIndex = activeWidgets.findIndex((widget) => widget.id === target.id);
+		[activeWidgets[sourceIndex], activeWidgets[targetIndex]] = [activeWidgets[targetIndex], activeWidgets[sourceIndex]];
+		dashboardPrefs.set(updateActiveDashboardView(preferences, { widgets: activeWidgets }));
+		announceMovement(`${dashboardWidgetMeta[id].label} moved ${direction < 0 ? 'earlier' : 'later'} in the stacked layout.`);
 	}
 
 	function startWidgetDrag(event: DragEvent, id: DashboardWidgetId) {
 		draggedWidget = id;
+		const position = gridLayout[id];
+		dragTarget = position ? { column: position.column, row: position.row } : null;
+		dragOrigin = dragTarget;
+		const widget = (event.currentTarget as HTMLElement).closest<HTMLElement>('[data-dashboard-widget]');
+		const rect = widget?.getBoundingClientRect();
+		dragOffset = rect ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : { x: 0, y: 0 };
 		event.dataTransfer?.setData('text/plain', id);
 		if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
 	}
 
-	function targetWidgetDrag(event: DragEvent, id: DashboardWidgetId) {
-		if (!draggedWidget || draggedWidget === id) return;
+	function targetGridDrag(event: DragEvent) {
+		if (!draggedWidget || !draggedConfig) return;
 		event.preventDefault();
-		dragTargetWidget = id;
 		if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+		const grid = event.currentTarget as HTMLElement;
+		const rect = grid.getBoundingClientRect();
+		const style = getComputedStyle(grid);
+		const rowHeight = Number.parseFloat(style.gridAutoRows) || 8;
+		const rowGap = Number.parseFloat(style.rowGap) || 0;
+		dragRowMetrics = { height: rowHeight, gap: rowGap };
+		const columnGap = Number.parseFloat(style.columnGap) || 0;
+		const columnWidth = (rect.width - columnGap * 11) / 12;
+		const requestedLeft = event.clientX - rect.left - dragOffset.x;
+		const column = dashboardWidgetValidColumns(draggedConfig.width).reduce((nearest, candidate) =>
+			Math.abs(candidate * (columnWidth + columnGap) - requestedLeft) < Math.abs(nearest * (columnWidth + columnGap) - requestedLeft)
+				? candidate
+				: nearest
+		);
+		dragTarget = {
+			column,
+			row: Math.max(0, Math.round((event.clientY - rect.top - dragOffset.y) / (rowHeight + rowGap))),
+		};
 	}
 
-	function dropWidget(event: DragEvent, target: DashboardWidgetId) {
+	function dropWidget(event: DragEvent) {
 		event.preventDefault();
-		if (draggedWidget) swapCustomWidgets(draggedWidget, target);
+		if (draggedWidget && dragTarget && dragPreview && dragOrigin
+			&& (dragTarget.column !== dragOrigin.column || dragTarget.row !== dragOrigin.row)
+			&& (dragPreview.column !== dragOrigin.column || dragPreview.row !== dragOrigin.row)) {
+			saveWidgetPlacement(draggedWidget, dragTarget.column, dragTarget.row);
+			announceMovement(`${dashboardWidgetMeta[draggedWidget].label} moved to grid column ${dragTarget.column + 1}.`);
+		}
 		endWidgetDrag();
 	}
 
 	function endWidgetDrag() {
 		draggedWidget = null;
-		dragTargetWidget = null;
+		dragTarget = null;
+		dragOrigin = null;
+	}
+
+	function widgetGridStyle(widget: DashboardWidgetConfig): string {
+		const position = gridLayout[widget.id];
+		return position
+			? `--dashboard-column: ${position.column + 1}; --dashboard-row: ${position.row + 1}; grid-row-end: span ${position.rowSpan};`
+			: '';
+	}
+
+	function previewTop(row: number): number {
+		return row * (dragRowMetrics.height + dragRowMetrics.gap);
+	}
+
+	function previewHeight(rowSpan: number): number {
+		return rowSpan * dragRowMetrics.height + Math.max(0, rowSpan - 1) * dragRowMetrics.gap;
 	}
 
 	function handleEvent(_: string, params: unknown) {
@@ -612,6 +703,7 @@
 		<div>
 			<div class="text-sm font-semibold">{presetLabel} dashboard</div>
 			<div class="text-xs text-muted-foreground">{widgets.length} visible widget{widgets.length === 1 ? '' : 's'} - {density} density</div>
+			{#if dashboardPrefs.value.preset === 'custom'}<div class="hidden text-xs text-muted-foreground xl:block">Drag a widget handle into a highlighted grid lane, or use its direction controls.</div>{/if}
 		</div>
 		<Button variant="outline" size="sm" onclick={() => customizeOpen = true}><Settings2 /> Customize</Button>
 	</div>
@@ -643,15 +735,31 @@
 {#if loading}
 	<Card><CardContent class="py-10 text-center text-sm text-muted-foreground">Loading dashboard...</CardContent></Card>
 {:else}
-	<div class="grid grid-cols-12 auto-rows-[8px] gap-4">
+	<div class="relative grid grid-cols-12 auto-rows-[8px] gap-4" role="group" aria-label="Dashboard widget grid" ondragover={targetGridDrag} ondrop={dropWidget}>
+		{#if draggedWidget && draggedConfig}
+			<div class="pointer-events-none absolute inset-0 z-20 hidden grid-cols-12 grid-rows-1 gap-4 xl:grid" aria-hidden="true">
+				{#each validDropColumns as column}
+					<div
+						class="h-full rounded-lg border border-dashed transition-colors {dragTarget?.column === column ? 'border-primary/70 bg-primary/10' : 'border-border/60 bg-muted/10'}"
+						style={`grid-column: ${column + 1} / span ${dashboardWidgetColumnSpan(draggedConfig.width)}; grid-row: 1;`}
+					></div>
+				{/each}
+				{#if dragPreview}
+					<div class="relative h-full" style={`grid-column: ${dragPreview.column + 1} / span ${dragPreview.columnSpan}; grid-row: 1;`}>
+						<div class="absolute inset-x-0 rounded-lg border-2 border-primary bg-primary/15 shadow-lg" style={`top: ${previewTop(dragPreview.row)}px; height: ${previewHeight(dragPreview.rowSpan)}px;`}></div>
+					</div>
+				{/if}
+			</div>
+		{/if}
 		{#each widgets as widget (widget.id)}
+			{@const position = gridLayout[widget.id]}
 			<div
-				use:masonryItem
+				use:masonryItem={widget.id}
 				role="group"
 				aria-label={dashboardWidgetMeta[widget.id].label}
-				class="self-start rounded-lg transition-shadow {dashboardWidgetWidthClass(widget.id, widget.width)} {dragTargetWidget === widget.id ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}"
-				ondragover={(event) => targetWidgetDrag(event, widget.id)}
-				ondrop={(event) => dropWidget(event, widget.id)}
+				data-dashboard-widget={widget.id}
+				style={widgetGridStyle(widget)}
+				class="self-start rounded-lg transition-[opacity,box-shadow] {dashboardWidgetWidthClass(widget.id, widget.width)} {dashboardPrefs.value.preset === 'custom' ? 'dashboard-positioned' : ''} {draggedWidget === widget.id ? 'opacity-45' : ''}"
 			>
 				{#if dashboardPrefs.value.preset === 'custom' || (widget.id === 'history' && widget.presentation === 'standard')}
 					<div class="mb-1 flex min-h-8 flex-wrap items-center gap-1 text-muted-foreground xl:flex-nowrap">
@@ -663,10 +771,16 @@
 							<HistoryControls range={metricsRange} offset={metricsOffset} loading={historyLoading} class="ml-auto" onRange={(range) => void changeRange(range)} onBack={() => void navigateBack()} onForward={() => void navigateForward()} onLive={() => void navigateLive()} />
 						{/if}
 						{#if dashboardPrefs.value.preset === 'custom'}
-							<div class={widget.id === 'history' && widget.presentation === 'standard' ? 'flex' : 'ml-auto flex'}>
-								<button type="button" onclick={() => moveCustomWidget(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
-								<button type="button" onclick={() => moveCustomWidget(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1 hover:bg-accent hover:text-foreground disabled:opacity-30" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
-								<button type="button" draggable={true} onclick={() => moveCustomWidget(widget.id, widgets.at(-1)?.id === widget.id ? -1 : 1)} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="cursor-grab rounded p-1 hover:bg-accent hover:text-foreground active:cursor-grabbing" aria-label={`Drag ${dashboardWidgetMeta[widget.id].label} to swap positions, or activate to move it ${widgets.at(-1)?.id === widget.id ? 'earlier' : 'later'}`} title="Drag to swap positions"><GripVertical class="h-3.5 w-3.5" /></button>
+							<div class="ml-auto flex xl:hidden">
+								<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
+							</div>
+							<div class="ml-auto hidden opacity-50 transition-opacity hover:opacity-100 focus-within:opacity-100 xl:flex">
+								<button type="button" onclick={() => moveCustomWidget(widget.id, -1, 0)} disabled={!position || position.column === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} left`}><ArrowLeft class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 1, 0)} disabled={!position || position.column + position.columnSpan >= 12} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} right`}><ArrowRight class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 0, -1)} disabled={!position || position.row === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 0, 1)} class="rounded p-1.5 hover:bg-accent hover:text-foreground" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown class="h-3.5 w-3.5" /></button>
+								<span draggable={true} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="inline-flex cursor-grab rounded p-1.5 hover:bg-accent hover:text-foreground active:cursor-grabbing" title="Drag to a grid position" aria-hidden="true"><GripVertical class="h-3.5 w-3.5" /></span>
 							</div>
 						{/if}
 					</div>
@@ -701,3 +815,12 @@
 </div>
 
 <CustomizeDialog bind:open={customizeOpen} preferences={dashboardPrefs.value} onSave={(preferences) => void applyPreferences(preferences)} />
+
+<style>
+	@media (min-width: 80rem) {
+		.dashboard-positioned {
+			grid-column-start: var(--dashboard-column);
+			grid-row-start: var(--dashboard-row);
+		}
+	}
+</style>

@@ -7,6 +7,7 @@
 		dashboardPresets,
 		dashboardViewNameAvailable,
 		dashboardWidgetMeta,
+		dashboardWidgetSnapColumn,
 		dashboardWidgetSupportsNarrowWidth,
 		dashboardWidgetSupportsTiny,
 		defaultDashboardPreferences,
@@ -23,7 +24,7 @@
 	} from '$lib/dashboard.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
-	import { ArrowDown, ArrowUp, Copy, LayoutDashboard, Pencil, Plus, RotateCcw, Trash2 } from '@lucide/svelte';
+	import { Copy, LayoutDashboard, Pencil, Plus, RotateCcw, Trash2 } from '@lucide/svelte';
 
 	type NameAction = 'create' | 'duplicate' | 'rename';
 
@@ -105,11 +106,13 @@
 	function updatePresentation(index: number, value: string) {
 		const widget = activeView.widgets[index];
 		const presentation = value === 'tiny' && dashboardWidgetSupportsTiny(widget.id) ? 'tiny' : 'standard';
+		const width = (widget.width === 'quarter' || widget.width === 'third') && !dashboardWidgetSupportsNarrowWidth(widget.id, presentation)
+			? 'half'
+			: widget.width;
 		updateWidget(index, {
 			presentation,
-			width: (widget.width === 'quarter' || widget.width === 'third') && !dashboardWidgetSupportsNarrowWidth(widget.id, presentation)
-				? 'half'
-				: widget.width,
+			width,
+			column: dashboardWidgetSnapColumn(width, widget.column),
 		});
 	}
 
@@ -123,12 +126,10 @@
 		return value === 'quarter' || value === 'third' || value === 'half' ? value : 'full';
 	}
 
-	function moveWidget(index: number, direction: -1 | 1) {
-		const target = index + direction;
-		if (target < 0 || target >= activeView.widgets.length) return;
-		const widgets = activeView.widgets.map((widget) => ({ ...widget }));
-		[widgets[index], widgets[target]] = [widgets[target], widgets[index]];
-		draft = updateActiveDashboardView(draft, { widgets });
+	function updateWidth(index: number, value: string) {
+		const widget = activeView.widgets[index];
+		const width = parseWidgetWidth(value);
+		updateWidget(index, { width, column: dashboardWidgetSnapColumn(width, widget.column) });
 	}
 
 	function resetCustom() {
@@ -279,7 +280,7 @@
 				</div>
 
 				<div class="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-5">
-					<div><h3 class="text-sm font-semibold">{activeView.name} widgets</h3><p class="text-xs text-muted-foreground">Widgets use a 12-column wide-screen grid and can span the full row, one half, one third, or one quarter.</p></div>
+					<div><h3 class="text-sm font-semibold">{activeView.name} widgets</h3><p class="text-xs text-muted-foreground">Choose widget sizes here, then place visible widgets directly on the wide-screen dashboard grid.</p></div>
 					<div class="flex items-center gap-2">
 						<label for="dashboard-density" class="text-xs font-medium text-muted-foreground">Density</label>
 						<select id="dashboard-density" value={activeView.density} onchange={(event) => updateDensity(event.currentTarget.value)} class="h-8 rounded-md border border-border bg-background px-2 text-xs">
@@ -296,11 +297,7 @@
 							{#if dashboardWidgetSupportsTiny(widget.id)}
 								<select value={widget.presentation} disabled={!widget.visible} onchange={(event) => updatePresentation(index, event.currentTarget.value)} aria-label={`${dashboardWidgetMeta[widget.id].label} presentation`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="standard">Standard</option><option value="tiny">Tiny</option></select>
 							{/if}
-							<select value={widget.width} disabled={!widget.visible} onchange={(event) => updateWidget(index, { width: parseWidgetWidth(event.currentTarget.value) })} aria-label={`${dashboardWidgetMeta[widget.id].label} width`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="full">Full</option><option value="half">1/2</option>{#if dashboardWidgetSupportsNarrowWidth(widget.id, widget.presentation)}<option value="third">1/3</option><option value="quarter">1/4</option>{/if}</select>
-							<div class="flex">
-								<Button variant="ghost" size="icon-sm" disabled={index === 0} onclick={() => moveWidget(index, -1)} aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp /></Button>
-								<Button variant="ghost" size="icon-sm" disabled={index === activeView.widgets.length - 1} onclick={() => moveWidget(index, 1)} aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown /></Button>
-							</div>
+							<select value={widget.width} disabled={!widget.visible} onchange={(event) => updateWidth(index, event.currentTarget.value)} aria-label={`${dashboardWidgetMeta[widget.id].label} width`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="full">Full</option><option value="half">1/2</option>{#if dashboardWidgetSupportsNarrowWidth(widget.id, widget.presentation)}<option value="third">1/3</option><option value="quarter">1/4</option>{/if}</select>
 						</div>
 					{/each}
 				</div>

@@ -5,27 +5,32 @@ import {
 	LEGACY_DASHBOARD_V2_PREFERENCES_KEY,
 	LEGACY_DASHBOARD_V3_PREFERENCES_KEY,
 	LEGACY_DASHBOARD_V4_PREFERENCES_KEY,
+	LEGACY_DASHBOARD_V5_PREFERENCES_KEY,
 	createDashboardView,
 	dashboardPrefs,
 	dashboardPresetTabVisible,
 	dashboardViewNameAvailable,
 	dashboardWidgetIds,
+	dashboardWidgetSnapColumn,
 	dashboardWidgetSupportsTiny,
 	dashboardWidgetSupportsNarrowWidth,
+	dashboardWidgetValidColumns,
 	dashboardWidgetWidthClass,
 	defaultDashboardPreferences,
 	deleteDashboardView,
 	getActiveDashboardView,
 	initializeDashboardPreferences,
+	layoutDashboardWidgets,
 	loadDashboardPreferences,
 	parseDashboardPreferences,
+	placeDashboardWidget,
 	renameDashboardView,
 	resolveDashboardDensity,
 	resolveDashboardWidgets,
 	selectDashboardView,
 	setDashboardPresetTabVisible,
-	swapDashboardWidgets,
 	updateActiveDashboardView,
+	type DashboardWidgetConfig,
 } from './dashboard.svelte';
 
 beforeEach(() => {
@@ -37,7 +42,7 @@ describe('dashboard preferences', () => {
 	test('defaults missing, malformed, and unknown versions to overview', () => {
 		expect(parseDashboardPreferences(null).preset).toBe('overview');
 		expect(parseDashboardPreferences('{')).toEqual(defaultDashboardPreferences());
-		expect(parseDashboardPreferences('{"version":6,"preset":"storage"}')).toEqual(defaultDashboardPreferences());
+		expect(parseDashboardPreferences('{"version":7,"preset":"storage"}')).toEqual(defaultDashboardPreferences());
 	});
 
 	test('migrates the v1 custom layout without losing its configuration', () => {
@@ -51,14 +56,14 @@ describe('dashboard preferences', () => {
 			],
 		}));
 
-		expect(parsed.version).toBe(5);
+		expect(parsed.version).toBe(6);
 		expect(parsed.preset).toBe('custom');
 		expect(parsed.customViews).toHaveLength(1);
 		expect(getActiveDashboardView(parsed)).toMatchObject({
 			name: 'Custom',
 			density: 'compact',
 		});
-		expect(getActiveDashboardView(parsed).widgets[0]).toEqual({ id: 'storage', visible: false, width: 'half', presentation: 'standard' });
+		expect(getActiveDashboardView(parsed).widgets[0]).toEqual({ id: 'storage', visible: false, width: 'half', presentation: 'standard', column: 0, row: 0, priority: 0 });
 		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(13);
 	});
 
@@ -78,13 +83,13 @@ describe('dashboard preferences', () => {
 			}],
 		}));
 
-		expect(parsed.version).toBe(5);
+		expect(parsed.version).toBe(6);
 		expect(parsed.activeViewId).toBe('daily');
 		expect(getActiveDashboardView(parsed)).toMatchObject({ name: 'Daily', density: 'compact' });
 		expect(getActiveDashboardView(parsed).widgets.every((widget) => widget.presentation === 'standard')).toBe(true);
 	});
 
-	test('initializes v5 storage from the newest available legacy key without overwriting v5 preferences', () => {
+	test('initializes v6 storage from the newest available legacy key without overwriting v6 preferences', () => {
 		localStorage.clear();
 		localStorage.setItem(LEGACY_DASHBOARD_PREFERENCES_KEY, JSON.stringify({
 			version: 1,
@@ -116,10 +121,15 @@ describe('dashboard preferences', () => {
 				widgets: [{ id: 'health', visible: true, width: 'full', presentation: 'standard' }],
 			}],
 		}));
-		expect(initializeDashboardPreferences(localStorage).preset).toBe('custom');
-		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
+		localStorage.setItem(LEGACY_DASHBOARD_V5_PREFERENCES_KEY, JSON.stringify({
+			...defaultDashboardPreferences(),
 			version: 5,
-			preset: 'custom',
+			preset: 'monitoring',
+		}));
+		expect(initializeDashboardPreferences(localStorage).preset).toBe('monitoring');
+		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
+			version: 6,
+			preset: 'monitoring',
 		});
 
 		const stored = defaultDashboardPreferences();
@@ -155,12 +165,35 @@ describe('dashboard preferences', () => {
 		]);
 		expect(widgets.filter((widget) => widget.id === 'service_health' || widget.id === 'container_health'))
 			.toEqual([
-				{ id: 'service_health', visible: false, width: 'quarter', presentation: 'standard' },
-				{ id: 'container_health', visible: false, width: 'quarter', presentation: 'standard' },
+				{ id: 'service_health', visible: false, width: 'quarter', presentation: 'standard', column: 0, row: 1, priority: 0 },
+				{ id: 'container_health', visible: false, width: 'quarter', presentation: 'standard', column: 0, row: 1, priority: 0 },
 			]);
 		expect(widgets.filter((widget) => ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(widget.id)).map((widget) => widget.width))
 			.toEqual(['quarter', 'quarter', 'quarter', 'quarter']);
 		expect(parsed.hiddenPresetTabs).toEqual(['overview']);
+	});
+
+	test('migrates v5 visible widgets without reserving space for hidden widgets', () => {
+		const parsed = parseDashboardPreferences(JSON.stringify({
+			version: 5,
+			preset: 'custom',
+			hiddenPresetTabs: [],
+			activeViewId: 'legacy',
+			customViews: [{
+				id: 'legacy',
+				name: 'Legacy',
+				density: 'comfortable',
+				widgets: [
+					{ id: 'alerts', visible: false, width: 'full', presentation: 'standard' },
+					{ id: 'service_health', visible: true, width: 'half', presentation: 'standard' },
+					{ id: 'container_health', visible: true, width: 'half', presentation: 'standard' },
+				],
+			}],
+		}));
+		const widgets = getActiveDashboardView(parsed).widgets;
+
+		expect(widgets.find((widget) => widget.id === 'service_health')).toMatchObject({ column: 0, row: 0, priority: 0 });
+		expect(widgets.find((widget) => widget.id === 'container_health')).toMatchObject({ column: 6, row: 0, priority: 0 });
 	});
 
 	test('normalizes named views, active selection, and newly added widget ids', () => {
@@ -329,28 +362,61 @@ describe('dashboard preferences', () => {
 		expect(getActiveDashboardView(preferences).density).toBe('compact');
 	});
 
-	test('persists the active named view in v5 storage', () => {
+	test('persists the active named view in v6 storage', () => {
 		const preferences = createDashboardView(defaultDashboardPreferences(), 'Monitoring desk');
 		dashboardPrefs.set(preferences);
 
 		expect(dashboardPrefs.value.preset).toBe('custom');
 		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
-			version: 5,
+			version: 6,
 			preset: 'custom',
 			activeViewId: preferences.activeViewId,
 		});
 	});
 
-	test('swaps custom widgets without mutating the saved view', () => {
-		const preferences = defaultDashboardPreferences();
-		const widgets = getActiveDashboardView(preferences).widgets;
-		const swapped = swapDashboardWidgets(widgets, 'alerts', 'storage');
+	test('snaps widgets to starts that match their width', () => {
+		expect(dashboardWidgetValidColumns('quarter')).toEqual([0, 3, 6, 9]);
+		expect(dashboardWidgetValidColumns('third')).toEqual([0, 4, 8]);
+		expect(dashboardWidgetValidColumns('half')).toEqual([0, 6]);
+		expect(dashboardWidgetValidColumns('full')).toEqual([0]);
+		expect(dashboardWidgetSnapColumn('quarter', 8)).toBe(9);
+		expect(dashboardWidgetSnapColumn('half', 4)).toBe(6);
+	});
 
-		expect(swapped.map((widget) => widget.id)).toEqual([
-			'storage', 'system', 'service_health', 'container_health', 'cpu_load', 'memory_usage',
-			'cpu_status', 'storage_summary', 'operations', 'alerts', 'history', 'network', 'disk_io',
-		]);
-		expect(widgets[0].id).toBe('alerts');
-		expect(swapDashboardWidgets(widgets, 'alerts', 'alerts')).not.toBe(widgets);
+	test('packs dynamic widget heights without overlapping neighboring columns', () => {
+		const widgets: DashboardWidgetConfig[] = [
+			{ id: 'storage', visible: true, width: 'half', presentation: 'standard', column: 0, row: 0, priority: 0 },
+			{ id: 'cpu_load', visible: true, width: 'quarter', presentation: 'standard', column: 6, row: 0, priority: 0 },
+			{ id: 'memory_usage', visible: true, width: 'quarter', presentation: 'standard', column: 9, row: 0, priority: 0 },
+			{ id: 'cpu_status', visible: true, width: 'quarter', presentation: 'standard', column: 6, row: 1, priority: 0 },
+		];
+		const layout = layoutDashboardWidgets(widgets, { storage: 8, cpu_load: 2, memory_usage: 2, cpu_status: 2 });
+
+		expect(layout.storage).toMatchObject({ column: 0, row: 0, columnSpan: 6, rowSpan: 8 });
+		expect(layout.cpu_load).toMatchObject({ column: 6, row: 0, rowSpan: 2 });
+		expect(layout.memory_usage).toMatchObject({ column: 9, row: 0, rowSpan: 2 });
+		expect(layout.cpu_status).toMatchObject({ column: 6, row: 2, rowSpan: 2 });
+	});
+
+	test('places a moved widget first and pushes collisions down without mutating the view', () => {
+		const widgets: DashboardWidgetConfig[] = [
+			{ id: 'storage', visible: true, width: 'half', presentation: 'standard', column: 0, row: 0, priority: 0 },
+			{ id: 'cpu_load', visible: true, width: 'quarter', presentation: 'standard', column: 6, row: 0, priority: 0 },
+			{ id: 'cpu_status', visible: true, width: 'quarter', presentation: 'standard', column: 6, row: 2, priority: 0 },
+		];
+		const placed = placeDashboardWidget(widgets, 'cpu_status', 0, 0);
+
+		expect(placed.find((widget) => widget.id === 'cpu_status')).toMatchObject({ column: 0, row: 0 });
+		expect(placed.find((widget) => widget.id === 'cpu_status')?.priority).toBe(1);
+		expect(placed.find((widget) => widget.id === 'storage')).toMatchObject({ column: 0, row: 0, priority: 0 });
+		expect(placed.find((widget) => widget.id === 'cpu_load')).toMatchObject({ column: 6, row: 0 });
+		expect(widgets.find((widget) => widget.id === 'storage')).toMatchObject({ column: 0, row: 0 });
+
+		const layout = layoutDashboardWidgets(placed, { storage: 8, cpu_load: 2, cpu_status: 2 });
+		expect(layout.cpu_status).toMatchObject({ column: 0, row: 0 });
+		expect(layout.storage).toMatchObject({ column: 0, row: 2 });
+
+		const shorterLayout = layoutDashboardWidgets(placed, { storage: 8, cpu_load: 2, cpu_status: 1 });
+		expect(shorterLayout.storage).toMatchObject({ column: 0, row: 1 });
 	});
 });
