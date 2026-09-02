@@ -214,7 +214,7 @@
 </script>
 
 <Dialog.Root bind:open>
-	<Dialog.Content class="flex max-h-[85vh] w-[94vw] max-w-3xl flex-col gap-0 overflow-hidden p-0">
+	<Dialog.Content class="flex max-h-[85vh] w-[94vw] flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl">
 		<Dialog.Header class="border-b border-border px-6 py-5">
 			<Dialog.Title class="flex items-center gap-2"><LayoutDashboard class="h-5 w-5" /> Customize dashboard</Dialog.Title>
 			<Dialog.Description>Choose a focused preset or manage named Custom views built from predefined widgets.</Dialog.Description>
