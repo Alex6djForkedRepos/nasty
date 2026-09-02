@@ -4,6 +4,7 @@ import {
 	LEGACY_DASHBOARD_PREFERENCES_KEY,
 	LEGACY_DASHBOARD_V2_PREFERENCES_KEY,
 	LEGACY_DASHBOARD_V3_PREFERENCES_KEY,
+	LEGACY_DASHBOARD_V4_PREFERENCES_KEY,
 	createDashboardView,
 	dashboardPrefs,
 	dashboardPresetTabVisible,
@@ -36,7 +37,7 @@ describe('dashboard preferences', () => {
 	test('defaults missing, malformed, and unknown versions to overview', () => {
 		expect(parseDashboardPreferences(null).preset).toBe('overview');
 		expect(parseDashboardPreferences('{')).toEqual(defaultDashboardPreferences());
-		expect(parseDashboardPreferences('{"version":5,"preset":"storage"}')).toEqual(defaultDashboardPreferences());
+		expect(parseDashboardPreferences('{"version":6,"preset":"storage"}')).toEqual(defaultDashboardPreferences());
 	});
 
 	test('migrates the v1 custom layout without losing its configuration', () => {
@@ -50,7 +51,7 @@ describe('dashboard preferences', () => {
 			],
 		}));
 
-		expect(parsed.version).toBe(4);
+		expect(parsed.version).toBe(5);
 		expect(parsed.preset).toBe('custom');
 		expect(parsed.customViews).toHaveLength(1);
 		expect(getActiveDashboardView(parsed)).toMatchObject({
@@ -58,7 +59,7 @@ describe('dashboard preferences', () => {
 			density: 'compact',
 		});
 		expect(getActiveDashboardView(parsed).widgets[0]).toEqual({ id: 'storage', visible: false, width: 'half', presentation: 'standard' });
-		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(9);
+		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(13);
 	});
 
 	test('migrates v2 named views to standard widget presentations', () => {
@@ -77,13 +78,13 @@ describe('dashboard preferences', () => {
 			}],
 		}));
 
-		expect(parsed.version).toBe(4);
+		expect(parsed.version).toBe(5);
 		expect(parsed.activeViewId).toBe('daily');
 		expect(getActiveDashboardView(parsed)).toMatchObject({ name: 'Daily', density: 'compact' });
 		expect(getActiveDashboardView(parsed).widgets.every((widget) => widget.presentation === 'standard')).toBe(true);
 	});
 
-	test('initializes v4 storage from the newest available legacy key without overwriting v4 preferences', () => {
+	test('initializes v5 storage from the newest available legacy key without overwriting v5 preferences', () => {
 		localStorage.clear();
 		localStorage.setItem(LEGACY_DASHBOARD_PREFERENCES_KEY, JSON.stringify({
 			version: 1,
@@ -103,10 +104,22 @@ describe('dashboard preferences', () => {
 			version: 3,
 			preset: 'monitoring',
 		}));
-		expect(initializeDashboardPreferences(localStorage).preset).toBe('monitoring');
-		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
+		localStorage.setItem(LEGACY_DASHBOARD_V4_PREFERENCES_KEY, JSON.stringify({
 			version: 4,
-			preset: 'monitoring',
+			preset: 'custom',
+			hiddenPresetTabs: [],
+			activeViewId: 'legacy',
+			customViews: [{
+				id: 'legacy',
+				name: 'Legacy',
+				density: 'comfortable',
+				widgets: [{ id: 'health', visible: true, width: 'full', presentation: 'standard' }],
+			}],
+		}));
+		expect(initializeDashboardPreferences(localStorage).preset).toBe('custom');
+		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
+			version: 5,
+			preset: 'custom',
 		});
 
 		const stored = defaultDashboardPreferences();
@@ -114,6 +127,40 @@ describe('dashboard preferences', () => {
 		localStorage.setItem(DASHBOARD_PREFERENCES_KEY, JSON.stringify(stored));
 		expect(initializeDashboardPreferences(localStorage).preset).toBe('storage');
 		expect(loadDashboardPreferences(localStorage).preset).toBe('storage');
+	});
+
+	test('expands v4 health and resource groups in place without losing configuration', () => {
+		const parsed = parseDashboardPreferences(JSON.stringify({
+			version: 4,
+			preset: 'custom',
+			hiddenPresetTabs: ['overview'],
+			activeViewId: 'legacy',
+			customViews: [{
+				id: 'legacy',
+				name: 'Legacy',
+				density: 'compact',
+				widgets: [
+					{ id: 'alerts', visible: true, width: 'full', presentation: 'tiny' },
+					{ id: 'health', visible: false, width: 'half', presentation: 'standard' },
+					{ id: 'network', visible: true, width: 'half', presentation: 'standard' },
+					{ id: 'summary', visible: true, width: 'half', presentation: 'standard' },
+				],
+			}],
+		}));
+		const widgets = getActiveDashboardView(parsed).widgets;
+
+		expect(widgets.slice(0, 9).map((widget) => widget.id)).toEqual([
+			'alerts', 'service_health', 'container_health', 'network',
+			'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary', 'system',
+		]);
+		expect(widgets.filter((widget) => widget.id === 'service_health' || widget.id === 'container_health'))
+			.toEqual([
+				{ id: 'service_health', visible: false, width: 'quarter', presentation: 'standard' },
+				{ id: 'container_health', visible: false, width: 'quarter', presentation: 'standard' },
+			]);
+		expect(widgets.filter((widget) => ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(widget.id)).map((widget) => widget.width))
+			.toEqual(['quarter', 'quarter', 'quarter', 'quarter']);
+		expect(parsed.hiddenPresetTabs).toEqual(['overview']);
 	});
 
 	test('normalizes named views, active selection, and newly added widget ids', () => {
@@ -141,7 +188,7 @@ describe('dashboard preferences', () => {
 		expect(parsed.activeViewId).toBe('ops');
 		expect(parsed.customViews.map((view) => view.id)).toEqual(['ops', 'custom-1']);
 		expect(parsed.customViews.map((view) => view.name)).toEqual(['Operations', 'operations 2']);
-		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(9);
+		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(13);
 		expect(resolveDashboardWidgets(parsed)).not.toContainEqual(expect.objectContaining({ id: 'storage' }));
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'storage')?.presentation).toBe('standard');
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'alerts')?.presentation).toBe('tiny');
@@ -164,8 +211,9 @@ describe('dashboard preferences', () => {
 	test('limits narrow widths to compact-safe presentations', () => {
 		expect(dashboardWidgetSupportsNarrowWidth('alerts', 'standard')).toBe(false);
 		expect(dashboardWidgetSupportsNarrowWidth('alerts', 'tiny')).toBe(true);
-		expect(dashboardWidgetSupportsNarrowWidth('health', 'standard')).toBe(true);
-		expect(dashboardWidgetSupportsNarrowWidth('summary', 'standard')).toBe(true);
+		for (const id of ['service_health', 'container_health', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'] as const) {
+			expect(dashboardWidgetSupportsNarrowWidth(id, 'standard')).toBe(true);
+		}
 		expect(dashboardWidgetSupportsNarrowWidth('storage', 'standard')).toBe(false);
 		expect(dashboardWidgetSupportsNarrowWidth('network', 'standard')).toBe(false);
 		expect(dashboardWidgetSupportsNarrowWidth('disk_io', 'standard')).toBe(false);
@@ -174,10 +222,12 @@ describe('dashboard preferences', () => {
 	});
 
 	test('maps custom widths onto the 12-column dashboard grid', () => {
-		expect(dashboardWidgetWidthClass('full')).toContain('xl:col-span-12');
-		expect(dashboardWidgetWidthClass('half')).toContain('xl:col-span-6');
-		expect(dashboardWidgetWidthClass('third')).toContain('xl:col-span-4');
-		expect(dashboardWidgetWidthClass('quarter')).toContain('xl:col-span-3');
+		expect(dashboardWidgetWidthClass('alerts', 'full')).toContain('xl:col-span-12');
+		expect(dashboardWidgetWidthClass('alerts', 'half')).toContain('xl:col-span-6');
+		expect(dashboardWidgetWidthClass('alerts', 'third')).toContain('xl:col-span-4');
+		expect(dashboardWidgetWidthClass('alerts', 'quarter')).toContain('xl:col-span-3');
+		expect(dashboardWidgetWidthClass('service_health', 'half')).toContain('md:col-span-6');
+		expect(dashboardWidgetWidthClass('cpu_load', 'quarter')).toContain('lg:col-span-3');
 	});
 
 	test('hides any built-in preset tab and falls back to a custom view', () => {
@@ -226,6 +276,9 @@ describe('dashboard preferences', () => {
 
 	test('resolves fixed presets independently from named custom views', () => {
 		const preferences = defaultDashboardPreferences();
+		const independentTiles = ['service_health', 'container_health', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'];
+		expect(resolveDashboardWidgets(preferences).map((widget) => widget.id)).toEqual(expect.arrayContaining(independentTiles));
+
 		preferences.preset = 'storage';
 		preferences.customViews[0].widgets = preferences.customViews[0].widgets.map((widget) => ({ ...widget, visible: false }));
 
@@ -233,6 +286,8 @@ describe('dashboard preferences', () => {
 			'alerts', 'system', 'operations', 'storage',
 		]);
 		expect(resolveDashboardDensity(preferences)).toBe('compact');
+		preferences.preset = 'monitoring';
+		expect(resolveDashboardWidgets(preferences).map((widget) => widget.id)).toEqual(expect.arrayContaining(independentTiles));
 	});
 
 	test('creates, duplicates, renames, selects, and deletes named views', () => {
@@ -274,13 +329,13 @@ describe('dashboard preferences', () => {
 		expect(getActiveDashboardView(preferences).density).toBe('compact');
 	});
 
-	test('persists the active named view in v4 storage', () => {
+	test('persists the active named view in v5 storage', () => {
 		const preferences = createDashboardView(defaultDashboardPreferences(), 'Monitoring desk');
 		dashboardPrefs.set(preferences);
 
 		expect(dashboardPrefs.value.preset).toBe('custom');
 		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
-			version: 4,
+			version: 5,
 			preset: 'custom',
 			activeViewId: preferences.activeViewId,
 		});
@@ -292,7 +347,8 @@ describe('dashboard preferences', () => {
 		const swapped = swapDashboardWidgets(widgets, 'alerts', 'storage');
 
 		expect(swapped.map((widget) => widget.id)).toEqual([
-			'storage', 'system', 'health', 'summary', 'operations', 'alerts', 'history', 'network', 'disk_io',
+			'storage', 'system', 'service_health', 'container_health', 'cpu_load', 'memory_usage',
+			'cpu_status', 'storage_summary', 'operations', 'alerts', 'history', 'network', 'disk_io',
 		]);
 		expect(widgets[0].id).toBe('alerts');
 		expect(swapDashboardWidgets(widgets, 'alerts', 'alerts')).not.toBe(widgets);

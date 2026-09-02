@@ -102,7 +102,8 @@
 	let healthRequest = 0;
 	let alertsRequest = 0;
 	let operationsRequest = 0;
-	let dashboardHealthInFlight: Promise<void> | null = null;
+	let serviceHealthInFlight: Promise<void> | null = null;
+	let containerHealthInFlight: Promise<void> | null = null;
 
 	let metricsRange = $state<MetricsRange>('5m');
 	let metricsOffset = $state(0);
@@ -149,15 +150,15 @@
 	}
 
 	function needsStats(): boolean {
-		return widgets.some((widget) => ['summary', 'storage', 'history', 'network', 'disk_io'].includes(widget.id));
+		return widgets.some((widget) => ['cpu_load', 'memory_usage', 'cpu_status', 'storage', 'history', 'network', 'disk_io'].includes(widget.id));
 	}
 
 	function needsMetricsHistory(): boolean {
 		return widgets.some((widget) => ['history', 'network', 'disk_io'].includes(widget.id));
 	}
 
-	function healthPollingEnabled(): boolean {
-		return shouldPollDashboardHealth(hasWidget('health'), document.hidden);
+	function healthPollingEnabled(id: 'service_health' | 'container_health'): boolean {
+		return shouldPollDashboardHealth(hasWidget(id), document.hidden);
 	}
 
 	function masonryItem(node: HTMLElement) {
@@ -231,7 +232,8 @@
 	onMount(() => {
 		client.onEvent(handleEvent);
 		const handleVisibilityChange = () => {
-			if (healthPollingEnabled()) void loadDashboardHealth(true);
+			if (healthPollingEnabled('service_health')) void loadServiceHealth(true);
+			if (healthPollingEnabled('container_health')) void loadContainerHealth(true);
 		};
 		document.addEventListener('visibilitychange', handleVisibilityChange);
 		void loadVisibleData(true).finally(() => loading = false);
@@ -264,7 +266,8 @@
 			}
 			if (hasWidget('alerts')) tasks.push(loadAlerts());
 			if (hasWidget('operations')) tasks.push(loadOperations());
-			if (healthPollingEnabled()) tasks.push(loadDashboardHealth(true));
+			if (healthPollingEnabled('service_health')) tasks.push(loadServiceHealth(true));
+			if (healthPollingEnabled('container_health')) tasks.push(loadContainerHealth(true));
 			const results = await Promise.allSettled(tasks);
 			if (hasWidget('storage')) await loadStorageDetails();
 			if (needsMetricsHistory()) await loadMetrics();
@@ -318,22 +321,20 @@
 		operationsLoaded = true;
 	}
 
-	function loadDashboardHealth(markExistingRefreshing = false): Promise<void> {
-		if (dashboardHealthInFlight) return dashboardHealthInFlight;
+	function loadServiceHealth(markExistingRefreshing = false): Promise<void> {
+		if (serviceHealthInFlight) return serviceHealthInFlight;
 		if (markExistingRefreshing && serviceHealth) serviceHealthFreshness = 'refreshing';
-		if (markExistingRefreshing && containerHealth) containerHealthFreshness = 'refreshing';
 		if (!serviceHealth) serviceHealthFreshness = 'loading';
-		if (!containerHealth) containerHealthFreshness = 'loading';
 
-		const request = Promise.all([loadServiceHealth(), loadContainerHealth()]).then(() => undefined);
-		dashboardHealthInFlight = request;
+		const request = fetchServiceHealth();
+		serviceHealthInFlight = request;
 		void request.finally(() => {
-			if (dashboardHealthInFlight === request) dashboardHealthInFlight = null;
+			if (serviceHealthInFlight === request) serviceHealthInFlight = null;
 		});
 		return request;
 	}
 
-	async function loadServiceHealth() {
+	async function fetchServiceHealth() {
 		try {
 			serviceHealth = summarizeEnabledServices(await client.call<ProtocolStatus[]>('service.protocol.list'));
 			serviceHealthFreshness = 'current';
@@ -342,7 +343,20 @@
 		}
 	}
 
-	async function loadContainerHealth() {
+	function loadContainerHealth(markExistingRefreshing = false): Promise<void> {
+		if (containerHealthInFlight) return containerHealthInFlight;
+		if (markExistingRefreshing && containerHealth) containerHealthFreshness = 'refreshing';
+		if (!containerHealth) containerHealthFreshness = 'loading';
+
+		const request = fetchContainerHealth();
+		containerHealthInFlight = request;
+		void request.finally(() => {
+			if (containerHealthInFlight === request) containerHealthInFlight = null;
+		});
+		return request;
+	}
+
+	async function fetchContainerHealth() {
 		let status: AppsStatus;
 		try {
 			status = await client.call<AppsStatus>('apps.status');
@@ -402,6 +416,8 @@
 	}
 
 	async function refreshVisibleData() {
+		if (healthPollingEnabled('service_health')) void loadServiceHealth();
+		if (healthPollingEnabled('container_health')) void loadContainerHealth();
 		if (refreshInFlight) return;
 		refreshInFlight = true;
 		refreshTick += 1;
@@ -410,7 +426,6 @@
 			if (needsStats()) tasks.push(refreshStats());
 			if (hasWidget('alerts')) tasks.push(loadAlerts());
 			if (hasWidget('operations')) tasks.push(loadOperations());
-			if (healthPollingEnabled()) tasks.push(loadDashboardHealth());
 			if (hasWidget('system') && refreshTick % 4 === 0) {
 				tasks.push(loadSystemHealth());
 				if (!infoLoaded) tasks.push(loadSystemInfo());
@@ -628,13 +643,13 @@
 {#if loading}
 	<Card><CardContent class="py-10 text-center text-sm text-muted-foreground">Loading dashboard...</CardContent></Card>
 {:else}
-	<div class="grid grid-cols-1 auto-rows-[8px] gap-4 xl:grid-cols-12">
+	<div class="grid grid-cols-12 auto-rows-[8px] gap-4">
 		{#each widgets as widget (widget.id)}
 			<div
 				use:masonryItem
 				role="group"
 				aria-label={dashboardWidgetMeta[widget.id].label}
-				class="self-start rounded-lg transition-shadow {dashboardWidgetWidthClass(widget.width)} {dragTargetWidget === widget.id ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}"
+				class="self-start rounded-lg transition-shadow {dashboardWidgetWidthClass(widget.id, widget.width)} {dragTargetWidget === widget.id ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}"
 				ondragover={(event) => targetWidgetDrag(event, widget.id)}
 				ondrop={(event) => dropWidget(event, widget.id)}
 			>
@@ -660,10 +675,12 @@
 					<AlertsWidget {alerts} loaded={alertsLoaded} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'system'}
 					<SystemWidget {info} {health} {infoLoaded} {healthLoaded} {density} presentation={widget.presentation} />
-				{:else if widget.id === 'health'}
-					<HealthWidget services={serviceHealth} servicesFreshness={serviceHealthFreshness} containers={containerHealth} containersFreshness={containerHealthFreshness} {density} width={widget.width} />
-				{:else if widget.id === 'summary' && stats}
-					<SummaryWidget {stats} {filesystems} width={widget.width} {density} />
+				{:else if widget.id === 'service_health'}
+					<HealthWidget kind="services" services={serviceHealth} freshness={serviceHealthFreshness} {density} />
+				{:else if widget.id === 'container_health'}
+					<HealthWidget kind="containers" containers={containerHealth} freshness={containerHealthFreshness} {density} />
+				{:else if widget.id === 'cpu_load' || widget.id === 'memory_usage' || widget.id === 'cpu_status' || widget.id === 'storage_summary'}
+					<SummaryWidget kind={widget.id} {stats} {filesystems} {filesystemsLoaded} {density} />
 				{:else if widget.id === 'operations'}
 					<OperationsWidget operations={systemStatus?.operations ?? []} loaded={operationsLoaded} {density} presentation={widget.presentation} />
 				{:else if widget.id === 'storage'}

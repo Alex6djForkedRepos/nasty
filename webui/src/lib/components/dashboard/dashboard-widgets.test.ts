@@ -4,8 +4,9 @@ import AlertsWidget from './alerts-widget.svelte';
 import HealthWidget from './health-widget.svelte';
 import HistoryWidget from './history-widget.svelte';
 import OperationsWidget from './operations-widget.svelte';
+import SummaryWidget from './summary-widget.svelte';
 import SystemWidget from './system-widget.svelte';
-import type { ActiveAlert, SystemInfo } from '$lib/types';
+import type { ActiveAlert, Filesystem, SystemInfo, SystemStats } from '$lib/types';
 
 const alert = (severity: ActiveAlert['severity'], message: string): ActiveAlert => ({
 	rule_id: message,
@@ -34,6 +35,25 @@ const info: SystemInfo = {
 	bcachefs_is_custom: false,
 	timezone: 'UTC',
 	ntp_synced: true,
+};
+
+const stats: SystemStats = {
+	cpu: { count: 4, load_1: 1, load_5: 0.75, load_15: 0.5, temp_c: 42, freq_mhz: 2400, governor: 'powersave' },
+	memory: { total_bytes: 1000, used_bytes: 500, available_bytes: 500, swap_total_bytes: 0, swap_used_bytes: 0, bcachefs_btree_cache_bytes: 100 },
+	network: [],
+	disk_io: [],
+};
+
+const filesystem: Filesystem = {
+	name: 'pool',
+	uuid: 'pool-uuid',
+	devices: [],
+	mount_point: '/mnt/pool',
+	mounted: true,
+	total_bytes: 400,
+	used_bytes: 100,
+	available_bytes: 300,
+	options: {} as Filesystem['options'],
 };
 
 describe('tiny dashboard widgets', () => {
@@ -116,73 +136,111 @@ describe('tiny dashboard widgets', () => {
 });
 
 describe('dashboard health widget', () => {
-	test('renders linked service and managed container counts with explicit health states', () => {
-		const body = render(HealthWidget, {
+	test('renders service and managed container health as independent linked cards', () => {
+		const services = render(HealthWidget, {
 			props: {
+				kind: 'services',
 				services: { enabled: 3, running: 2 },
-				servicesFreshness: 'current',
-				containers: { runtime: 'running', expected: 2, running: 2 },
-				containersFreshness: 'current',
+				freshness: 'current',
 				density: 'comfortable',
-				width: 'full',
+			},
+		}).body;
+		const containers = render(HealthWidget, {
+			props: {
+				kind: 'containers',
+				containers: { runtime: 'running', expected: 2, running: 2 },
+				freshness: 'current',
+				density: 'comfortable',
 			},
 		}).body;
 
-		expect(body).toContain('href="/services"');
-		expect(body).toContain('3 enabled');
-		expect(body).toContain('2 running');
-		expect(body).toContain('1 enabled service not running.');
-		expect(body).toContain('href="/apps"');
-		expect(body).toContain('2 expected');
-		expect(body).toContain('All expected containers are running.');
-		expect(body).toContain('Simple apps count once; Compose service instances count individually.');
-		expect(body).toContain('md:grid-cols-2');
-		expect(body).toContain('px-5 py-4');
+		expect(services).toContain('href="/services"');
+		expect(services).toContain('3 enabled');
+		expect(services).toContain('2 running');
+		expect(services).toContain('1 enabled service not running.');
+		expect(services).not.toContain('href="/apps"');
+		expect(containers).toContain('href="/apps"');
+		expect(containers).toContain('2 expected');
+		expect(containers).toContain('All expected containers are running.');
+		expect(containers).toContain('Simple apps count once; Compose service instances count individually.');
+		expect(containers).not.toContain('href="/services"');
 	});
 
 	test('distinguishes disabled, loading, unavailable, and stale states in text', () => {
+		const loading = render(HealthWidget, {
+			props: {
+				kind: 'services',
+				services: null,
+				freshness: 'loading',
+				density: 'compact',
+			},
+		}).body;
 		const disabled = render(HealthWidget, {
 			props: {
-				services: null,
-				servicesFreshness: 'loading',
+				kind: 'containers',
 				containers: { runtime: 'disabled', expected: null, running: null },
-				containersFreshness: 'current',
+				freshness: 'current',
 				density: 'compact',
-				width: 'half',
 			},
 		}).body;
 		const stale = render(HealthWidget, {
 			props: {
+				kind: 'services',
 				services: { enabled: 1, running: 1 },
-				servicesFreshness: 'stale',
-				containers: null,
-				containersFreshness: 'unavailable',
+				freshness: 'stale',
 				density: 'compact',
-				width: 'quarter',
 			},
 		}).body;
 		const refreshing = render(HealthWidget, {
 			props: {
-				services: { enabled: 1, running: 1 },
-				servicesFreshness: 'refreshing',
+				kind: 'containers',
 				containers: { runtime: 'running', expected: 1, running: 1 },
-				containersFreshness: 'refreshing',
+				freshness: 'refreshing',
 				density: 'compact',
-				width: 'half',
 			},
 		}).body;
 
-		expect(disabled).toContain('Checking enabled services.');
+		expect(loading).toContain('Checking enabled services.');
 		expect(disabled).toContain('Docker runtime is disabled.');
 		expect(disabled).toContain('px-4 py-3');
-		expect(disabled).toContain('md:grid-cols-2');
 		expect(stale).toContain('Stale - healthy');
-		expect(stale).toContain('xl:grid-cols-1');
 		expect(stale).toContain('Refresh failed; showing last known healthy state.');
-		expect(stale).toContain('Managed container health could not be loaded.');
 		expect(stale).toContain('role="status"');
 		expect(refreshing).toContain('Refreshing - healthy');
 		expect(refreshing).toContain('Refreshing; showing last known healthy state.');
 		expect(refreshing).not.toContain('Refresh failed');
+	});
+});
+
+describe('dashboard resource summary widgets', () => {
+	test('renders each resource as an independent card', () => {
+		const cpu = render(SummaryWidget, { props: { kind: 'cpu_load', stats, density: 'comfortable' } }).body;
+		const memory = render(SummaryWidget, { props: { kind: 'memory_usage', stats, density: 'comfortable' } }).body;
+		const status = render(SummaryWidget, { props: { kind: 'cpu_status', stats, density: 'comfortable' } }).body;
+		const storage = render(SummaryWidget, { props: { kind: 'storage_summary', filesystems: [filesystem], density: 'comfortable' } }).body;
+
+		expect(cpu).toContain('CPU load');
+		expect(cpu).toContain('1.00');
+		expect(cpu).not.toContain('Memory');
+		expect(memory).toContain('Memory');
+		expect(memory).toContain('Btree cache');
+		expect(memory).not.toContain('CPU load');
+		expect(status).toContain('2.4 GHz - powersave');
+		expect(storage).toContain('Storage');
+		expect(storage).toContain('1 filesystem');
+	});
+
+	test('keeps unavailable standalone resources visible', () => {
+		const cpu = render(SummaryWidget, { props: { kind: 'cpu_load', stats: null, density: 'compact' } }).body;
+		const status = render(SummaryWidget, {
+			props: { kind: 'cpu_status', stats: { ...stats, cpu: { ...stats.cpu, temp_c: null, freq_mhz: null } }, density: 'compact' },
+		}).body;
+		const storage = render(SummaryWidget, { props: { kind: 'storage_summary', filesystems: [], density: 'compact' } }).body;
+		const unavailableStorage = render(SummaryWidget, { props: { kind: 'storage_summary', filesystemsLoaded: false, density: 'compact' } }).body;
+
+		expect(cpu).toContain('Unavailable');
+		expect(status).toContain('CPU temperature and frequency are unavailable.');
+		expect(storage).toContain('No filesystems');
+		expect(unavailableStorage).toContain('Filesystem inventory could not be loaded.');
 	});
 });
