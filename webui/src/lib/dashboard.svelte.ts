@@ -1,15 +1,20 @@
-export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v4';
+export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v5';
+export const LEGACY_DASHBOARD_V4_PREFERENCES_KEY = 'nasty:dashboard:v4';
 export const LEGACY_DASHBOARD_V3_PREFERENCES_KEY = 'nasty:dashboard:v3';
 export const LEGACY_DASHBOARD_V2_PREFERENCES_KEY = 'nasty:dashboard:v2';
 export const LEGACY_DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v1';
-export const DASHBOARD_PREFERENCES_VERSION = 4;
+export const DASHBOARD_PREFERENCES_VERSION = 5;
 export const DASHBOARD_VIEW_NAME_MAX_LENGTH = 40;
 
 export const dashboardWidgetIds = [
 	'alerts',
 	'system',
-	'health',
-	'summary',
+	'service_health',
+	'container_health',
+	'cpu_load',
+	'memory_usage',
+	'cpu_status',
+	'storage_summary',
 	'operations',
 	'storage',
 	'history',
@@ -52,8 +57,12 @@ export interface DashboardPreferences {
 export const dashboardWidgetMeta: Record<DashboardWidgetId, { label: string; description: string; supportsTiny: boolean }> = {
 	alerts: { label: 'Alerts', description: 'Active warnings and critical conditions.', supportsTiny: true },
 	system: { label: 'System status', description: 'Host identity, uptime, and service health.', supportsTiny: true },
-	health: { label: 'Service and container health', description: 'Enabled services and expected managed containers currently running.', supportsTiny: false },
-	summary: { label: 'Resource summary', description: 'CPU, memory, temperature, and total storage.', supportsTiny: false },
+	service_health: { label: 'Service health', description: 'Enabled services currently running.', supportsTiny: false },
+	container_health: { label: 'Container health', description: 'Expected managed containers currently running.', supportsTiny: false },
+	cpu_load: { label: 'CPU load', description: 'Current load across available CPU cores.', supportsTiny: false },
+	memory_usage: { label: 'Memory', description: 'Current memory use and bcachefs cache.', supportsTiny: false },
+	cpu_status: { label: 'CPU status', description: 'CPU temperature, frequency, and governor.', supportsTiny: false },
+	storage_summary: { label: 'Storage summary', description: 'Combined mounted filesystem capacity.', supportsTiny: false },
 	operations: { label: 'Active operations', description: 'Scrubs, evacuations, and reconciliation work.', supportsTiny: true },
 	storage: { label: 'Compact storage', description: 'Filesystems and member devices in a dense table.', supportsTiny: false },
 	history: { label: 'CPU and memory history', description: 'Resource history for the selected time range.', supportsTiny: true },
@@ -69,21 +78,31 @@ export function dashboardWidgetSupportsNarrowWidth(
 	id: DashboardWidgetId,
 	presentation: DashboardWidgetPresentation,
 ): boolean {
-	return id === 'health' || id === 'summary' || (dashboardWidgetSupportsTiny(id) && presentation === 'tiny');
+	return ['service_health', 'container_health', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
+		|| (dashboardWidgetSupportsTiny(id) && presentation === 'tiny');
 }
 
-export function dashboardWidgetWidthClass(width: DashboardWidgetWidth): string {
-	if (width === 'quarter') return 'min-w-0 xl:col-span-3';
-	if (width === 'third') return 'min-w-0 xl:col-span-4';
-	if (width === 'half') return 'min-w-0 xl:col-span-6';
-	return 'min-w-0 xl:col-span-12';
+export function dashboardWidgetWidthClass(id: DashboardWidgetId, width: DashboardWidgetWidth): string {
+	const responsive = id === 'service_health' || id === 'container_health'
+		? 'col-span-12 md:col-span-6'
+		: ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
+			? 'col-span-6 lg:col-span-3'
+			: 'col-span-12';
+	if (width === 'quarter') return `min-w-0 ${responsive} xl:col-span-3`;
+	if (width === 'third') return `min-w-0 ${responsive} xl:col-span-4`;
+	if (width === 'half') return `min-w-0 ${responsive} xl:col-span-6`;
+	return `min-w-0 ${responsive} xl:col-span-12`;
 }
 
 const defaultCustomWidgets: DashboardWidgetConfig[] = [
 	{ id: 'alerts', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'system', visible: true, width: 'full', presentation: 'standard' },
-	{ id: 'health', visible: true, width: 'full', presentation: 'standard' },
-	{ id: 'summary', visible: true, width: 'full', presentation: 'standard' },
+	{ id: 'service_health', visible: true, width: 'half', presentation: 'standard' },
+	{ id: 'container_health', visible: true, width: 'half', presentation: 'standard' },
+	{ id: 'cpu_load', visible: true, width: 'quarter', presentation: 'standard' },
+	{ id: 'memory_usage', visible: true, width: 'quarter', presentation: 'standard' },
+	{ id: 'cpu_status', visible: true, width: 'quarter', presentation: 'standard' },
+	{ id: 'storage_summary', visible: true, width: 'quarter', presentation: 'standard' },
 	{ id: 'operations', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'storage', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'history', visible: true, width: 'full', presentation: 'standard' },
@@ -147,8 +166,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function expandLegacyWidgets(configured: unknown[]): unknown[] {
+	return configured.flatMap((candidate) => {
+		if (!isRecord(candidate) || (candidate.id !== 'health' && candidate.id !== 'summary')) return [candidate];
+		const requestedWidth: DashboardWidgetWidth = candidate.width === 'quarter' || candidate.width === 'third' || candidate.width === 'half'
+			? candidate.width
+			: 'full';
+		const width: DashboardWidgetWidth = candidate.id === 'health'
+			? requestedWidth === 'full' ? 'half' : requestedWidth === 'half' ? 'quarter' : requestedWidth
+			: requestedWidth === 'full' || requestedWidth === 'half' ? 'quarter' : requestedWidth;
+		const ids: DashboardWidgetId[] = candidate.id === 'health'
+			? ['service_health', 'container_health']
+			: ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'];
+		return ids.map((id) => ({ ...candidate, id, width, presentation: 'standard' }));
+	});
+}
+
 function normalizeWidgets(value: unknown): DashboardWidgetConfig[] {
-	const configured = Array.isArray(value) ? value : [];
+	const configured = expandLegacyWidgets(Array.isArray(value) ? value : []);
 	const byId = new Map<DashboardWidgetId, DashboardWidgetConfig>();
 	for (const candidate of configured) {
 		if (!isRecord(candidate) || !dashboardWidgetIds.includes(candidate.id as DashboardWidgetId)) continue;
@@ -253,7 +288,7 @@ function migrateLegacyPreferences(value: Record<string, unknown>): DashboardPref
 function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 	if (!isRecord(value)) return defaultDashboardPreferences();
 	if (value.version === 1) return migrateLegacyPreferences(value);
-	if (value.version !== 2 && value.version !== 3 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
+	if (value.version !== 2 && value.version !== 3 && value.version !== 4 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
 
 	const customViews = normalizeCustomViews(value.customViews);
 	const requestedActiveViewId = typeof value.activeViewId === 'string' ? value.activeViewId.trim() : '';
@@ -286,6 +321,7 @@ export function parseDashboardPreferences(raw: string | null): DashboardPreferen
 export function loadDashboardPreferences(storage: Pick<Storage, 'getItem'>): DashboardPreferences {
 	return parseDashboardPreferences(
 		storage.getItem(DASHBOARD_PREFERENCES_KEY)
+		?? storage.getItem(LEGACY_DASHBOARD_V4_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V3_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V2_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_PREFERENCES_KEY)
