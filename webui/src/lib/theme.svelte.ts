@@ -13,7 +13,8 @@ function createTheme() {
 		return 'dark';
 	}
 
-	let current = $state<'dark' | 'light'>(getInitial());
+	const initial = getInitial();
+	let current = $state<'dark' | 'light'>(initial);
 
 	function apply(theme: 'dark' | 'light') {
 		if (typeof document !== 'undefined') {
@@ -22,7 +23,7 @@ function createTheme() {
 	}
 
 	// Apply on first load
-	apply(current);
+	apply(initial);
 
 	return {
 		get current() { return current; },
