@@ -25,8 +25,8 @@
 				<span class="font-medium text-muted-foreground">System status unavailable</span>
 			{:else}
 				{#if info}
-					<span class="font-semibold">{info.hostname}</span>
-					<span class="text-muted-foreground">v{info.version}</span>
+					<span class="min-w-0 max-w-full truncate font-semibold" title={info.hostname}>{info.hostname}</span>
+					<span class="max-w-full truncate text-muted-foreground" title={`Version ${info.version}`}>v{info.version}</span>
 					<span class="text-muted-foreground">Up {formatUptime(info.uptime_seconds)}</span>
 				{:else if !infoLoaded}
 					<span class="font-medium text-muted-foreground">System info unavailable</span>

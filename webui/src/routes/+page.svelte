@@ -6,8 +6,10 @@
 	import { createIoHistory } from '$lib/history.svelte';
 	import {
 		dashboardPrefs,
+		dashboardPresetTabVisible,
 		dashboardPresets,
 		dashboardWidgetMeta,
+		dashboardWidgetWidthClass,
 		getActiveDashboardView,
 		resolveDashboardDensity,
 		resolveDashboardWidgets,
@@ -15,8 +17,8 @@
 		swapDashboardWidgets,
 		updateActiveDashboardView,
 		type DashboardPreferences,
+		type DashboardFixedPreset,
 		type DashboardWidgetId,
-		type DashboardWidgetWidth,
 	} from '$lib/dashboard.svelte';
 	import type {
 		ActiveAlert,
@@ -137,6 +139,10 @@
 			? `custom:${activeCustomView.id}`
 			: dashboardPrefs.value.preset
 	);
+	let presetTabs = $derived(
+		(Object.entries(dashboardPresets) as [DashboardFixedPreset, (typeof dashboardPresets)[DashboardFixedPreset]][])
+			.filter(([id]) => dashboardPresetTabVisible(dashboardPrefs.value, id))
+	);
 
 	function hasWidget(id: DashboardWidgetId): boolean {
 		return widgets.some((widget) => widget.id === id);
@@ -152,10 +158,6 @@
 
 	function healthPollingEnabled(): boolean {
 		return shouldPollDashboardHealth(hasWidget('health'), document.hidden);
-	}
-
-	function widgetClass(width: DashboardWidgetWidth): string {
-		return width === 'full' ? 'min-w-0 xl:col-span-2' : 'min-w-0 xl:col-span-1';
 	}
 
 	function masonryItem(node: HTMLElement) {
@@ -600,7 +602,7 @@
 	</div>
 	<div class="mt-3 overflow-x-auto border-b border-border">
 		<div class="flex min-w-max items-end" role="tablist" aria-label="Dashboard views">
-			{#each Object.entries(dashboardPresets) as [id, preset]}
+			{#each presetTabs as [id, preset]}
 				<button type="button" role="tab" aria-selected={dashboardSelection === id} aria-controls="dashboard-panel" tabindex={dashboardSelection === id ? 0 : -1} onclick={() => void switchDashboard(id)} onkeydown={handleDashboardTabKeydown} class="-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors {dashboardSelection === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'}">{preset.label}</button>
 			{/each}
 			<span class="mx-1 mb-2 h-5 w-px bg-border" aria-hidden="true"></span>
@@ -626,13 +628,13 @@
 {#if loading}
 	<Card><CardContent class="py-10 text-center text-sm text-muted-foreground">Loading dashboard...</CardContent></Card>
 {:else}
-	<div class="grid grid-cols-1 auto-rows-[8px] gap-4 xl:grid-cols-2">
+	<div class="grid grid-cols-1 auto-rows-[8px] gap-4 xl:grid-cols-12">
 		{#each widgets as widget (widget.id)}
 			<div
 				use:masonryItem
 				role="group"
 				aria-label={dashboardWidgetMeta[widget.id].label}
-				class="self-start rounded-lg transition-shadow {widgetClass(widget.width)} {dragTargetWidget === widget.id ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}"
+				class="self-start rounded-lg transition-shadow {dashboardWidgetWidthClass(widget.width)} {dragTargetWidget === widget.id ? 'ring-2 ring-primary ring-offset-2 ring-offset-background' : ''}"
 				ondragover={(event) => targetWidgetDrag(event, widget.id)}
 				ondrop={(event) => dropWidget(event, widget.id)}
 			>

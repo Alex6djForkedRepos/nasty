@@ -101,7 +101,7 @@ describe('tiny dashboard widgets', () => {
 				],
 				range: '5m',
 				loading: false,
-				width: 'half',
+				width: 'quarter',
 				density: 'compact',
 				presentation: 'tiny',
 			},
@@ -110,6 +110,7 @@ describe('tiny dashboard widgets', () => {
 		expect(body).toContain('8.0%');
 		expect(body).toContain('5m peak 12.0%');
 		expect(body).toContain('45.0%');
+		expect(body).toContain('xl:grid-cols-1');
 		expect(body).not.toContain('role="img"');
 	});
 });
@@ -157,7 +158,7 @@ describe('dashboard health widget', () => {
 				containers: null,
 				containersFreshness: 'unavailable',
 				density: 'compact',
-				width: 'half',
+				width: 'quarter',
 			},
 		}).body;
 		const refreshing = render(HealthWidget, {
@@ -174,8 +175,9 @@ describe('dashboard health widget', () => {
 		expect(disabled).toContain('Checking enabled services.');
 		expect(disabled).toContain('Docker runtime is disabled.');
 		expect(disabled).toContain('px-4 py-3');
-		expect(disabled).not.toContain('md:grid-cols-2');
+		expect(disabled).toContain('md:grid-cols-2');
 		expect(stale).toContain('Stale - healthy');
+		expect(stale).toContain('xl:grid-cols-1');
 		expect(stale).toContain('Refresh failed; showing last known healthy state.');
 		expect(stale).toContain('Managed container health could not be loaded.');
 		expect(stale).toContain('role="status"');

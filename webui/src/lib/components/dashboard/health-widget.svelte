@@ -95,7 +95,7 @@
 	let containerState = $derived(containerPresentation());
 </script>
 
-<div class="grid gap-3 {width === 'full' ? 'md:grid-cols-2' : ''}">
+<div class="grid gap-3 {width === 'full' || width === 'half' ? 'md:grid-cols-2' : 'md:grid-cols-2 xl:grid-cols-1'}">
 	<Card class="h-full overflow-hidden {tileClass(serviceState.tone)}">
 		<a href="/services" class="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background" aria-label={`Services: ${serviceState.label}. ${services ? `${services.enabled} enabled, ${services.running} running.` : serviceState.detail}`}>
 			<CardContent class={density === 'compact' ? 'px-4 py-3' : 'px-5 py-4'}>

@@ -3,18 +3,23 @@
 	import {
 		DASHBOARD_VIEW_NAME_MAX_LENGTH,
 		createDashboardView,
+		dashboardOptionalPresets,
 		dashboardPresets,
 		dashboardViewNameAvailable,
 		dashboardWidgetMeta,
+		dashboardWidgetSupportsNarrowWidth,
 		dashboardWidgetSupportsTiny,
 		defaultDashboardPreferences,
 		deleteDashboardView,
 		getActiveDashboardView,
 		renameDashboardView,
 		selectDashboardView,
+		setDashboardPresetTabVisible,
 		updateActiveDashboardView,
 		type DashboardPreferences,
+		type DashboardOptionalPreset,
 		type DashboardPreset,
+		type DashboardWidgetWidth,
 	} from '$lib/dashboard.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
@@ -60,6 +65,7 @@
 	function clone(value: DashboardPreferences): DashboardPreferences {
 		return {
 			...value,
+			hiddenPresetTabs: [...value.hiddenPresetTabs],
 			customViews: value.customViews.map((view) => ({
 				...view,
 				widgets: view.widgets.map((widget) => ({ ...widget })),
@@ -68,9 +74,19 @@
 	}
 
 	function selectPreset(preset: DashboardPreset) {
-		draft = { ...draft, preset };
+		const preferences = dashboardOptionalPresets.includes(preset as DashboardOptionalPreset)
+			? setDashboardPresetTabVisible(draft, preset as DashboardOptionalPreset, true)
+			: draft;
+		draft = {
+			...preferences,
+			preset,
+		};
 		cancelNameAction();
 		deletePending = false;
+	}
+
+	function setPresetTabVisible(preset: DashboardOptionalPreset, visible: boolean) {
+		draft = setDashboardPresetTabVisible(draft, preset, visible);
 	}
 
 	function selectView(id: string) {
@@ -86,10 +102,25 @@
 		draft = updateActiveDashboardView(draft, { widgets });
 	}
 
+	function updatePresentation(index: number, value: string) {
+		const widget = activeView.widgets[index];
+		const presentation = value === 'tiny' && dashboardWidgetSupportsTiny(widget.id) ? 'tiny' : 'standard';
+		updateWidget(index, {
+			presentation,
+			width: (widget.width === 'quarter' || widget.width === 'third') && !dashboardWidgetSupportsNarrowWidth(widget.id, presentation)
+				? 'half'
+				: widget.width,
+		});
+	}
+
 	function updateDensity(value: string) {
 		draft = updateActiveDashboardView(draft, {
 			density: value === 'compact' ? 'compact' : 'comfortable',
 		});
+	}
+
+	function parseWidgetWidth(value: string): DashboardWidgetWidth {
+		return value === 'quarter' || value === 'third' || value === 'half' ? value : 'full';
 	}
 
 	function moveWidget(index: number, direction: -1 | 1) {
@@ -202,6 +233,15 @@
 					<p class="mt-1 text-xs leading-relaxed text-muted-foreground">{draft.customViews.length} named view{draft.customViews.length === 1 ? '' : 's'}.</p>
 				</button>
 			</div>
+			<div class="mt-4 rounded-lg border border-border bg-muted/20 px-4 py-3">
+				<div class="text-sm font-semibold">Preset tabs</div>
+				<p class="mt-0.5 text-xs text-muted-foreground">Choose which optional built-in views appear above the dashboard. Overview always stays visible.</p>
+				<div class="mt-3 flex flex-wrap gap-x-5 gap-y-2">
+					{#each dashboardOptionalPresets as preset}
+						<label class="flex items-center gap-2 text-sm"><input type="checkbox" checked={!draft.hiddenPresetTabs.includes(preset)} onchange={(event) => setPresetTabVisible(preset, event.currentTarget.checked)} class="h-4 w-4 accent-primary" />{dashboardPresets[preset].label}</label>
+					{/each}
+				</div>
+			</div>
 
 			{#if draft.preset === 'custom'}
 				<div class="mt-6 border-t border-border pt-5">
@@ -239,7 +279,7 @@
 				</div>
 
 				<div class="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-5">
-					<div><h3 class="text-sm font-semibold">{activeView.name} widgets</h3><p class="text-xs text-muted-foreground">Half-width widgets pack into open column space on wide screens. Full-width widgets start a new row.</p></div>
+					<div><h3 class="text-sm font-semibold">{activeView.name} widgets</h3><p class="text-xs text-muted-foreground">Widgets use a 12-column wide-screen grid and can span the full row, one half, one third, or one quarter.</p></div>
 					<div class="flex items-center gap-2">
 						<label for="dashboard-density" class="text-xs font-medium text-muted-foreground">Density</label>
 						<select id="dashboard-density" value={activeView.density} onchange={(event) => updateDensity(event.currentTarget.value)} class="h-8 rounded-md border border-border bg-background px-2 text-xs">
@@ -254,9 +294,9 @@
 							<input type="checkbox" checked={widget.visible} disabled={widget.visible && activeView.widgets.filter((candidate) => candidate.visible).length === 1} onchange={(event) => updateWidget(index, { visible: event.currentTarget.checked })} aria-label={`Show ${dashboardWidgetMeta[widget.id].label}`} class="h-4 w-4 accent-primary disabled:opacity-40" />
 							<div class="min-w-40 flex-1"><div class="text-sm font-medium">{dashboardWidgetMeta[widget.id].label}</div><div class="truncate text-xs text-muted-foreground">{dashboardWidgetMeta[widget.id].description}</div></div>
 							{#if dashboardWidgetSupportsTiny(widget.id)}
-								<select value={widget.presentation} disabled={!widget.visible} onchange={(event) => updateWidget(index, { presentation: event.currentTarget.value === 'tiny' ? 'tiny' : 'standard' })} aria-label={`${dashboardWidgetMeta[widget.id].label} presentation`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="standard">Standard</option><option value="tiny">Tiny</option></select>
+								<select value={widget.presentation} disabled={!widget.visible} onchange={(event) => updatePresentation(index, event.currentTarget.value)} aria-label={`${dashboardWidgetMeta[widget.id].label} presentation`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="standard">Standard</option><option value="tiny">Tiny</option></select>
 							{/if}
-							<select value={widget.width} disabled={!widget.visible} onchange={(event) => updateWidget(index, { width: event.currentTarget.value === 'half' ? 'half' : 'full' })} aria-label={`${dashboardWidgetMeta[widget.id].label} width`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="full">Full</option><option value="half">Half</option></select>
+							<select value={widget.width} disabled={!widget.visible} onchange={(event) => updateWidget(index, { width: parseWidgetWidth(event.currentTarget.value) })} aria-label={`${dashboardWidgetMeta[widget.id].label} width`} class="h-8 rounded-md border border-border bg-background px-2 text-xs disabled:opacity-40"><option value="full">Full</option><option value="half">1/2</option>{#if dashboardWidgetSupportsNarrowWidth(widget.id, widget.presentation)}<option value="third">1/3</option><option value="quarter">1/4</option>{/if}</select>
 							<div class="flex">
 								<Button variant="ghost" size="icon-sm" disabled={index === 0} onclick={() => moveWidget(index, -1)} aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp /></Button>
 								<Button variant="ghost" size="icon-sm" disabled={index === activeView.widgets.length - 1} onclick={() => moveWidget(index, 1)} aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown /></Button>
