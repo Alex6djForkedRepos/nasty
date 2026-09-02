@@ -1,10 +1,12 @@
-export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v5';
+export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v6';
+export const LEGACY_DASHBOARD_V5_PREFERENCES_KEY = 'nasty:dashboard:v5';
 export const LEGACY_DASHBOARD_V4_PREFERENCES_KEY = 'nasty:dashboard:v4';
 export const LEGACY_DASHBOARD_V3_PREFERENCES_KEY = 'nasty:dashboard:v3';
 export const LEGACY_DASHBOARD_V2_PREFERENCES_KEY = 'nasty:dashboard:v2';
 export const LEGACY_DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v1';
-export const DASHBOARD_PREFERENCES_VERSION = 5;
+export const DASHBOARD_PREFERENCES_VERSION = 6;
 export const DASHBOARD_VIEW_NAME_MAX_LENGTH = 40;
+export const DASHBOARD_GRID_COLUMNS = 12;
 
 export const dashboardWidgetIds = [
 	'alerts',
@@ -37,7 +39,20 @@ export interface DashboardWidgetConfig {
 	visible: boolean;
 	width: DashboardWidgetWidth;
 	presentation: DashboardWidgetPresentation;
+	column: number;
+	row: number;
+	priority: number;
 }
+
+export interface DashboardGridPosition {
+	column: number;
+	row: number;
+	columnSpan: number;
+	rowSpan: number;
+}
+
+export type DashboardGridLayout = Partial<Record<DashboardWidgetId, DashboardGridPosition>>;
+export type DashboardWidgetRowSpans = Partial<Record<DashboardWidgetId, number>>;
 
 export interface DashboardCustomView {
 	id: string;
@@ -82,6 +97,26 @@ export function dashboardWidgetSupportsNarrowWidth(
 		|| (dashboardWidgetSupportsTiny(id) && presentation === 'tiny');
 }
 
+export function dashboardWidgetColumnSpan(width: DashboardWidgetWidth): number {
+	if (width === 'quarter') return 3;
+	if (width === 'third') return 4;
+	if (width === 'half') return 6;
+	return DASHBOARD_GRID_COLUMNS;
+}
+
+export function dashboardWidgetValidColumns(width: DashboardWidgetWidth): number[] {
+	const span = dashboardWidgetColumnSpan(width);
+	return Array.from({ length: DASHBOARD_GRID_COLUMNS / span }, (_, index) => index * span);
+}
+
+export function dashboardWidgetSnapColumn(width: DashboardWidgetWidth, requested: number): number {
+	const columns = dashboardWidgetValidColumns(width);
+	if (!Number.isFinite(requested)) return columns[0];
+	return columns.reduce((nearest, candidate) =>
+		Math.abs(candidate - requested) < Math.abs(nearest - requested) ? candidate : nearest
+	);
+}
+
 export function dashboardWidgetWidthClass(id: DashboardWidgetId, width: DashboardWidgetWidth): string {
 	const responsive = id === 'service_health' || id === 'container_health'
 		? 'col-span-12 md:col-span-6'
@@ -94,7 +129,28 @@ export function dashboardWidgetWidthClass(id: DashboardWidgetId, width: Dashboar
 	return `min-w-0 ${responsive} xl:col-span-12`;
 }
 
-const defaultCustomWidgets: DashboardWidgetConfig[] = [
+type DashboardWidgetDefinition = Omit<DashboardWidgetConfig, 'column' | 'row' | 'priority'>;
+
+function positionWidgets(widgets: DashboardWidgetDefinition[]): DashboardWidgetConfig[] {
+	let column = 0;
+	let row = 0;
+	return widgets.map((widget) => {
+		const columnSpan = dashboardWidgetColumnSpan(widget.width);
+		if (column + columnSpan > DASHBOARD_GRID_COLUMNS) {
+			column = 0;
+			row += 1;
+		}
+		const positioned = { ...widget, column, row, priority: 0 };
+		column += columnSpan;
+		if (column === DASHBOARD_GRID_COLUMNS) {
+			column = 0;
+			row += 1;
+		}
+		return positioned;
+	});
+}
+
+const defaultCustomWidgets: DashboardWidgetConfig[] = positionWidgets([
 	{ id: 'alerts', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'system', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'service_health', visible: true, width: 'half', presentation: 'standard' },
@@ -108,7 +164,7 @@ const defaultCustomWidgets: DashboardWidgetConfig[] = [
 	{ id: 'history', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'network', visible: true, width: 'half', presentation: 'standard' },
 	{ id: 'disk_io', visible: true, width: 'half', presentation: 'standard' },
-];
+]);
 
 export const dashboardPresets: Record<DashboardFixedPreset, {
 	label: string;
@@ -185,6 +241,22 @@ function expandLegacyWidgets(configured: unknown[]): unknown[] {
 function normalizeWidgets(value: unknown): DashboardWidgetConfig[] {
 	const configured = expandLegacyWidgets(Array.isArray(value) ? value : []);
 	const byId = new Map<DashboardWidgetId, DashboardWidgetConfig>();
+	let fallbackColumn = 0;
+	let fallbackRow = 0;
+	const nextFallbackPosition = (width: DashboardWidgetWidth) => {
+		const columnSpan = dashboardWidgetColumnSpan(width);
+		if (fallbackColumn + columnSpan > DASHBOARD_GRID_COLUMNS) {
+			fallbackColumn = 0;
+			fallbackRow += 1;
+		}
+		const position = { column: fallbackColumn, row: fallbackRow };
+		fallbackColumn += columnSpan;
+		if (fallbackColumn === DASHBOARD_GRID_COLUMNS) {
+			fallbackColumn = 0;
+			fallbackRow += 1;
+		}
+		return position;
+	};
 	for (const candidate of configured) {
 		if (!isRecord(candidate) || !dashboardWidgetIds.includes(candidate.id as DashboardWidgetId)) continue;
 		const id = candidate.id as DashboardWidgetId;
@@ -193,19 +265,31 @@ function normalizeWidgets(value: unknown): DashboardWidgetConfig[] {
 		const requestedWidth = candidate.width === 'quarter' || candidate.width === 'third' || candidate.width === 'half'
 			? candidate.width
 			: 'full';
+		const width = (requestedWidth === 'quarter' || requestedWidth === 'third') && !dashboardWidgetSupportsNarrowWidth(id, presentation)
+			? 'half'
+			: requestedWidth;
+		const visible = candidate.visible !== false;
+		const fallback = visible ? nextFallbackPosition(width) : { column: fallbackColumn, row: fallbackRow };
 		byId.set(id, {
 			id,
-			visible: candidate.visible !== false,
-			width: (requestedWidth === 'quarter' || requestedWidth === 'third') && !dashboardWidgetSupportsNarrowWidth(id, presentation)
-				? 'half'
-				: requestedWidth,
+			visible,
+			width,
 			presentation,
+			column: typeof candidate.column === 'number' && Number.isInteger(candidate.column)
+				? dashboardWidgetSnapColumn(width, candidate.column)
+				: fallback.column,
+			row: typeof candidate.row === 'number' && Number.isInteger(candidate.row)
+				? Math.max(0, Math.min(10_000, candidate.row))
+				: fallback.row,
+			priority: typeof candidate.priority === 'number' && Number.isInteger(candidate.priority)
+				? Math.max(0, Math.min(1_000_000_000, candidate.priority))
+				: 0,
 		});
 	}
 
 	const widgets = [...byId.values()];
 	for (const widget of defaultCustomWidgets) {
-		if (!byId.has(widget.id)) widgets.push({ ...widget });
+		if (!byId.has(widget.id)) widgets.push({ ...widget, ...nextFallbackPosition(widget.width), priority: 0 });
 	}
 	if (!widgets.some((widget) => widget.visible)) widgets[0] = { ...widgets[0], visible: true };
 	return widgets;
@@ -288,7 +372,7 @@ function migrateLegacyPreferences(value: Record<string, unknown>): DashboardPref
 function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 	if (!isRecord(value)) return defaultDashboardPreferences();
 	if (value.version === 1) return migrateLegacyPreferences(value);
-	if (value.version !== 2 && value.version !== 3 && value.version !== 4 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
+	if (value.version !== 2 && value.version !== 3 && value.version !== 4 && value.version !== 5 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
 
 	const customViews = normalizeCustomViews(value.customViews);
 	const requestedActiveViewId = typeof value.activeViewId === 'string' ? value.activeViewId.trim() : '';
@@ -321,6 +405,7 @@ export function parseDashboardPreferences(raw: string | null): DashboardPreferen
 export function loadDashboardPreferences(storage: Pick<Storage, 'getItem'>): DashboardPreferences {
 	return parseDashboardPreferences(
 		storage.getItem(DASHBOARD_PREFERENCES_KEY)
+		?? storage.getItem(LEGACY_DASHBOARD_V5_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V4_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V3_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V2_PREFERENCES_KEY)
@@ -453,18 +538,69 @@ export function updateActiveDashboardView(
 	};
 }
 
-export function swapDashboardWidgets(
-	widgets: DashboardWidgetConfig[],
-	source: DashboardWidgetId,
-	target: DashboardWidgetId,
-): DashboardWidgetConfig[] {
-	const sourceIndex = widgets.findIndex((widget) => widget.id === source);
-	const targetIndex = widgets.findIndex((widget) => widget.id === target);
-	if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return cloneWidgets(widgets);
+function rectanglesOverlap(a: DashboardGridPosition, b: DashboardGridPosition): boolean {
+	return a.column < b.column + b.columnSpan
+		&& a.column + a.columnSpan > b.column
+		&& a.row < b.row + b.rowSpan
+		&& a.row + a.rowSpan > b.row;
+}
 
-	const next = cloneWidgets(widgets);
-	[next[sourceIndex], next[targetIndex]] = [next[targetIndex], next[sourceIndex]];
-	return next;
+export function layoutDashboardWidgets(
+	widgets: DashboardWidgetConfig[],
+	rowSpans: DashboardWidgetRowSpans,
+	moving?: { id: DashboardWidgetId; column: number; row: number },
+): DashboardGridLayout {
+	const movingPriority = Math.max(0, ...widgets.map((widget) => widget.priority)) + 1;
+	const candidates = widgets
+		.filter((widget) => widget.visible)
+		.map((widget, index) => ({
+			id: widget.id,
+			column: moving?.id === widget.id
+				? dashboardWidgetSnapColumn(widget.width, moving.column)
+				: dashboardWidgetSnapColumn(widget.width, widget.column),
+			row: moving?.id === widget.id ? Math.max(0, Math.round(moving.row)) : widget.row,
+			columnSpan: dashboardWidgetColumnSpan(widget.width),
+			rowSpan: Math.max(1, Math.round(rowSpans[widget.id] ?? 1)),
+			priority: moving?.id === widget.id ? movingPriority : widget.priority,
+			index,
+		}));
+	candidates.sort((a, b) => a.row - b.row || b.priority - a.priority || a.column - b.column || a.index - b.index);
+
+	const placed: DashboardGridPosition[] = [];
+	const layout: DashboardGridLayout = {};
+	for (const candidate of candidates) {
+		const position: DashboardGridPosition = { ...candidate };
+		let collisions = placed.filter((existing) => rectanglesOverlap(position, existing));
+		while (collisions.length > 0) {
+			position.row = Math.max(...collisions.map((existing) => existing.row + existing.rowSpan));
+			collisions = placed.filter((existing) => rectanglesOverlap(position, existing));
+		}
+		placed.push(position);
+		layout[candidate.id] = position;
+	}
+	return layout;
+}
+
+export function placeDashboardWidget(
+	widgets: DashboardWidgetConfig[],
+	id: DashboardWidgetId,
+	column: number,
+	row: number,
+): DashboardWidgetConfig[] {
+	if (!widgets.some((widget) => widget.id === id && widget.visible)) return cloneWidgets(widgets);
+	const widget = widgets.find((candidate) => candidate.id === id)!;
+	const nextPriority = Math.max(0, ...widgets.map((candidate) => candidate.priority)) + 1;
+	return cloneWidgets(widgets)
+		.map((candidate) => candidate.id === id
+			? {
+				...candidate,
+				column: dashboardWidgetSnapColumn(widget.width, column),
+				row: Math.max(0, Math.round(row)),
+				priority: nextPriority,
+			}
+			: candidate
+		)
+		.sort((a, b) => a.row - b.row || a.column - b.column || dashboardWidgetIds.indexOf(a.id) - dashboardWidgetIds.indexOf(b.id));
 }
 
 function createDashboardPrefs() {
