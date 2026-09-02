@@ -148,8 +148,8 @@ describe('dashboard preferences', () => {
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'alerts')?.width).toBe('quarter');
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'system')?.width).toBe('third');
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'network')?.width).toBe('half');
-		expect(parsed.hiddenPresetTabs).toEqual(['storage', 'monitoring']);
-		expect(dashboardPresetTabVisible(parsed, 'overview')).toBe(true);
+		expect(parsed.hiddenPresetTabs).toEqual(['overview', 'storage', 'monitoring']);
+		expect(dashboardPresetTabVisible(parsed, 'overview')).toBe(false);
 		expect(dashboardPresetTabVisible(parsed, 'storage')).toBe(false);
 		expect(dashboardPresetTabVisible(parsed, 'monitoring')).toBe(false);
 		expect(resolveDashboardDensity(parsed)).toBe('compact');
@@ -180,16 +180,22 @@ describe('dashboard preferences', () => {
 		expect(dashboardWidgetWidthClass('quarter')).toContain('xl:col-span-3');
 	});
 
-	test('hides optional preset tabs and leaves overview available', () => {
-		let preferences = defaultDashboardPreferences();
-		preferences.preset = 'storage';
-		preferences = setDashboardPresetTabVisible(preferences, 'storage', false);
+	test('hides any built-in preset tab and falls back to a custom view', () => {
+		let preferences = createDashboardView(defaultDashboardPreferences(), 'Mine');
+		const activeViewId = preferences.activeViewId;
+		preferences.preset = 'overview';
+		preferences = setDashboardPresetTabVisible(preferences, 'overview', false);
 
-		expect(preferences.preset).toBe('overview');
-		expect(dashboardPresetTabVisible(preferences, 'overview')).toBe(true);
+		expect(preferences.preset).toBe('custom');
+		expect(preferences.activeViewId).toBe(activeViewId);
+		expect(getActiveDashboardView(preferences).name).toBe('Mine');
+		expect(dashboardPresetTabVisible(preferences, 'overview')).toBe(false);
+		preferences = setDashboardPresetTabVisible(preferences, 'storage', false);
+		preferences = setDashboardPresetTabVisible(preferences, 'monitoring', false);
 		expect(dashboardPresetTabVisible(preferences, 'storage')).toBe(false);
-		preferences = setDashboardPresetTabVisible(preferences, 'storage', true);
-		expect(dashboardPresetTabVisible(preferences, 'storage')).toBe(true);
+		expect(dashboardPresetTabVisible(preferences, 'monitoring')).toBe(false);
+		preferences = setDashboardPresetTabVisible(preferences, 'overview', true);
+		expect(dashboardPresetTabVisible(preferences, 'overview')).toBe(true);
 	});
 
 	test('repairs a persisted active preset whose tab is hidden', () => {
@@ -199,7 +205,7 @@ describe('dashboard preferences', () => {
 			hiddenPresetTabs: ['storage'],
 		}));
 
-		expect(parsed.preset).toBe('overview');
+		expect(parsed.preset).toBe('custom');
 		expect(parsed.hiddenPresetTabs).toEqual(['storage']);
 	});
 
