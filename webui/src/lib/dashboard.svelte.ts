@@ -1,7 +1,8 @@
-export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v3';
+export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v4';
+export const LEGACY_DASHBOARD_V3_PREFERENCES_KEY = 'nasty:dashboard:v3';
 export const LEGACY_DASHBOARD_V2_PREFERENCES_KEY = 'nasty:dashboard:v2';
 export const LEGACY_DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v1';
-export const DASHBOARD_PREFERENCES_VERSION = 3;
+export const DASHBOARD_PREFERENCES_VERSION = 4;
 export const DASHBOARD_VIEW_NAME_MAX_LENGTH = 40;
 
 export const dashboardWidgetIds = [
@@ -18,9 +19,13 @@ export const dashboardWidgetIds = [
 
 export type DashboardWidgetId = (typeof dashboardWidgetIds)[number];
 export type DashboardPreset = 'overview' | 'storage' | 'monitoring' | 'custom';
+export type DashboardFixedPreset = Exclude<DashboardPreset, 'custom'>;
+export type DashboardOptionalPreset = Exclude<DashboardFixedPreset, 'overview'>;
 export type DashboardDensity = 'comfortable' | 'compact';
-export type DashboardWidgetWidth = 'half' | 'full';
+export type DashboardWidgetWidth = 'quarter' | 'third' | 'half' | 'full';
 export type DashboardWidgetPresentation = 'standard' | 'tiny';
+
+export const dashboardOptionalPresets: DashboardOptionalPreset[] = ['storage', 'monitoring'];
 
 export interface DashboardWidgetConfig {
 	id: DashboardWidgetId;
@@ -39,6 +44,7 @@ export interface DashboardCustomView {
 export interface DashboardPreferences {
 	version: typeof DASHBOARD_PREFERENCES_VERSION;
 	preset: DashboardPreset;
+	hiddenPresetTabs: DashboardOptionalPreset[];
 	activeViewId: string;
 	customViews: DashboardCustomView[];
 }
@@ -59,6 +65,20 @@ export function dashboardWidgetSupportsTiny(id: DashboardWidgetId): boolean {
 	return dashboardWidgetMeta[id].supportsTiny;
 }
 
+export function dashboardWidgetSupportsNarrowWidth(
+	id: DashboardWidgetId,
+	presentation: DashboardWidgetPresentation,
+): boolean {
+	return id === 'health' || id === 'summary' || (dashboardWidgetSupportsTiny(id) && presentation === 'tiny');
+}
+
+export function dashboardWidgetWidthClass(width: DashboardWidgetWidth): string {
+	if (width === 'quarter') return 'min-w-0 xl:col-span-3';
+	if (width === 'third') return 'min-w-0 xl:col-span-4';
+	if (width === 'half') return 'min-w-0 xl:col-span-6';
+	return 'min-w-0 xl:col-span-12';
+}
+
 const defaultCustomWidgets: DashboardWidgetConfig[] = [
 	{ id: 'alerts', visible: true, width: 'full', presentation: 'standard' },
 	{ id: 'system', visible: true, width: 'full', presentation: 'standard' },
@@ -71,9 +91,7 @@ const defaultCustomWidgets: DashboardWidgetConfig[] = [
 	{ id: 'disk_io', visible: true, width: 'half', presentation: 'standard' },
 ];
 
-type FixedPreset = Exclude<DashboardPreset, 'custom'>;
-
-export const dashboardPresets: Record<FixedPreset, {
+export const dashboardPresets: Record<DashboardFixedPreset, {
 	label: string;
 	description: string;
 	density: DashboardDensity;
@@ -119,6 +137,7 @@ export function defaultDashboardPreferences(): DashboardPreferences {
 	return {
 		version: DASHBOARD_PREFERENCES_VERSION,
 		preset: 'overview',
+		hiddenPresetTabs: [],
 		activeViewId: customView.id,
 		customViews: [customView],
 	};
@@ -135,11 +154,17 @@ function normalizeWidgets(value: unknown): DashboardWidgetConfig[] {
 		if (!isRecord(candidate) || !dashboardWidgetIds.includes(candidate.id as DashboardWidgetId)) continue;
 		const id = candidate.id as DashboardWidgetId;
 		if (byId.has(id)) continue;
+		const presentation = candidate.presentation === 'tiny' && dashboardWidgetSupportsTiny(id) ? 'tiny' : 'standard';
+		const requestedWidth = candidate.width === 'quarter' || candidate.width === 'third' || candidate.width === 'half'
+			? candidate.width
+			: 'full';
 		byId.set(id, {
 			id,
 			visible: candidate.visible !== false,
-			width: candidate.width === 'half' ? 'half' : 'full',
-			presentation: candidate.presentation === 'tiny' && dashboardWidgetSupportsTiny(id) ? 'tiny' : 'standard',
+			width: (requestedWidth === 'quarter' || requestedWidth === 'third') && !dashboardWidgetSupportsNarrowWidth(id, presentation)
+				? 'half'
+				: requestedWidth,
+			presentation,
 		});
 	}
 
@@ -153,6 +178,11 @@ function normalizeWidgets(value: unknown): DashboardWidgetConfig[] {
 
 function normalizePreset(value: unknown): DashboardPreset {
 	return value === 'storage' || value === 'monitoring' || value === 'custom' ? value : 'overview';
+}
+
+function normalizeHiddenPresetTabs(value: unknown): DashboardOptionalPreset[] {
+	if (!Array.isArray(value)) return [];
+	return dashboardOptionalPresets.filter((preset) => value.includes(preset));
 }
 
 function normalizeViewName(value: unknown, fallback: string): string {
@@ -214,6 +244,7 @@ function migrateLegacyPreferences(value: Record<string, unknown>): DashboardPref
 	return {
 		version: DASHBOARD_PREFERENCES_VERSION,
 		preset: normalizePreset(value.preset),
+		hiddenPresetTabs: [],
 		activeViewId: customView.id,
 		customViews: [customView],
 	};
@@ -222,7 +253,7 @@ function migrateLegacyPreferences(value: Record<string, unknown>): DashboardPref
 function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 	if (!isRecord(value)) return defaultDashboardPreferences();
 	if (value.version === 1) return migrateLegacyPreferences(value);
-	if (value.version !== 2 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
+	if (value.version !== 2 && value.version !== 3 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
 
 	const customViews = normalizeCustomViews(value.customViews);
 	const requestedActiveViewId = typeof value.activeViewId === 'string' ? value.activeViewId.trim() : '';
@@ -230,9 +261,14 @@ function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 		? requestedActiveViewId
 		: customViews[0].id;
 
+	const hiddenPresetTabs = normalizeHiddenPresetTabs(value.hiddenPresetTabs);
+	const requestedPreset = normalizePreset(value.preset);
 	return {
 		version: DASHBOARD_PREFERENCES_VERSION,
-		preset: normalizePreset(value.preset),
+		preset: requestedPreset !== 'custom' && requestedPreset !== 'overview' && hiddenPresetTabs.includes(requestedPreset)
+			? 'overview'
+			: requestedPreset,
+		hiddenPresetTabs,
 		activeViewId,
 		customViews,
 	};
@@ -250,6 +286,7 @@ export function parseDashboardPreferences(raw: string | null): DashboardPreferen
 export function loadDashboardPreferences(storage: Pick<Storage, 'getItem'>): DashboardPreferences {
 	return parseDashboardPreferences(
 		storage.getItem(DASHBOARD_PREFERENCES_KEY)
+		?? storage.getItem(LEGACY_DASHBOARD_V3_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V2_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_PREFERENCES_KEY)
 	);
@@ -280,6 +317,28 @@ export function resolveDashboardDensity(preferences: DashboardPreferences): Dash
 	return preferences.preset === 'custom'
 		? getActiveDashboardView(preferences).density
 		: dashboardPresets[preferences.preset].density;
+}
+
+export function dashboardPresetTabVisible(
+	preferences: DashboardPreferences,
+	preset: DashboardFixedPreset,
+): boolean {
+	return preset === 'overview' || !preferences.hiddenPresetTabs.includes(preset);
+}
+
+export function setDashboardPresetTabVisible(
+	preferences: DashboardPreferences,
+	preset: DashboardOptionalPreset,
+	visible: boolean,
+): DashboardPreferences {
+	const hiddenPresetTabs = visible
+		? preferences.hiddenPresetTabs.filter((candidate) => candidate !== preset)
+		: [...new Set([...preferences.hiddenPresetTabs, preset])];
+	return {
+		...preferences,
+		hiddenPresetTabs,
+		preset: !visible && preferences.preset === preset ? 'overview' : preferences.preset,
+	};
 }
 
 export function dashboardViewNameAvailable(
