@@ -605,7 +605,7 @@
 			{#each presetTabs as [id, preset]}
 				<button type="button" role="tab" aria-selected={dashboardSelection === id} aria-controls="dashboard-panel" tabindex={dashboardSelection === id ? 0 : -1} onclick={() => void switchDashboard(id)} onkeydown={handleDashboardTabKeydown} class="-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors {dashboardSelection === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'}">{preset.label}</button>
 			{/each}
-			<span class="mx-1 mb-2 h-5 w-px bg-border" aria-hidden="true"></span>
+			{#if presetTabs.length > 0}<span class="mx-1 mb-2 h-5 w-px bg-border" aria-hidden="true"></span>{/if}
 			{#each dashboardPrefs.value.customViews as view (view.id)}
 				{@const selection = `custom:${view.id}`}
 				<button type="button" role="tab" aria-selected={dashboardSelection === selection} aria-controls="dashboard-panel" tabindex={dashboardSelection === selection ? 0 : -1} onclick={() => void switchDashboard(selection)} onkeydown={handleDashboardTabKeydown} class="-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors {dashboardSelection === selection ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'}">{view.name}</button>

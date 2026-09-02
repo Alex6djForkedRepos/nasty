@@ -74,9 +74,9 @@
 	}
 
 	function selectPreset(preset: DashboardPreset) {
-		const preferences = dashboardOptionalPresets.includes(preset as DashboardOptionalPreset)
-			? setDashboardPresetTabVisible(draft, preset as DashboardOptionalPreset, true)
-			: draft;
+		const preferences = preset === 'custom'
+			? draft
+			: setDashboardPresetTabVisible(draft, preset, true);
 		draft = {
 			...preferences,
 			preset,
@@ -235,7 +235,7 @@
 			</div>
 			<div class="mt-4 rounded-lg border border-border bg-muted/20 px-4 py-3">
 				<div class="text-sm font-semibold">Preset tabs</div>
-				<p class="mt-0.5 text-xs text-muted-foreground">Choose which optional built-in views appear above the dashboard. Overview always stays visible.</p>
+				<p class="mt-0.5 text-xs text-muted-foreground">Choose which built-in views appear above the dashboard. Your Custom views stay available.</p>
 				<div class="mt-3 flex flex-wrap gap-x-5 gap-y-2">
 					{#each dashboardOptionalPresets as preset}
 						<label class="flex items-center gap-2 text-sm"><input type="checkbox" checked={!draft.hiddenPresetTabs.includes(preset)} onchange={(event) => setPresetTabVisible(preset, event.currentTarget.checked)} class="h-4 w-4 accent-primary" />{dashboardPresets[preset].label}</label>

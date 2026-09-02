@@ -20,12 +20,12 @@ export const dashboardWidgetIds = [
 export type DashboardWidgetId = (typeof dashboardWidgetIds)[number];
 export type DashboardPreset = 'overview' | 'storage' | 'monitoring' | 'custom';
 export type DashboardFixedPreset = Exclude<DashboardPreset, 'custom'>;
-export type DashboardOptionalPreset = Exclude<DashboardFixedPreset, 'overview'>;
+export type DashboardOptionalPreset = DashboardFixedPreset;
 export type DashboardDensity = 'comfortable' | 'compact';
 export type DashboardWidgetWidth = 'quarter' | 'third' | 'half' | 'full';
 export type DashboardWidgetPresentation = 'standard' | 'tiny';
 
-export const dashboardOptionalPresets: DashboardOptionalPreset[] = ['storage', 'monitoring'];
+export const dashboardOptionalPresets: DashboardOptionalPreset[] = ['overview', 'storage', 'monitoring'];
 
 export interface DashboardWidgetConfig {
 	id: DashboardWidgetId;
@@ -265,8 +265,8 @@ function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 	const requestedPreset = normalizePreset(value.preset);
 	return {
 		version: DASHBOARD_PREFERENCES_VERSION,
-		preset: requestedPreset !== 'custom' && requestedPreset !== 'overview' && hiddenPresetTabs.includes(requestedPreset)
-			? 'overview'
+		preset: requestedPreset !== 'custom' && hiddenPresetTabs.includes(requestedPreset)
+			? 'custom'
 			: requestedPreset,
 		hiddenPresetTabs,
 		activeViewId,
@@ -323,7 +323,7 @@ export function dashboardPresetTabVisible(
 	preferences: DashboardPreferences,
 	preset: DashboardFixedPreset,
 ): boolean {
-	return preset === 'overview' || !preferences.hiddenPresetTabs.includes(preset);
+	return !preferences.hiddenPresetTabs.includes(preset);
 }
 
 export function setDashboardPresetTabVisible(
@@ -337,7 +337,7 @@ export function setDashboardPresetTabVisible(
 	return {
 		...preferences,
 		hiddenPresetTabs,
-		preset: !visible && preferences.preset === preset ? 'overview' : preferences.preset,
+		preset: !visible && preferences.preset === preset ? 'custom' : preferences.preset,
 	};
 }
 
