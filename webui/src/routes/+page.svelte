@@ -910,48 +910,51 @@
 		{/if}
 		{#each widgets as widget (widget.id)}
 			{@const position = gridLayout[widget.id]}
+			{@const persistentHeader = widget.id === 'history' && widget.presentation === 'standard'}
 			<div
 				use:masonryItem={widget.id}
 				role="group"
 				aria-label={dashboardWidgetMeta[widget.id].label}
 				data-dashboard-widget={widget.id}
 				style={widgetGridStyle(widget)}
-				class="self-start rounded-lg transition-[opacity,box-shadow] {dashboardWidgetWidthClass(widget.id, widget.width)} {dashboardPrefs.value.preset === 'custom' ? 'dashboard-positioned' : ''} {draggedWidget === widget.id ? 'opacity-45' : ''}"
+				class="relative self-start rounded-lg transition-[opacity,box-shadow] {dashboardWidgetWidthClass(widget.id, widget.width)} {dashboardPrefs.value.preset === 'custom' ? 'dashboard-positioned' : ''} {draggedWidget === widget.id ? 'opacity-45' : ''}"
 			>
-				{#if editingDashboard || (widget.id === 'history' && widget.presentation === 'standard')}
-					<div class="mb-1 flex min-h-8 flex-wrap items-center gap-1 text-muted-foreground xl:flex-nowrap">
-						<span class="text-[0.65rem] font-medium uppercase tracking-wide">{editingDashboard ? `${dashboardWidgetMeta[widget.id].label}${widget.id === 'history' && historyLoading ? ' - loading' : ''}` : `History${historyLoading ? ' - loading' : ''}`}</span>
-						{#if widget.id === 'history' && widget.presentation === 'standard'}
-							{#if metricsOffset > 0}
-								<span class="ml-1 min-w-0 truncate text-xs normal-case tracking-normal" title={`${new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - ${new Date(Date.now() - metricsOffset).toLocaleString()}`}>{new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - {new Date(Date.now() - metricsOffset).toLocaleString()}</span>
-							{/if}
-							<HistoryControls range={metricsRange} offset={metricsOffset} loading={historyLoading} class="ml-auto" onRange={(range) => void changeRange(range)} onBack={() => void navigateBack()} onForward={() => void navigateForward()} onLive={() => void navigateLive()} />
+				{#if persistentHeader}
+					<div class="mb-1 flex min-h-8 flex-wrap items-center gap-1 text-muted-foreground xl:flex-nowrap {editingDashboard ? 'invisible pointer-events-none' : ''}" aria-hidden={editingDashboard}>
+						<span class="text-[0.65rem] font-medium uppercase tracking-wide">History{historyLoading ? ' - loading' : ''}</span>
+						{#if metricsOffset > 0}
+							<span class="ml-1 min-w-0 truncate text-xs normal-case tracking-normal" title={`${new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - ${new Date(Date.now() - metricsOffset).toLocaleString()}`}>{new Date(Date.now() - metricsOffset - rangeDurations[metricsRange]).toLocaleString()} - {new Date(Date.now() - metricsOffset).toLocaleString()}</span>
 						{/if}
-						{#if editingDashboard}
-							<div class="ml-auto flex items-center">
-								<div class="flex xl:hidden">
-									<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
-									<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
-								</div>
-								<div class="hidden opacity-50 transition-opacity hover:opacity-100 focus-within:opacity-100 xl:flex">
-									<button type="button" onclick={() => moveCustomWidget(widget.id, -1, 0)} disabled={!position || position.column === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} left`}><ArrowLeft class="h-3.5 w-3.5" /></button>
-									<button type="button" onclick={() => moveCustomWidget(widget.id, 1, 0)} disabled={!position || position.column + position.columnSpan >= 12} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} right`}><ArrowRight class="h-3.5 w-3.5" /></button>
-									<button type="button" onclick={() => moveCustomWidget(widget.id, 0, -1)} disabled={!position || position.row === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp class="h-3.5 w-3.5" /></button>
-									<button type="button" onclick={() => moveCustomWidget(widget.id, 0, 1)} class="rounded p-1.5 hover:bg-accent hover:text-foreground" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown class="h-3.5 w-3.5" /></button>
-									<span draggable={true} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="inline-flex cursor-grab rounded p-1.5 hover:bg-accent hover:text-foreground active:cursor-grabbing" title="Drag to a grid position" aria-hidden="true"><GripVertical class="h-3.5 w-3.5" /></span>
-								</div>
-								<WidgetOptions {widget} onChange={(patch) => updateWidgetAppearance(widget.id, patch)} />
-								<button
-									type="button"
-									onclick={() => void hideWidget(widget.id)}
-									disabled={widgets.length <= 1}
-									data-dashboard-remove={widget.id}
-									class="rounded p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-20"
-									aria-label={`Remove ${dashboardWidgetMeta[widget.id].label} from this view`}
-									title={widgets.length <= 1 ? 'At least one widget must remain visible' : 'Remove from this view'}
-								><X class="h-3.5 w-3.5" /></button>
+						<HistoryControls range={metricsRange} offset={metricsOffset} loading={historyLoading} class="ml-auto" onRange={(range) => void changeRange(range)} onBack={() => void navigateBack()} onForward={() => void navigateForward()} onLive={() => void navigateLive()} />
+					</div>
+				{/if}
+				{#if editingDashboard}
+					<!-- Edit-only chrome must not affect the masonry geometry users are arranging. -->
+					<div role="group" aria-label={`${dashboardWidgetMeta[widget.id].label} edit controls`} class="absolute -top-4 right-2 z-10 flex min-h-7 max-w-[calc(100%-1rem)] items-center gap-1 rounded-md border border-border bg-background/95 px-1 text-muted-foreground shadow-sm focus-within:z-50">
+						<span class="hidden truncate text-[0.65rem] font-medium uppercase tracking-wide 2xl:inline">{dashboardWidgetMeta[widget.id].label}{widget.id === 'history' && historyLoading ? ' - loading' : ''}</span>
+						<div class="ml-auto flex items-center">
+							<div class="flex xl:hidden">
+								<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, -1)} disabled={widgets[0]?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} earlier`}><ArrowUp class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidgetInOrder(widget.id, 1)} disabled={widgets.at(-1)?.id === widget.id} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} later`}><ArrowDown class="h-3.5 w-3.5" /></button>
 							</div>
-						{/if}
+							<div class="hidden opacity-50 transition-opacity hover:opacity-100 focus-within:opacity-100 xl:flex">
+								<button type="button" onclick={() => moveCustomWidget(widget.id, -1, 0)} disabled={!position || position.column === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} left`}><ArrowLeft class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 1, 0)} disabled={!position || position.column + position.columnSpan >= 12} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} right`}><ArrowRight class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 0, -1)} disabled={!position || position.row === 0} class="rounded p-1.5 hover:bg-accent hover:text-foreground disabled:opacity-20" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} up`}><ArrowUp class="h-3.5 w-3.5" /></button>
+								<button type="button" onclick={() => moveCustomWidget(widget.id, 0, 1)} class="rounded p-1.5 hover:bg-accent hover:text-foreground" aria-label={`Move ${dashboardWidgetMeta[widget.id].label} down`}><ArrowDown class="h-3.5 w-3.5" /></button>
+								<span draggable={true} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="inline-flex cursor-grab rounded p-1.5 hover:bg-accent hover:text-foreground active:cursor-grabbing" title="Drag to a grid position" aria-hidden="true"><GripVertical class="h-3.5 w-3.5" /></span>
+							</div>
+							<WidgetOptions {widget} onChange={(patch) => updateWidgetAppearance(widget.id, patch)} />
+							<button
+								type="button"
+								onclick={() => void hideWidget(widget.id)}
+								disabled={widgets.length <= 1}
+								data-dashboard-remove={widget.id}
+								class="rounded p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-20"
+								aria-label={`Remove ${dashboardWidgetMeta[widget.id].label} from this view`}
+								title={widgets.length <= 1 ? 'At least one widget must remain visible' : 'Remove from this view'}
+							><X class="h-3.5 w-3.5" /></button>
+						</div>
 					</div>
 				{/if}
 				{#if widget.id === 'alerts'}
