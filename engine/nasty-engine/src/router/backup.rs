@@ -66,6 +66,7 @@ pub(super) async fn try_route(
 ) -> Option<Response> {
     Some(match req.method.as_str() {
         "backup.profile.list" => ok(req, state.backups.list_profiles().await),
+        "backup.schedule.list" => ok(req, state.backups.list_schedule(chrono::Utc::now()).await),
         "backup.profile.get" => match require_str(req, "id") {
             Ok(id) => match state.backups.get_profile(id).await {
                 Ok(v) => ok(req, v),

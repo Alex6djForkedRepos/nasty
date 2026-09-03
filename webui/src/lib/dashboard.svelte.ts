@@ -1,10 +1,11 @@
-export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v6';
+export const DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v7';
+export const LEGACY_DASHBOARD_V6_PREFERENCES_KEY = 'nasty:dashboard:v6';
 export const LEGACY_DASHBOARD_V5_PREFERENCES_KEY = 'nasty:dashboard:v5';
 export const LEGACY_DASHBOARD_V4_PREFERENCES_KEY = 'nasty:dashboard:v4';
 export const LEGACY_DASHBOARD_V3_PREFERENCES_KEY = 'nasty:dashboard:v3';
 export const LEGACY_DASHBOARD_V2_PREFERENCES_KEY = 'nasty:dashboard:v2';
 export const LEGACY_DASHBOARD_PREFERENCES_KEY = 'nasty:dashboard:v1';
-export const DASHBOARD_PREFERENCES_VERSION = 6;
+export const DASHBOARD_PREFERENCES_VERSION = 7;
 export const DASHBOARD_VIEW_NAME_MAX_LENGTH = 40;
 export const DASHBOARD_GRID_COLUMNS = 12;
 
@@ -14,6 +15,8 @@ export const dashboardWidgetIds = [
 	'service_health',
 	'container_health',
 	'compute',
+	'clock',
+	'schedule',
 	'cpu_load',
 	'memory_usage',
 	'cpu_status',
@@ -76,6 +79,8 @@ export const dashboardWidgetMeta: Record<DashboardWidgetId, { label: string; des
 	service_health: { label: 'Service health', description: 'Enabled services currently running.', supportsTiny: false },
 	container_health: { label: 'Container health', description: 'Expected managed containers currently running.', supportsTiny: false },
 	compute: { label: 'Compute', description: 'Virtual machines and Docker workloads at a glance.', supportsTiny: false },
+	clock: { label: 'Clock & notice', description: 'Host time, date, timezone, and dashboard notice.', supportsTiny: false },
+	schedule: { label: 'Backup schedule', description: 'Upcoming scheduled backup runs.', supportsTiny: false },
 	cpu_load: { label: 'CPU load', description: 'Current load across available CPU cores.', supportsTiny: false },
 	memory_usage: { label: 'Memory', description: 'Current memory use and bcachefs cache.', supportsTiny: false },
 	cpu_status: { label: 'CPU status', description: 'CPU temperature, frequency, and governor.', supportsTiny: false },
@@ -95,7 +100,7 @@ export function dashboardWidgetSupportsNarrowWidth(
 	id: DashboardWidgetId,
 	presentation: DashboardWidgetPresentation,
 ): boolean {
-	return ['service_health', 'container_health', 'compute', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
+	return ['service_health', 'container_health', 'compute', 'clock', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
 		|| (dashboardWidgetSupportsTiny(id) && presentation === 'tiny');
 }
 
@@ -120,9 +125,11 @@ export function dashboardWidgetSnapColumn(width: DashboardWidgetWidth, requested
 }
 
 export function dashboardWidgetWidthClass(id: DashboardWidgetId, width: DashboardWidgetWidth): string {
-	const responsive = id === 'service_health' || id === 'container_health' || id === 'compute'
+	const responsive = id === 'service_health' || id === 'container_health' || id === 'compute' || id === 'schedule'
 		? 'col-span-12 md:col-span-6'
-		: ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
+		: id === 'clock'
+			? 'col-span-12 md:col-span-6'
+			: ['cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'].includes(id)
 			? 'col-span-6 lg:col-span-3'
 			: 'col-span-12';
 	if (width === 'quarter') return `min-w-0 ${responsive} xl:col-span-3`;
@@ -191,6 +198,8 @@ const defaultCustomWidgets: DashboardWidgetConfig[] = positionWidgets([
 	{ id: 'network', visible: true, width: 'half', presentation: 'standard' },
 	{ id: 'disk_io', visible: true, width: 'half', presentation: 'standard' },
 	{ id: 'compute', visible: false, width: 'half', presentation: 'standard' },
+	{ id: 'clock', visible: false, width: 'quarter', presentation: 'standard' },
+	{ id: 'schedule', visible: false, width: 'half', presentation: 'standard' },
 ]);
 
 export const dashboardPresets: Record<DashboardFixedPreset, {
@@ -399,7 +408,7 @@ function migrateLegacyPreferences(value: Record<string, unknown>): DashboardPref
 function normalizeDashboardPreferences(value: unknown): DashboardPreferences {
 	if (!isRecord(value)) return defaultDashboardPreferences();
 	if (value.version === 1) return migrateLegacyPreferences(value);
-	if (value.version !== 2 && value.version !== 3 && value.version !== 4 && value.version !== 5 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
+	if (value.version !== 2 && value.version !== 3 && value.version !== 4 && value.version !== 5 && value.version !== 6 && value.version !== DASHBOARD_PREFERENCES_VERSION) return defaultDashboardPreferences();
 
 	const customViews = normalizeCustomViews(value.customViews);
 	const requestedActiveViewId = typeof value.activeViewId === 'string' ? value.activeViewId.trim() : '';
@@ -432,6 +441,7 @@ export function parseDashboardPreferences(raw: string | null): DashboardPreferen
 export function loadDashboardPreferences(storage: Pick<Storage, 'getItem'>): DashboardPreferences {
 	return parseDashboardPreferences(
 		storage.getItem(DASHBOARD_PREFERENCES_KEY)
+		?? storage.getItem(LEGACY_DASHBOARD_V6_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V5_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V4_PREFERENCES_KEY)
 		?? storage.getItem(LEGACY_DASHBOARD_V3_PREFERENCES_KEY)

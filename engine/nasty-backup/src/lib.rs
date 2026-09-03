@@ -743,6 +743,57 @@ pub struct BackupStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BackupScheduleEntry {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub schedule: String,
+    /// Next nominal cron occurrence in UTC, formatted as RFC 3339.
+    pub next_run_at: Option<String>,
+    /// Present when an enabled profile contains an invalid cron expression.
+    pub schedule_error: Option<String>,
+    pub last_run: Option<BackupRunResult>,
+}
+
+fn schedule_entries(
+    profiles: &[BackupProfile],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<BackupScheduleEntry> {
+    let mut entries: Vec<_> = profiles
+        .iter()
+        .filter(|profile| profile.enabled)
+        .filter_map(|profile| {
+            let expression = profile.schedule.as_deref()?.trim();
+            if expression.is_empty() {
+                return None;
+            }
+            let (next_run_at, schedule_error) = match scheduler::parse_cron(expression) {
+                Ok(schedule) => (
+                    schedule.after(&now).next().map(|next| next.to_rfc3339()),
+                    None,
+                ),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            Some(BackupScheduleEntry {
+                profile_id: profile.id.clone(),
+                profile_name: profile.name.clone(),
+                schedule: expression.to_string(),
+                next_run_at,
+                schedule_error,
+                last_run: profile.last_run.clone(),
+            })
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        left.next_run_at
+            .is_none()
+            .cmp(&right.next_run_at.is_none())
+            .then_with(|| left.next_run_at.cmp(&right.next_run_at))
+            .then_with(|| left.profile_name.cmp(&right.profile_name))
+    });
+    entries
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RestoreSummary {
     /// Number of files written to the destination.
     pub files_restored: u64,
@@ -894,6 +945,14 @@ impl BackupService {
             .iter()
             .map(|p| p.redacted())
             .collect()
+    }
+
+    pub async fn list_schedule(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<BackupScheduleEntry> {
+        let profiles = self.profiles.lock().await;
+        schedule_entries(&profiles, now)
     }
 
     /// Return the in-memory profiles only after verifying that persisted state
@@ -1557,6 +1616,7 @@ async fn save_profiles(profiles: &[BackupProfile]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn backup_sources_must_not_be_empty() {
@@ -1625,6 +1685,36 @@ mod tests {
         };
         invalidate_last_run_if_definition_changed(&mut retargeted, &existing);
         assert!(retargeted.last_run.is_none());
+    }
+
+    #[test]
+    fn schedule_entries_use_scheduler_cron_and_sort_invalid_last() {
+        let now = chrono::Utc.with_ymd_and_hms(2026, 9, 2, 20, 0, 0).unwrap();
+        let mut daily = baseline_profile(BackupTarget::Local {
+            path: "/backup".into(),
+        });
+        daily.id = "daily".into();
+        daily.name = "Daily data".into();
+        daily.schedule = Some("0 3 * * *".into());
+        let mut invalid = daily.clone();
+        invalid.id = "invalid".into();
+        invalid.name = "Broken".into();
+        invalid.schedule = Some("not cron".into());
+        let mut disabled = daily.clone();
+        disabled.id = "disabled".into();
+        disabled.enabled = false;
+
+        let entries = schedule_entries(&[invalid, disabled, daily], now);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].profile_id, "daily");
+        assert_eq!(
+            entries[0].next_run_at.as_deref(),
+            Some("2026-09-03T03:00:00+00:00")
+        );
+        assert!(entries[0].schedule_error.is_none());
+        assert_eq!(entries[1].profile_id, "invalid");
+        assert!(entries[1].next_run_at.is_none());
+        assert!(entries[1].schedule_error.is_some());
     }
 
     fn s3_with_plaintext(secret: &str, region: Option<&str>) -> BackupTarget {

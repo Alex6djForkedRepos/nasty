@@ -1,14 +1,16 @@
 import { render } from 'svelte/server';
 import { describe, expect, test } from 'vitest';
 import AlertsWidget from './alerts-widget.svelte';
+import ClockWidget from './clock-widget.svelte';
 import ComputeWidget from './compute-widget.svelte';
 import HealthWidget from './health-widget.svelte';
 import HistoryWidget from './history-widget.svelte';
 import OperationsWidget from './operations-widget.svelte';
+import ScheduleWidget from './schedule-widget.svelte';
 import SummaryWidget from './summary-widget.svelte';
 import SystemWidget from './system-widget.svelte';
 import WidgetOptions from './widget-options.svelte';
-import type { ActiveAlert, AppsStatus, Filesystem, SystemInfo, SystemStats, VmStatus } from '$lib/types';
+import type { ActiveAlert, AppsStatus, BackupScheduleEntry, Filesystem, Settings, SystemInfo, SystemStats, VmStatus } from '$lib/types';
 
 const alert = (severity: ActiveAlert['severity'], message: string): ActiveAlert => ({
 	rule_id: message,
@@ -37,6 +39,7 @@ const info: SystemInfo = {
 	bcachefs_is_custom: false,
 	timezone: 'UTC',
 	ntp_synced: true,
+	current_time: '2026-09-02T20:00:00Z',
 };
 
 const stats: SystemStats = {
@@ -64,6 +67,12 @@ const appsStatus: AppsStatus = {
 	app_count: 2,
 	storage_ok: true,
 };
+
+const settings = {
+	timezone: 'UTC',
+	clock_24h: true,
+	dashboard_motd: 'Storage maintenance tonight.',
+} as Settings;
 
 const vm = (name: string, running: boolean, cpus: number, memory_mib: number): VmStatus => ({
 	id: name,
@@ -312,6 +321,59 @@ describe('dashboard compute widget', () => {
 		expect(loading).not.toContain('could not be loaded');
 		expect(partial).toContain('Inventory unavailable');
 		expect(partial).toContain('2 configured apps.');
+	});
+});
+
+describe('dashboard clock and schedule widgets', () => {
+	test('renders host time state and the configured dashboard notice', () => {
+		const body = render(ClockWidget, {
+			props: { info, settings, loaded: true, density: 'comfortable' },
+		}).body;
+
+		expect(body).toContain('Analog clock showing');
+		expect(body).toContain('UTC');
+		expect(body).toContain('NTP synchronized');
+		expect(body).toContain('Storage maintenance tonight.');
+	});
+
+	test('does not substitute browser time when host time is unavailable', () => {
+		const legacyInfo = { ...info, current_time: undefined } as unknown as SystemInfo;
+		const body = render(ClockWidget, {
+			props: { info: legacyInfo, settings, loaded: true, density: 'comfortable' },
+		}).body;
+
+		expect(body).toContain('Host time is unavailable.');
+		expect(body).not.toContain('Analog clock showing');
+	});
+
+	test('renders upcoming and invalid backup schedules explicitly', () => {
+		const entries: BackupScheduleEntry[] = [
+			{
+				profile_id: 'daily',
+				profile_name: 'Daily data',
+				schedule: '0 3 * * *',
+				next_run_at: '2099-09-03T03:00:00+00:00',
+				schedule_error: null,
+				last_run: null,
+			},
+			{
+				profile_id: 'broken',
+				profile_name: 'Broken profile',
+				schedule: 'not cron',
+				next_run_at: null,
+				schedule_error: 'invalid cron',
+				last_run: null,
+			},
+		];
+		const body = render(ScheduleWidget, {
+			props: { entries, currentTime: info.current_time, freshness: 'current', density: 'comfortable' },
+		}).body;
+
+		expect(body).toContain('Upcoming backups');
+		expect(body).toContain('Daily data');
+		expect(body).toContain('Broken profile');
+		expect(body).toContain('Invalid schedule');
+		expect(body).toContain('href="/backups"');
 	});
 });
 

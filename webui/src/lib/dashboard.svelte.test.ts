@@ -6,6 +6,7 @@ import {
 	LEGACY_DASHBOARD_V3_PREFERENCES_KEY,
 	LEGACY_DASHBOARD_V4_PREFERENCES_KEY,
 	LEGACY_DASHBOARD_V5_PREFERENCES_KEY,
+	LEGACY_DASHBOARD_V6_PREFERENCES_KEY,
 	createDashboardView,
 	dashboardPrefs,
 	dashboardPresetTabVisible,
@@ -43,7 +44,7 @@ describe('dashboard preferences', () => {
 	test('defaults missing, malformed, and unknown versions to overview', () => {
 		expect(parseDashboardPreferences(null).preset).toBe('overview');
 		expect(parseDashboardPreferences('{')).toEqual(defaultDashboardPreferences());
-		expect(parseDashboardPreferences('{"version":7,"preset":"storage"}')).toEqual(defaultDashboardPreferences());
+		expect(parseDashboardPreferences('{"version":8,"preset":"storage"}')).toEqual(defaultDashboardPreferences());
 	});
 
 	test('migrates the v1 custom layout without losing its configuration', () => {
@@ -57,7 +58,7 @@ describe('dashboard preferences', () => {
 			],
 		}));
 
-		expect(parsed.version).toBe(6);
+		expect(parsed.version).toBe(7);
 		expect(parsed.preset).toBe('custom');
 		expect(parsed.customViews).toHaveLength(1);
 		expect(getActiveDashboardView(parsed)).toMatchObject({
@@ -65,7 +66,7 @@ describe('dashboard preferences', () => {
 			density: 'compact',
 		});
 		expect(getActiveDashboardView(parsed).widgets[0]).toEqual({ id: 'storage', visible: false, width: 'half', presentation: 'standard', column: 0, row: 0, priority: 0 });
-		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(14);
+		expect(new Set(getActiveDashboardView(parsed).widgets.map((widget) => widget.id)).size).toBe(16);
 		expect(getActiveDashboardView(parsed).widgets.find((widget) => widget.id === 'compute')).toMatchObject({ visible: false, width: 'half' });
 	});
 
@@ -85,13 +86,13 @@ describe('dashboard preferences', () => {
 			}],
 		}));
 
-		expect(parsed.version).toBe(6);
+		expect(parsed.version).toBe(7);
 		expect(parsed.activeViewId).toBe('daily');
 		expect(getActiveDashboardView(parsed)).toMatchObject({ name: 'Daily', density: 'compact' });
 		expect(getActiveDashboardView(parsed).widgets.every((widget) => widget.presentation === 'standard')).toBe(true);
 	});
 
-	test('initializes v6 storage from the newest available legacy key without overwriting v6 preferences', () => {
+	test('initializes v7 storage from the newest available legacy key without overwriting v7 preferences', () => {
 		localStorage.clear();
 		localStorage.setItem(LEGACY_DASHBOARD_PREFERENCES_KEY, JSON.stringify({
 			version: 1,
@@ -128,10 +129,15 @@ describe('dashboard preferences', () => {
 			version: 5,
 			preset: 'monitoring',
 		}));
-		expect(initializeDashboardPreferences(localStorage).preset).toBe('monitoring');
-		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
+		localStorage.setItem(LEGACY_DASHBOARD_V6_PREFERENCES_KEY, JSON.stringify({
+			...defaultDashboardPreferences(),
 			version: 6,
-			preset: 'monitoring',
+			preset: 'custom',
+		}));
+		expect(initializeDashboardPreferences(localStorage).preset).toBe('custom');
+		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
+			version: 7,
+			preset: 'custom',
 		});
 
 		const stored = defaultDashboardPreferences();
@@ -198,7 +204,7 @@ describe('dashboard preferences', () => {
 		expect(widgets.find((widget) => widget.id === 'container_health')).toMatchObject({ column: 6, row: 0, priority: 0 });
 	});
 
-	test('adds Compute disabled without disturbing deployed v6 widget placement', () => {
+	test('adds new widgets disabled without disturbing deployed v6 widget placement', () => {
 		const existingWidgets: DashboardWidgetConfig[] = [
 			{ id: 'alerts', visible: false, width: 'full', presentation: 'tiny', column: 0, row: 7, priority: 4 },
 			{ id: 'storage', visible: true, width: 'half', presentation: 'standard', column: 6, row: 3, priority: 2 },
@@ -218,6 +224,8 @@ describe('dashboard preferences', () => {
 			width: 'half',
 			presentation: 'standard',
 		});
+		expect(widgets.find((widget) => widget.id === 'clock')).toMatchObject({ visible: false, width: 'quarter' });
+		expect(widgets.find((widget) => widget.id === 'schedule')).toMatchObject({ visible: false, width: 'half' });
 	});
 
 	test('normalizes named views, active selection, and newly added widget ids', () => {
@@ -245,7 +253,7 @@ describe('dashboard preferences', () => {
 		expect(parsed.activeViewId).toBe('ops');
 		expect(parsed.customViews.map((view) => view.id)).toEqual(['ops', 'custom-1']);
 		expect(parsed.customViews.map((view) => view.name)).toEqual(['Operations', 'operations 2']);
-		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(14);
+		expect(new Set(parsed.customViews[0].widgets.map((widget) => widget.id)).size).toBe(16);
 		expect(resolveDashboardWidgets(parsed)).not.toContainEqual(expect.objectContaining({ id: 'storage' }));
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'storage')?.presentation).toBe('standard');
 		expect(parsed.customViews[0].widgets.find((widget) => widget.id === 'alerts')?.presentation).toBe('tiny');
@@ -268,7 +276,7 @@ describe('dashboard preferences', () => {
 	test('limits narrow widths to compact-safe presentations', () => {
 		expect(dashboardWidgetSupportsNarrowWidth('alerts', 'standard')).toBe(false);
 		expect(dashboardWidgetSupportsNarrowWidth('alerts', 'tiny')).toBe(true);
-		for (const id of ['service_health', 'container_health', 'compute', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'] as const) {
+		for (const id of ['service_health', 'container_health', 'compute', 'clock', 'cpu_load', 'memory_usage', 'cpu_status', 'storage_summary'] as const) {
 			expect(dashboardWidgetSupportsNarrowWidth(id, 'standard')).toBe(true);
 		}
 		expect(dashboardWidgetSupportsNarrowWidth('storage', 'standard')).toBe(false);
@@ -285,6 +293,7 @@ describe('dashboard preferences', () => {
 		expect(dashboardWidgetWidthClass('alerts', 'quarter')).toContain('xl:col-span-3');
 		expect(dashboardWidgetWidthClass('service_health', 'half')).toContain('md:col-span-6');
 		expect(dashboardWidgetWidthClass('compute', 'quarter')).toContain('xl:col-span-3');
+		expect(dashboardWidgetWidthClass('clock', 'quarter')).toContain('xl:col-span-3');
 		expect(dashboardWidgetWidthClass('cpu_load', 'quarter')).toContain('lg:col-span-3');
 	});
 
@@ -400,13 +409,13 @@ describe('dashboard preferences', () => {
 		expect(getActiveDashboardView(preferences).density).toBe('compact');
 	});
 
-	test('persists the active named view in v6 storage', () => {
+	test('persists the active named view in v7 storage', () => {
 		const preferences = createDashboardView(defaultDashboardPreferences(), 'Monitoring desk');
 		dashboardPrefs.set(preferences);
 
 		expect(dashboardPrefs.value.preset).toBe('custom');
 		expect(JSON.parse(localStorage.getItem(DASHBOARD_PREFERENCES_KEY) ?? '{}')).toMatchObject({
-			version: 6,
+			version: 7,
 			preset: 'custom',
 			activeViewId: preferences.activeViewId,
 		});

@@ -18,7 +18,7 @@ use nasty_apps::{
     ManagedNetwork, NetworkSummary, PortConflict, PruneResult, SetComposeStartupRequest,
     SetIngressRequest, VolumeMismatch,
 };
-use nasty_backup::{BackupProfile, BackupSnapshot, BackupStatus};
+use nasty_backup::{BackupProfile, BackupScheduleEntry, BackupSnapshot, BackupStatus};
 use nasty_sharing::iscsi::{
     AddAclRequest, AddLunRequest, AddPortalRequest, CreateTargetRequest, DeleteTargetRequest,
     IscsiTarget, RemoveAclRequest, RemoveLunRequest, RemovePortalRequest, RepairLunRequest,
@@ -2621,6 +2621,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<BackupProfile>>(generator)),
+                },
+                Method {
+                    name: "backup.schedule.list",
+                    desc: "Return enabled backup schedules with their next nominal UTC cron occurrence.",
+                    role: MethodRole::Any,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<Vec<BackupScheduleEntry>>(generator)),
                 },
                 Method {
                     name: "backup.profile.get",

@@ -30,6 +30,7 @@
 		ActiveAlert,
 		App,
 		AppsStatus,
+		BackupScheduleEntry,
 		DiskHealth,
 		DiskIoStats,
 		Filesystem,
@@ -37,6 +38,7 @@
 		NetIfStats,
 		ProtocolStatus,
 		ResourceHistory,
+		Settings,
 		SystemHealth,
 		SystemInfo,
 		SystemStats,
@@ -54,6 +56,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import AlertsWidget from '$lib/components/dashboard/alerts-widget.svelte';
+	import ClockWidget from '$lib/components/dashboard/clock-widget.svelte';
 	import ComputeWidget from '$lib/components/dashboard/compute-widget.svelte';
 	import CustomizeDialog from '$lib/components/dashboard/customize-dialog.svelte';
 	import DiskIoWidget from '$lib/components/dashboard/disk-io-widget.svelte';
@@ -62,6 +65,7 @@
 	import HistoryWidget from '$lib/components/dashboard/history-widget.svelte';
 	import NetworkWidget from '$lib/components/dashboard/network-widget.svelte';
 	import OperationsWidget from '$lib/components/dashboard/operations-widget.svelte';
+	import ScheduleWidget from '$lib/components/dashboard/schedule-widget.svelte';
 	import StorageWidget from '$lib/components/dashboard/storage-widget.svelte';
 	import SummaryWidget from '$lib/components/dashboard/summary-widget.svelte';
 	import SystemWidget from '$lib/components/dashboard/system-widget.svelte';
@@ -103,6 +107,10 @@
 	let appsStatus = $state<AppsStatus | null>(null);
 	let vms = $state<VmStatus[] | null>(null);
 	let vmFreshness = $state<DashboardHealthFreshness>('loading');
+	let settings = $state<Settings | null>(null);
+	let clockDataLoaded = $state(false);
+	let scheduleEntries = $state<BackupScheduleEntry[] | null>(null);
+	let scheduleFreshness = $state<DashboardHealthFreshness>('loading');
 	let customizeOpen = $state(false);
 	let editingDashboard = $state(false);
 	let customizeButton = $state<HTMLButtonElement | null>(null);
@@ -117,6 +125,8 @@
 	let healthRequest = 0;
 	let alertsRequest = 0;
 	let operationsRequest = 0;
+	let clockRequest = 0;
+	let scheduleRequest = 0;
 	let serviceHealthInFlight: Promise<void> | null = null;
 	let containerHealthInFlight: Promise<void> | null = null;
 	let vmHealthInFlight: Promise<void> | null = null;
@@ -389,8 +399,10 @@
 			const tasks: Promise<unknown>[] = [
 				fetchFilesystemInventory(),
 			];
+			if (hasWidget('system') || hasWidget('clock') || hasWidget('schedule')) {
+				tasks.push(hasWidget('clock') ? loadClockData() : loadSystemInfo());
+			}
 			if (hasWidget('system')) {
-				tasks.push(loadSystemInfo());
 				tasks.push(loadSystemHealth());
 			}
 			if (needsStats()) {
@@ -405,6 +417,7 @@
 			}
 			if (hasWidget('alerts')) tasks.push(loadAlerts());
 			if (hasWidget('operations')) tasks.push(loadOperations());
+			if (hasWidget('schedule')) tasks.push(loadBackupSchedule());
 			if (healthPollingEnabled('service_health')) tasks.push(loadServiceHealth(true));
 			if (healthPollingEnabled('container_health')) tasks.push(loadContainerHealth(true));
 			if (vmPollingEnabled()) tasks.push(loadVmHealth(true));
@@ -435,6 +448,38 @@
 		if (request !== infoRequest) return;
 		info = value;
 		infoLoaded = true;
+	}
+
+	async function loadClockData() {
+		const request = ++clockRequest;
+		const [nextInfo, nextSettings] = await Promise.allSettled([
+			client.call<SystemInfo>('system.info'),
+			client.call<Settings>('system.settings.get'),
+		]);
+		if (request !== clockRequest) return;
+		if (nextInfo.status === 'fulfilled') {
+			info = nextInfo.value;
+			infoLoaded = true;
+		}
+		if (nextSettings.status === 'fulfilled') {
+			settings = { ...nextSettings.value, dashboard_motd: nextSettings.value.dashboard_motd ?? '' };
+		}
+		clockDataLoaded = true;
+		const failure = [nextInfo, nextSettings].find((result): result is PromiseRejectedResult => result.status === 'rejected');
+		if (failure) throw failure.reason;
+	}
+
+	async function loadBackupSchedule() {
+		const request = ++scheduleRequest;
+		scheduleFreshness = scheduleEntries ? 'refreshing' : 'loading';
+		try {
+			const entries = await client.call<BackupScheduleEntry[]>('backup.schedule.list');
+			if (request !== scheduleRequest) return;
+			scheduleEntries = entries;
+			scheduleFreshness = 'current';
+		} catch {
+			if (request === scheduleRequest) scheduleFreshness = scheduleEntries ? 'stale' : 'unavailable';
+		}
 	}
 
 	async function loadSystemHealth() {
@@ -596,9 +641,11 @@
 			if (needsStats()) tasks.push(refreshStats());
 			if (hasWidget('alerts')) tasks.push(loadAlerts());
 			if (hasWidget('operations')) tasks.push(loadOperations());
-			if (hasWidget('system') && refreshTick % 4 === 0) {
-				tasks.push(loadSystemHealth());
-				if (!infoLoaded) tasks.push(loadSystemInfo());
+			if (refreshTick % 4 === 0) {
+				if (hasWidget('clock')) tasks.push(loadClockData());
+				else if (hasWidget('schedule') || (hasWidget('system') && !infoLoaded)) tasks.push(loadSystemInfo());
+				if (hasWidget('system')) tasks.push(loadSystemHealth());
+				if (hasWidget('schedule')) tasks.push(loadBackupSchedule());
 			}
 			if (refreshTick % 4 === 0) tasks.push(loadFilesystemData());
 			else if (hasWidget('storage') && refreshTick % 2 === 0) tasks.push(loadStorageDetails());
@@ -890,6 +937,10 @@
 					<HealthWidget kind="containers" containers={containerHealth} freshness={containerHealthFreshness} {density} />
 				{:else if widget.id === 'compute'}
 					<ComputeWidget {vms} {appsStatus} containers={containerHealth} {vmFreshness} containerFreshness={containerHealthFreshness} {density} />
+				{:else if widget.id === 'clock'}
+					<ClockWidget {info} {settings} loaded={clockDataLoaded} {density} />
+				{:else if widget.id === 'schedule'}
+					<ScheduleWidget entries={scheduleEntries} currentTime={info?.current_time} freshness={scheduleFreshness} {density} />
 				{:else if widget.id === 'cpu_load' || widget.id === 'memory_usage' || widget.id === 'cpu_status' || widget.id === 'storage_summary'}
 					<SummaryWidget kind={widget.id} {stats} {filesystems} {filesystemsLoaded} {density} />
 				{:else if widget.id === 'operations'}

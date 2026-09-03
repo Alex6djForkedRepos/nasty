@@ -65,6 +65,7 @@ export interface SystemInfo {
 	bcachefs_is_custom: boolean;
 	timezone: string;
 	ntp_synced: boolean;
+	current_time?: string;
 }
 
 export interface SystemHealth {
@@ -1197,6 +1198,7 @@ export interface Settings {
 	timezone: string;
 	hostname: string | null;
 	clock_24h: boolean;
+	dashboard_motd: string;
 	temp_unit: TempUnit;
 	tls_domain: string | null;
 	files_domain: string | null;
@@ -1532,6 +1534,15 @@ export interface BackupProfile {
 	 * rest-server / MinIO). Engine writes it to disk and passes the
 	 * path through to rustic_backend's `cacert` option. */
 	trusted_cacert?: string;
+}
+
+export interface BackupScheduleEntry {
+	profile_id: string;
+	profile_name: string;
+	schedule: string;
+	next_run_at: string | null;
+	schedule_error: string | null;
+	last_run: BackupRunResult | null;
 }
 
 export type BackupTarget =
