@@ -36,8 +36,15 @@
 		return Math.min(100, Math.max(0, value));
 	}
 
+	function utilizationColor(percent: number): string {
+		if (percent > 90) return 'var(--color-red-500)';
+		if (percent > 75) return 'var(--color-amber-500)';
+		return 'var(--color-emerald-500)';
+	}
+
 	let cpu = $derived(summarize(cpuSamples));
 	let memory = $derived(summarize(memorySamples));
+	let memoryColor = $derived(utilizationColor(memory?.current ?? 0));
 </script>
 
 {#if presentation === 'tiny'}
@@ -59,7 +66,7 @@
 				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">Memory usage</CardTitle>
 				{#if memory}
 					<div class="mt-1 text-2xl font-bold tabular-nums">{memory.current.toFixed(1)}%</div>
-					<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary" aria-hidden="true"><div class="h-full rounded-full bg-[var(--chart-5)]" style="width: {boundedPercent(memory.current)}%"></div></div>
+					<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary" aria-hidden="true"><div class="h-full rounded-full" style="width: {boundedPercent(memory.current)}%; background-color: {memoryColor}"></div></div>
 					<div class="mt-1.5 text-xs text-muted-foreground">{range} peak {memory.peak.toFixed(1)}%</div>
 				{:else}
 					<div class="mt-2 text-sm font-medium text-muted-foreground" role="status">{loading ? 'Loading...' : 'Unavailable'}</div>
@@ -75,7 +82,7 @@
 		</Card>
 		<Card>
 			<CardHeader class={density === 'compact' ? 'px-4 py-2.5' : 'pb-2'}><CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">Memory usage</CardTitle></CardHeader>
-			<CardContent class={density === 'compact' ? 'px-4 pb-3' : ''}><IoChart samples={memorySamples} inLabel="Used" inColor="var(--chart-5)" yFormat={(value) => value.toFixed(0) + '%'} tooltipFormat={(value) => value.toFixed(1) + '%'} ariaLabel="Memory usage history" emptyMessage={loading ? 'Loading data...' : 'No data for selected interval.'} /></CardContent>
+			<CardContent class={density === 'compact' ? 'px-4 pb-3' : ''}><IoChart samples={memorySamples} inLabel="Used" inColor={memoryColor} yFormat={(value) => value.toFixed(0) + '%'} tooltipFormat={(value) => value.toFixed(1) + '%'} ariaLabel="Memory usage history" emptyMessage={loading ? 'Loading data...' : 'No data for selected interval.'} /></CardContent>
 		</Card>
 	</div>
 {/if}
