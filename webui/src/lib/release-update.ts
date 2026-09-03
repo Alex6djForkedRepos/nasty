@@ -13,9 +13,26 @@ interface UpdateRpcClient {
 	call<T>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
 }
 
-let updateCheckInFlight: Promise<UpdateInfo> | null = null;
+export type ReleaseUpdateCheckMode = 'fresh' | 'cached';
+
+const updateChecksInFlight: Record<ReleaseUpdateCheckMode, Promise<UpdateInfo> | null> = {
+	fresh: null,
+	cached: null,
+};
 let releaseUpdateSnapshot: ReleaseUpdateChangedDetail | null = null;
 const UPDATE_CHECK_TIMEOUT_MS = 180_000;
+
+async function fetchCachedReleaseUpdateCheck(): Promise<UpdateInfo> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
+	try {
+		const response = await fetch('/api/v1/system/update/check_cached', { signal: controller.signal });
+		if (!response.ok) throw new Error(`Update check failed with HTTP ${response.status}`);
+		return await response.json() as UpdateInfo;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
 
 export interface ReleaseUpdateDisplay {
 	kind: ReleaseUpdateKind;
@@ -51,19 +68,25 @@ export function setReleaseUpdateSnapshot(
 	releaseUpdateSnapshot = { info, requestState };
 }
 
-export function requestReleaseUpdateCheck(client: UpdateRpcClient): Promise<UpdateInfo> {
-	if (updateCheckInFlight) return updateCheckInFlight;
-	const request = client.call<UpdateInfo>('system.update.check', undefined, UPDATE_CHECK_TIMEOUT_MS);
-	updateCheckInFlight = request;
+export function requestReleaseUpdateCheck(
+	client: UpdateRpcClient,
+	mode: ReleaseUpdateCheckMode = 'fresh',
+): Promise<UpdateInfo> {
+	if (updateChecksInFlight[mode]) return updateChecksInFlight[mode];
+	const request = mode === 'cached'
+		? fetchCachedReleaseUpdateCheck()
+		: client.call<UpdateInfo>('system.update.check', undefined, UPDATE_CHECK_TIMEOUT_MS);
+	updateChecksInFlight[mode] = request;
 	const clear = () => {
-		if (updateCheckInFlight === request) updateCheckInFlight = null;
+		if (updateChecksInFlight[mode] === request) updateChecksInFlight[mode] = null;
 	};
 	request.then(clear, clear);
 	return request;
 }
 
 export function invalidateReleaseUpdateCheck() {
-	updateCheckInFlight = null;
+	updateChecksInFlight.fresh = null;
+	updateChecksInFlight.cached = null;
 }
 
 export function releaseUpdateDisplay(

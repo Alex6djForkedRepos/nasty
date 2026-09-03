@@ -714,6 +714,10 @@ pub(super) async fn try_route(
             Ok(v) => ok(req, v),
             Err(e) => err(req, e),
         },
+        "system.update.check_cached" => match state.updates.check_cached().await {
+            Ok(v) => ok(req, v),
+            Err(e) => err(req, e),
+        },
         "system.update.apply" => match state.updates.apply().await {
             Ok(()) => {
                 state.system.invalidate_bcachefs_cache().await;

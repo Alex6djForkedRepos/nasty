@@ -301,11 +301,15 @@
 		localStorage.setItem(SIDEBAR_KEY, sidebarCollapsed ? '1' : '0');
 	}
 
-	// Version info (loaded once after connect)
+	// Version and release status shown in the sidebar footer.
 	let sysInfo: { hostname: string; version: string; kernel: string; bcachefs_version: string; bcachefs_commit: string | null; bcachefs_pinned_ref: string | null; bcachefs_recommended_ref: string | null; bcachefs_is_custom: boolean; bcachefs_debug_checks: boolean; kvm_available: boolean; is_virtual: boolean } | null = $state(null);
 	let releaseInfo: UpdateInfo | null = $state(null);
 	let releaseRequestState: ReleaseUpdateRequestState = $state('idle');
 	let releaseRequest = 0;
+	const RELEASE_UPDATE_POLL_MS = 5 * 60_000;
+	let releaseUpdatePoll: ReturnType<typeof setTimeout> | null = null;
+	let releaseUpdatePolling = false;
+	let releaseUpdateRefresh: Promise<void> | null = null;
 	let releaseUpdate = $derived(releaseUpdateDisplay(releaseInfo, releaseRequestState));
 	let releaseUpdateClass = $derived(
 		releaseUpdate.kind === 'current' ? 'text-emerald-400'
@@ -377,7 +381,7 @@
 			// The local endpoint is cheap and may gain a cached result later. Only
 			// fall through to the remote lookup when the status is still unknown.
 			if (shouldCheckReleaseUpdate(info)) {
-				info = await requestReleaseUpdateCheck(getClient());
+				info = await requestReleaseUpdateCheck(getClient(), 'cached');
 				if (request !== releaseRequest) return;
 				releaseInfo = info;
 			}
@@ -389,6 +393,41 @@
 				publishReleaseUpdate(releaseInfo, 'failed');
 			}
 		}
+	}
+
+	function refreshReleaseUpdate() {
+		if (releaseUpdateRefresh) return releaseUpdateRefresh;
+		const request = loadReleaseUpdate();
+		releaseUpdateRefresh = request;
+		void request.finally(() => {
+			if (releaseUpdateRefresh === request) releaseUpdateRefresh = null;
+		});
+		return request;
+	}
+
+	function scheduleReleaseUpdatePoll() {
+		if (!releaseUpdatePolling) return;
+		if (releaseUpdatePoll) clearTimeout(releaseUpdatePoll);
+		releaseUpdatePoll = setTimeout(async () => {
+			releaseUpdatePoll = null;
+			if (connected && isManagementRole(authInfo?.role) && !document.hidden) {
+				await refreshReleaseUpdate();
+			}
+			scheduleReleaseUpdatePoll();
+		}, RELEASE_UPDATE_POLL_MS);
+	}
+
+	function triggerReleaseUpdateRefresh() {
+		if (!connected || !isManagementRole(authInfo?.role) || document.hidden) return;
+		if (releaseUpdatePoll) {
+			clearTimeout(releaseUpdatePoll);
+			releaseUpdatePoll = null;
+		}
+		void refreshReleaseUpdate().finally(scheduleReleaseUpdatePoll);
+	}
+
+	function handleReleaseUpdateVisibility() {
+		if (!document.hidden) triggerReleaseUpdateRefresh();
 	}
 
 	function handleReleaseUpdateChanged(event: Event) {
@@ -519,6 +558,7 @@
 		// — without this trigger it shows the pre-reboot version until the
 		// user hits cmd+R.
 		sysInfoRefresh.trigger();
+		triggerReleaseUpdateRefresh();
 	};
 	const onDisconnect = () => {
 		dbg(`disconnect cb fired — arming ${RECONNECT_OVERLAY_DELAY_MS}ms reconnect-overlay timer (powering=${powering}, prior timer=${reconnectingTimer ? 'rearming' : 'fresh'})`);
@@ -541,9 +581,11 @@
 
 	onMount(() => {
 		if (isPublicShare) return;
+		releaseUpdatePolling = true;
 		tryConnect();
 		window.addEventListener(RECOVERY_BACKUP_CHANGED_EVENT, checkConfigBackup);
 		window.addEventListener(RELEASE_UPDATE_CHANGED_EVENT, handleReleaseUpdateChanged);
+		document.addEventListener('visibilitychange', handleReleaseUpdateVisibility);
 		const tick = setInterval(() => { now = new Date(); }, 1000);
 		const rebootPoll = setInterval(checkRebootRequired, 30_000);
 		const statusPoll = setInterval(refreshSystemStatus, 20_000);
@@ -551,7 +593,9 @@
 		const sshPoll = setInterval(checkSshStatus, 30_000);
 		const backupPoll = setInterval(checkConfigBackup, 30_000);
 		return () => {
+			releaseUpdatePolling = false;
 			if (reconnectingTimer) clearTimeout(reconnectingTimer);
+			if (releaseUpdatePoll) clearTimeout(releaseUpdatePoll);
 			lifecycleClient?.offReconnect(onReconnect);
 			lifecycleClient?.offDisconnect(onDisconnect);
 			lifecycleClient?.disconnect();
@@ -564,6 +608,7 @@
 			clearInterval(authPoll);
 			window.removeEventListener(RECOVERY_BACKUP_CHANGED_EVENT, checkConfigBackup);
 			window.removeEventListener(RELEASE_UPDATE_CHANGED_EVENT, handleReleaseUpdateChanged);
+			document.removeEventListener('visibilitychange', handleReleaseUpdateVisibility);
 		};
 	});
 
@@ -612,7 +657,7 @@
 			if (isManagementRole(authInfo.role)) {
 				checkSshStatus();
 				checkConfigBackup();
-				void loadReleaseUpdate();
+				triggerReleaseUpdateRefresh();
 			}
 			// Capture engine commit on first connect for reconnect version check
 			if (!initialCommit) {

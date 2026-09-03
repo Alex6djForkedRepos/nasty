@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { UpdateInfo } from './types';
 import { getReleaseUpdateSnapshot, invalidateReleaseUpdateCheck, publishReleaseUpdate, releaseUpdateDisplay, requestReleaseUpdateCheck, setReleaseUpdateSnapshot, shouldCheckReleaseUpdate } from './release-update';
 
@@ -13,6 +13,10 @@ const info: UpdateInfo = {
 };
 
 describe('release update display', () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
 	test('distinguishes loading and unchecked states', () => {
 		expect(releaseUpdateDisplay(null, 'loading')).toMatchObject({ kind: 'loading', label: 'checking' });
 		expect(releaseUpdateDisplay(info, 'ready')).toMatchObject({ kind: 'unknown', label: 'unchecked' });
@@ -66,9 +70,11 @@ describe('release update display', () => {
 		let resolve!: (value: typeof info) => void;
 		let calls = 0;
 		let timeout = 0;
+		let method = '';
 		const client = {
-			call: <T>(_method: string, _params?: unknown, timeoutMs?: number) => {
+			call: <T>(nextMethod: string, _params?: unknown, timeoutMs?: number) => {
 				calls++;
+				method = nextMethod;
 				timeout = timeoutMs ?? 0;
 				return new Promise<typeof info>((done) => { resolve = done; }) as Promise<T>;
 			},
@@ -78,6 +84,7 @@ describe('release update display', () => {
 
 		expect(second).toBe(first);
 		expect(calls).toBe(1);
+		expect(method).toBe('system.update.check');
 		expect(timeout).toBe(180_000);
 		resolve(info);
 		await first;
@@ -86,6 +93,21 @@ describe('release update display', () => {
 		expect(calls).toBe(2);
 		resolve(info);
 		await third;
+	});
+
+	test('uses the REST gateway for cached background polling', async () => {
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve(info),
+		});
+		vi.stubGlobal('fetch', fetchMock);
+		const client = { call: <T>() => Promise.resolve(info) as Promise<T> };
+
+		await requestReleaseUpdateCheck(client, 'cached');
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/v1/system/update/check_cached',
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
 	});
 
 	test('starts a fresh check after the previous request is invalidated', async () => {
