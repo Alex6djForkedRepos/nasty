@@ -7,7 +7,7 @@ pub mod jobs;
 pub mod restore;
 pub mod scheduler;
 
-use jobs::{BackupJob, BackupJobKind, JobError, JobRegistry};
+use jobs::{BackupJob, BackupJobKind, JobError, JobRegistry, spawn_monitored};
 use nasty_common::secrets::{self, EncryptedBlob, SecretsStatus};
 use restore::{RestoreProgress, RestoreProgressBars, validate_restore_dest};
 use rustic_backend::BackendOptions;
@@ -1251,21 +1251,26 @@ impl BackupService {
         let profile_id = id.to_string();
         let registry = self.jobs.clone();
         let service = self.clone_for_task();
-        tokio::spawn(async move {
-            registry.mark_running(&job_id).await;
-            match service.init_repo(&profile_id).await {
-                Ok(msg) => {
-                    registry
-                        .mark_succeeded(&job_id, serde_json::Value::String(msg))
-                        .await;
+        spawn_monitored(
+            registry.clone(),
+            self.running.clone(),
+            job_id.clone(),
+            async move {
+                registry.mark_running(&job_id).await;
+                match service.init_repo(&profile_id).await {
+                    Ok(msg) => {
+                        registry
+                            .mark_succeeded(&job_id, serde_json::Value::String(msg))
+                            .await;
+                    }
+                    Err(e) => {
+                        registry
+                            .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                            .await;
+                    }
                 }
-                Err(e) => {
-                    registry
-                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
-                        .await;
-                }
-            }
-        });
+            },
+        );
         Ok(job)
     }
 
@@ -1279,29 +1284,35 @@ impl BackupService {
         let profile_id = id.to_string();
         let registry = self.jobs.clone();
         let service = self.clone_for_task();
-        tokio::spawn(async move {
-            registry.mark_running(&job_id).await;
-            match service.run_backup(&profile_id).await {
-                Ok(result) => {
-                    let value = serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
-                    if result.success {
-                        registry.mark_succeeded(&job_id, value).await;
-                    } else {
-                        // run_backup() returns Ok with success=false
-                        // when rustic reported a failure. Map that to
-                        // a Failed job state so the WebUI's polling
-                        // loop renders it consistently with the
-                        // "engine returned an error" case.
-                        registry.mark_failed(&job_id, result.message.clone()).await;
+        spawn_monitored(
+            registry.clone(),
+            self.running.clone(),
+            job_id.clone(),
+            async move {
+                registry.mark_running(&job_id).await;
+                match service.run_backup(&profile_id).await {
+                    Ok(result) => {
+                        let value =
+                            serde_json::to_value(&result).unwrap_or(serde_json::Value::Null);
+                        if result.success {
+                            registry.mark_succeeded(&job_id, value).await;
+                        } else {
+                            // run_backup() returns Ok with success=false
+                            // when rustic reported a failure. Map that to
+                            // a Failed job state so the WebUI's polling
+                            // loop renders it consistently with the
+                            // "engine returned an error" case.
+                            registry.mark_failed(&job_id, result.message.clone()).await;
+                        }
+                    }
+                    Err(e) => {
+                        registry
+                            .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                            .await;
                     }
                 }
-                Err(e) => {
-                    registry
-                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
-                        .await;
-                }
-            }
-        });
+            },
+        );
         Ok(job)
     }
 
@@ -1312,21 +1323,26 @@ impl BackupService {
         let profile_id = id.to_string();
         let registry = self.jobs.clone();
         let service = self.clone_for_task();
-        tokio::spawn(async move {
-            registry.mark_running(&job_id).await;
-            match service.check_repo(&profile_id).await {
-                Ok(msg) => {
-                    registry
-                        .mark_succeeded(&job_id, serde_json::Value::String(msg))
-                        .await;
+        spawn_monitored(
+            registry.clone(),
+            self.running.clone(),
+            job_id.clone(),
+            async move {
+                registry.mark_running(&job_id).await;
+                match service.check_repo(&profile_id).await {
+                    Ok(msg) => {
+                        registry
+                            .mark_succeeded(&job_id, serde_json::Value::String(msg))
+                            .await;
+                    }
+                    Err(e) => {
+                        registry
+                            .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                            .await;
+                    }
                 }
-                Err(e) => {
-                    registry
-                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
-                        .await;
-                }
-            }
-        });
+            },
+        );
         Ok(job)
     }
 
@@ -1365,38 +1381,44 @@ impl BackupService {
         let progress = RestoreProgress::new();
         let poll_progress = progress.clone();
 
-        tokio::spawn(async move {
-            registry.mark_running(&job_id).await;
+        spawn_monitored(
+            registry.clone(),
+            self.running.clone(),
+            job_id.clone(),
+            async move {
+                registry.mark_running(&job_id).await;
 
-            let work = service.restore_inner(&profile_id, &snapshot_id, resolved_dest, progress);
-            tokio::pin!(work);
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            ticker.tick().await; // first tick fires immediately; skip it
+                let work =
+                    service.restore_inner(&profile_id, &snapshot_id, resolved_dest, progress);
+                tokio::pin!(work);
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+                ticker.tick().await; // first tick fires immediately; skip it
 
-            loop {
-                tokio::select! {
-                    res = &mut work => {
-                        match res {
-                            Ok(summary) => {
-                                let value = serde_json::to_value(&summary)
-                                    .unwrap_or(serde_json::Value::Null);
-                                registry.mark_progress(&job_id, 1.0).await;
-                                registry.mark_succeeded(&job_id, value).await;
+                loop {
+                    tokio::select! {
+                        res = &mut work => {
+                            match res {
+                                Ok(summary) => {
+                                    let value = serde_json::to_value(&summary)
+                                        .unwrap_or(serde_json::Value::Null);
+                                    registry.mark_progress(&job_id, 1.0).await;
+                                    registry.mark_succeeded(&job_id, value).await;
+                                }
+                                Err(e) => {
+                                    registry
+                                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                                        .await
+                                }
                             }
-                            Err(e) => {
-                                registry
-                                    .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
-                                    .await
-                            }
+                            break;
                         }
-                        break;
-                    }
-                    _ = ticker.tick() => {
-                        registry.mark_progress(&job_id, poll_progress.fraction()).await;
+                        _ = ticker.tick() => {
+                            registry.mark_progress(&job_id, poll_progress.fraction()).await;
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
 
         Ok(job)
     }

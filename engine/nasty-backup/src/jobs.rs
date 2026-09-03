@@ -27,13 +27,15 @@
 //! [`Pending`]: BackupJobState::Pending
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -168,6 +170,8 @@ pub enum JobError {
 /// day doesn't accumulate thousands of entries.
 const JOB_RETENTION: Duration = Duration::hours(1);
 
+const UNEXPECTED_TASK_ERROR: &str = "Backup operation stopped unexpectedly; retry the operation";
+
 /// In-memory store of currently-active and recently-finished backup
 /// jobs. Cheap-to-clone Arc so the spawned task can update its own
 /// entry without going through the BackupService.
@@ -257,6 +261,32 @@ impl JobRegistry {
         }
     }
 
+    async fn recover_abandoned(&self, job_id: &str, running: &Mutex<Option<String>>) -> bool {
+        let mut map = self.inner.write().await;
+        let Some(job) = map.get(job_id) else {
+            return false;
+        };
+        if job.state.is_terminal() {
+            return false;
+        }
+        let profile_id = job.profile_id.clone();
+
+        // Keep start() excluded until the stale running marker is cleared and
+        // the abandoned job is terminal, so a same-profile replacement cannot
+        // be mistaken for the old run.
+        let mut running = running.lock().await;
+        if running.as_deref() == Some(profile_id.as_str()) {
+            *running = None;
+        }
+
+        let job = map.get_mut(job_id).expect("job was checked above");
+        job.state = BackupJobState::Failed;
+        job.finished_at = Some(now_rfc3339());
+        job.error = Some(UNEXPECTED_TASK_ERROR.to_string());
+        warn!("{} failed", job.log_target());
+        true
+    }
+
     pub async fn get(&self, job_id: &str) -> Option<BackupJob> {
         let mut map = self.inner.write().await;
         self.gc_locked(&mut map);
@@ -302,6 +332,43 @@ impl JobRegistry {
     }
 }
 
+pub(crate) fn spawn_monitored<F>(
+    registry: JobRegistry,
+    running: Arc<Mutex<Option<String>>>,
+    job_id: String,
+    task: F,
+) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let worker = tokio::spawn(task);
+    tokio::spawn(monitor_task(registry, running, job_id, worker))
+}
+
+async fn monitor_task(
+    registry: JobRegistry,
+    running: Arc<Mutex<Option<String>>>,
+    job_id: String,
+    worker: JoinHandle<()>,
+) {
+    match worker.await {
+        Ok(()) => {}
+        Err(error) => {
+            let outcome = if error.is_cancelled() {
+                "was cancelled"
+            } else if error.is_panic() {
+                "panicked"
+            } else {
+                "ended abnormally"
+            };
+            // JoinError may contain a panic payload, so log only its classification.
+            warn!("backup job {job_id} worker {outcome}");
+        }
+    }
+
+    registry.recover_abandoned(&job_id, &running).await;
+}
+
 fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
@@ -323,6 +390,17 @@ impl BackupJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn active_job() -> (JobRegistry, BackupJob, Arc<Mutex<Option<String>>>) {
+        let registry = JobRegistry::new();
+        let job = registry
+            .start("profile-a", BackupJobKind::RunBackup)
+            .await
+            .unwrap();
+        registry.mark_running(&job.id).await;
+        let running = Arc::new(Mutex::new(Some(job.profile_id.clone())));
+        (registry, job, running)
+    }
 
     fn delta_ago_rfc3339(seconds: i64) -> String {
         (Utc::now() - Duration::seconds(seconds)).to_rfc3339()
@@ -515,5 +593,141 @@ mod tests {
         assert_eq!(reg.get(&job.id).await.unwrap().progress_fraction, Some(1.0));
         reg.mark_progress(&job.id, -0.3).await;
         assert_eq!(reg.get(&job.id).await.unwrap().progress_fraction, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn monitor_stores_generic_error_for_panicked_task() {
+        let (registry, job, running) = active_job().await;
+        let monitor = spawn_monitored(registry.clone(), running.clone(), job.id.clone(), async {
+            panic!("secret panic payload")
+        });
+        monitor.await.unwrap();
+
+        let finished = registry.get(&job.id).await.unwrap();
+        assert_eq!(finished.state, BackupJobState::Failed);
+        assert_eq!(finished.error.as_deref(), Some(UNEXPECTED_TASK_ERROR));
+        assert!(!finished.error.unwrap().contains("secret panic payload"));
+        assert!(running.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn monitor_fails_aborted_task() {
+        let (registry, job, running) = active_job().await;
+        let worker = tokio::spawn(std::future::pending());
+        worker.abort();
+
+        monitor_task(registry.clone(), running.clone(), job.id.clone(), worker).await;
+
+        let finished = registry.get(&job.id).await.unwrap();
+        assert_eq!(finished.state, BackupJobState::Failed);
+        assert_eq!(finished.error.as_deref(), Some(UNEXPECTED_TASK_ERROR));
+        assert!(running.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn monitor_fails_clean_exit_without_terminal_state() {
+        let (registry, job, running) = active_job().await;
+        let monitor = spawn_monitored(registry.clone(), running.clone(), job.id.clone(), async {});
+        monitor.await.unwrap();
+
+        let finished = registry.get(&job.id).await.unwrap();
+        assert_eq!(finished.state, BackupJobState::Failed);
+        assert_eq!(finished.error.as_deref(), Some(UNEXPECTED_TASK_ERROR));
+        assert!(running.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn monitor_preserves_normal_terminal_completion() {
+        let (registry, job, running) = active_job().await;
+        let worker_registry = registry.clone();
+        let worker_running = running.clone();
+        let worker_job_id = job.id.clone();
+        let monitor = spawn_monitored(
+            registry.clone(),
+            running.clone(),
+            job.id.clone(),
+            async move {
+                *worker_running.lock().await = None;
+                worker_registry
+                    .mark_succeeded(&worker_job_id, serde_json::json!("complete"))
+                    .await;
+            },
+        );
+        monitor.await.unwrap();
+
+        let finished = registry.get(&job.id).await.unwrap();
+        assert_eq!(finished.state, BackupJobState::Succeeded);
+        assert_eq!(finished.result, Some(serde_json::json!("complete")));
+        assert!(finished.error.is_none());
+        assert!(running.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn recovery_blocks_same_profile_start_until_running_is_cleared() {
+        use std::pin::pin;
+        use std::task::Poll;
+
+        let (registry, job, running) = active_job().await;
+        let running_guard = running.lock().await;
+        let mut recovery = pin!(registry.recover_abandoned(&job.id, &running));
+
+        std::future::poll_fn(|cx| {
+            assert!(matches!(recovery.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+
+        let mut replacement = pin!(registry.start(&job.profile_id, BackupJobKind::RunBackup));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(replacement.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+
+        drop(running_guard);
+        assert!(recovery.await);
+        let replacement = replacement.await.unwrap();
+        *running.lock().await = Some(replacement.profile_id.clone());
+
+        let finished = registry.get(&job.id).await.unwrap();
+        assert_eq!(finished.state, BackupJobState::Failed);
+        assert_eq!(running.lock().await.as_deref(), Some("profile-a"));
+    }
+
+    #[tokio::test]
+    async fn monitor_does_not_clear_newer_run_after_old_job_terminalized() {
+        let (registry, job, running) = active_job().await;
+        let worker_registry = registry.clone();
+        let worker_job_id = job.id.clone();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let monitor = spawn_monitored(
+            registry.clone(),
+            running.clone(),
+            job.id.clone(),
+            async move {
+                worker_registry
+                    .mark_succeeded(&worker_job_id, serde_json::json!("complete"))
+                    .await;
+                terminal_tx.send(()).unwrap();
+                finish_rx.await.unwrap();
+                panic!("panic after terminal state");
+            },
+        );
+
+        terminal_rx.await.unwrap();
+        let replacement = registry
+            .start(&job.profile_id, BackupJobKind::RunBackup)
+            .await
+            .unwrap();
+        *running.lock().await = Some(replacement.profile_id);
+        finish_tx.send(()).unwrap();
+        monitor.await.unwrap();
+
+        let finished = registry.get(&job.id).await.unwrap();
+        assert_eq!(finished.state, BackupJobState::Succeeded);
+        assert_eq!(finished.result, Some(serde_json::json!("complete")));
+        assert!(finished.error.is_none());
+        assert_eq!(running.lock().await.as_deref(), Some("profile-a"));
     }
 }
