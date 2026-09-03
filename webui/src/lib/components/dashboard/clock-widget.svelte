@@ -24,7 +24,7 @@
 
 	let now = $state(new Date());
 	let serverOffset = $state<number | null>(hostOffset(untrack(() => info?.current_time)));
-	let timezone = $derived(info?.timezone ?? settings?.timezone ?? 'UTC');
+	let timezone = $derived(settings?.timezone ?? info?.timezone ?? 'UTC');
 	let hostNow = $derived(serverOffset === null ? null : new Date(now.getTime() + serverOffset));
 	let clockParts = $derived(hostNow ? getClockParts(hostNow, timezone) : { hour: 0, minute: 0, second: 0 });
 	let hourAngle = $derived((clockParts.hour % 12 + clockParts.minute / 60) * 30);
