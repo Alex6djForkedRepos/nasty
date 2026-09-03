@@ -163,8 +163,30 @@ describe('tiny dashboard widgets', () => {
 		expect(body).toContain('8.0%');
 		expect(body).toContain('5m peak 12.0%');
 		expect(body).toContain('45.0%');
+		expect(body).toContain('background-color: var(--color-emerald-500)');
 		expect(body).toContain('xl:grid-cols-1');
 		expect(body).not.toContain('role="img"');
+	});
+
+	test('colors memory usage by current severity', () => {
+		const renderMemory = (current: number) => render(HistoryWidget, {
+			props: {
+				cpuSamples: [],
+				memorySamples: [
+					{ time: new Date('2026-09-01T10:00:00Z'), in: 95, out: 0 },
+					{ time: new Date('2026-09-01T10:01:00Z'), in: current, out: 0 },
+				],
+				range: '5m',
+				loading: false,
+				width: 'quarter' as const,
+				density: 'compact' as const,
+				presentation: 'tiny' as const,
+			},
+		}).body;
+
+		expect(renderMemory(45)).toContain('background-color: var(--color-emerald-500)');
+		expect(renderMemory(80)).toContain('background-color: var(--color-amber-500)');
+		expect(renderMemory(95)).toContain('background-color: var(--color-red-500)');
 	});
 });
 
