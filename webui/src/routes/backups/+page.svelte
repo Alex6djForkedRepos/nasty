@@ -31,6 +31,13 @@
 			: []),
 	]);
 	let backupStatus: BackupStatus | null = $state(null);
+	let viewRunLogProfile: BackupProfile | null = $state(null);
+	let runLogOutput = $state('');
+	let runLogLoading = $state(false);
+	let runLogPoll: ReturnType<typeof setTimeout> | null = null;
+	let runLogRequest = 0;
+	let backupStateRequest = 0;
+	let pageActive = true;
 	/** Loaded once on mount from backup.secrets_status — drives the
 	 * small status pill near the page header. `null` means the
 	 * status hasn't been fetched yet (briefly during initial load) or
@@ -448,6 +455,7 @@
 	// cancel it on SPA navigation — otherwise the 3-second interval keeps
 	// running until the backup finishes server-side, which can be minutes.
 	let runBackupPoll: ReturnType<typeof setInterval> | null = null;
+	let backupStatePoll: ReturnType<typeof setInterval> | null = null;
 	function stopRunBackupPoll() {
 		if (runBackupPoll !== null) { clearInterval(runBackupPoll); runBackupPoll = null; }
 	}
@@ -469,6 +477,25 @@
 
 	function stopAllJobPolls() {
 		for (const id of Object.keys(jobPollers)) stopJobPoll(id);
+	}
+
+	async function refreshBackupState() {
+		const request = ++backupStateRequest;
+		try {
+			const [nextProfiles, nextStatus, jobs] = await Promise.all([
+				client.call<BackupProfile[]>('backup.profile.list'),
+				client.call<BackupStatus>('backup.status'),
+				client.call<BackupJob[]>('backup.jobs.list'),
+			]);
+			if (!pageActive || request !== backupStateRequest) return;
+			profiles = nextProfiles;
+			backupStatus = nextStatus;
+			for (const job of jobs) {
+				if ((job.state === 'pending' || job.state === 'running') && !activeJobs[job.profile_id]) {
+					rehydrateJobPolling(job);
+				}
+			}
+		} catch { /* Keep the last known state during a transient disconnect. */ }
 	}
 
 	/** Attach a 2 s poll for an already-started job, updating the inline
@@ -550,6 +577,7 @@
 
 	onMount(async () => {
 		await Promise.all([refresh(), loadRecoveryContext()]);
+		if (!pageActive) return;
 		loading = false;
 		// Load filesystems (and subvolumes) up front rather than only when
 		// the create form is opened — the restore dialog's destination
@@ -563,6 +591,7 @@
 		try {
 			secretsStatus = await client.call<SecretsStatus>('backup.secrets_status');
 		} catch { /* leave null */ }
+		if (!pageActive) return;
 
 		// Re-attach pollers for any backup jobs the engine is still
 		// running. Without this, reloading the Backups page mid-init
@@ -573,12 +602,15 @@
 		// last_run from the engine.
 		try {
 			const activeOnEngine = await client.call<BackupJob[]>('backup.jobs.list');
+			if (!pageActive) return;
 			for (const job of activeOnEngine) {
 				if (job.state === 'pending' || job.state === 'running') {
 					rehydrateJobPolling(job);
 				}
 			}
 		} catch { /* engine didn't expose jobs.list; ignore */ }
+		if (!pageActive) return;
+		backupStatePoll = setInterval(refreshBackupState, 15_000);
 
 		// Auto-open create form with config preset from ?create=config
 		if ($page.url.searchParams.get('create') === 'config' && isAdmin) {
@@ -600,21 +632,34 @@
 	}
 
 	onDestroy(() => {
+		pageActive = false;
+		backupStateRequest++;
+		runLogRequest++;
 		stopRunBackupPoll();
 		stopAllJobPolls();
+		if (backupStatePoll) clearInterval(backupStatePoll);
+		if (runLogPoll) clearTimeout(runLogPoll);
 	});
 
 	let snapshotCounts: Record<string, number> = $state({});
 
 	async function refresh() {
+		const request = ++backupStateRequest;
 		try {
-			profiles = await client.call<BackupProfile[]>('backup.profile.list');
+			const [nextProfiles, nextStatus] = await Promise.all([
+				client.call<BackupProfile[]>('backup.profile.list'),
+				client.call<BackupStatus>('backup.status'),
+			]);
+			if (!pageActive || request !== backupStateRequest) return;
+			profiles = nextProfiles;
+			backupStatus = nextStatus;
 			window.dispatchEvent(new Event(RECOVERY_BACKUP_CHANGED_EVENT));
-			backupStatus = await client.call<BackupStatus>('backup.status');
 			// Fetch snapshot counts for initialized repos
 			for (const p of profiles.filter(p => p.repo_initialized)) {
 				client.call<BackupSnapshot[]>('backup.snapshots', { id: p.id })
-					.then(snaps => { snapshotCounts[p.id] = snaps.length; })
+					.then(snaps => {
+						if (pageActive && request === backupStateRequest) snapshotCounts[p.id] = snaps.length;
+					})
 					.catch(() => {});
 			}
 		} catch { /* ignore */ }
@@ -749,6 +794,99 @@
 		if (t.type === 'rest') return t.url;
 		if (t.type === 'b2') return `b2:${t.bucket}`;
 		return '?';
+	}
+
+	function backupFailureSummary(message: string): string {
+		const lines = message.split('\n');
+		for (const marker of ['Caused by:', 'Message:']) {
+			for (let index = lines.length - 1; index >= 0; index--) {
+				if (lines[index].trim() !== marker) continue;
+				const detail = lines.slice(index + 1).find(line => line.trim());
+				if (detail) return detail.trim();
+			}
+		}
+		return lines.find(line => line.trim())?.trim() ?? message;
+	}
+
+	function formatRunTimestamp(timestamp: string): string {
+		const date = new Date(timestamp);
+		if (Number.isNaN(date.getTime())) return timestamp;
+		return new Intl.DateTimeFormat(undefined, {
+			year: 'numeric',
+			month: '2-digit',
+			day: '2-digit',
+			hour: '2-digit',
+			minute: '2-digit',
+			second: '2-digit',
+			timeZoneName: 'short',
+		}).format(date);
+	}
+
+	function closeRunLogs() {
+		runLogRequest++;
+		viewRunLogProfile = null;
+		runLogOutput = '';
+		runLogLoading = false;
+		if (runLogPoll) {
+			clearTimeout(runLogPoll);
+			runLogPoll = null;
+		}
+	}
+
+	async function loadRunLogs() {
+		if (!viewRunLogProfile || runLogLoading) return;
+		if (runLogPoll) {
+			clearTimeout(runLogPoll);
+			runLogPoll = null;
+		}
+		const current = profiles.find(profile => profile.id === viewRunLogProfile?.id) ?? viewRunLogProfile;
+		const wasRunning = activeJobs[current.id]?.kind === 'run_backup'
+			&& (activeJobs[current.id].state === 'pending' || activeJobs[current.id].state === 'running');
+		const request = ++runLogRequest;
+		viewRunLogProfile = current;
+		runLogLoading = true;
+		try {
+			const grep = current.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+			const journal = await client.call<string>('system.logs', {
+				unit: 'nasty-engine',
+				lines: 500,
+				grep: `(${grep}.*kind run|Starting backup.*${grep}|Backup completed.*${grep}|Backup failed.*${grep}|Auto-prune failed.*${grep})`,
+			});
+			if (request !== runLogRequest || viewRunLogProfile?.id !== current.id) return;
+			const latest = profiles.find(profile => profile.id === current.id) ?? current;
+			viewRunLogProfile = latest;
+			const recorded = latest.last_run
+				? `Latest recorded result (${formatRunTimestamp(latest.last_run.timestamp)}):\n${latest.last_run.message}`
+				: 'No completed run has been recorded yet.';
+			runLogOutput = journal.trim()
+				? `${journal.trimEnd()}\n\n${recorded}`
+				: `No matching journal entries are available.\n\n${recorded}`;
+		} catch {
+			if (request !== runLogRequest || viewRunLogProfile?.id !== current.id) return;
+			const latest = profiles.find(profile => profile.id === current.id) ?? current;
+			viewRunLogProfile = latest;
+			const recorded = latest.last_run
+				? `Latest recorded result (${formatRunTimestamp(latest.last_run.timestamp)}):\n${latest.last_run.message}`
+				: 'No completed run has been recorded yet.';
+			runLogOutput = `Unable to load the engine journal.\n\n${recorded}`;
+		} finally {
+			if (request === runLogRequest) {
+				runLogLoading = false;
+				const active = activeJobs[current.id];
+				const stillRunning = active?.kind === 'run_backup'
+					&& (active.state === 'pending' || active.state === 'running');
+				if (viewRunLogProfile?.id === current.id && (wasRunning || stillRunning)) {
+					runLogPoll = setTimeout(loadRunLogs, 3_000);
+				}
+			}
+		}
+	}
+
+	function openRunLogs(profile: BackupProfile) {
+		if (runLogPoll) clearTimeout(runLogPoll);
+		viewRunLogProfile = profile;
+		runLogOutput = '';
+		void loadRunLogs();
 	}
 
 	function profileHasSystemSources(profile: BackupProfile): boolean {
@@ -1043,11 +1181,17 @@
 								</div>
 								{#if profile.last_run}
 									<div class="mt-1 text-xs {profile.last_run.success ? 'text-green-400' : 'text-red-400'}">
-										Last: {profile.last_run.success ? 'Success' : 'Failed'} — {profile.last_run.timestamp.slice(0, 19).replace('T', ' ')} ({profile.last_run.duration_secs}s)
+										Last: {profile.last_run.success ? 'Success' : 'Failed'} — {formatRunTimestamp(profile.last_run.timestamp)} ({profile.last_run.duration_secs}s)
 									</div>
+									{#if !profile.last_run.success}
+										<div class="mt-1 max-w-3xl break-words text-xs text-red-300">{backupFailureSummary(profile.last_run.message)}</div>
+									{/if}
 								{/if}
 							</div>
-							<div class="flex gap-2">
+							<div class="flex flex-wrap justify-end gap-2">
+								{#if profile.last_run || activeJobs[profile.id]?.kind === 'run_backup'}
+									<Button size="xs" variant="outline" onclick={() => openRunLogs(profile)}>Logs</Button>
+								{/if}
 								{#if canManageProfile}
 								{#if !profile.repo_initialized}
 									<Button size="xs" onclick={() => initRepo(profile.id)} disabled={activeJobs[profile.id] !== undefined}>
@@ -1063,8 +1207,8 @@
 										{activeJobs[profile.id]?.kind === 'check_repo' ? 'Checking…' : 'Check'}
 									</Button>
 								{/if}
-								<Button size="xs" variant="secondary" onclick={() => startEdit(profile)}>Edit</Button>
-								<Button size="xs" variant="destructive" onclick={() => deleteProfile(profile.id)}>Delete</Button>
+				<Button size="xs" variant="secondary" onclick={() => startEdit(profile)} disabled={activeJobs[profile.id] !== undefined}>Edit</Button>
+				<Button size="xs" variant="destructive" onclick={() => deleteProfile(profile.id)} disabled={activeJobs[profile.id] !== undefined}>Delete</Button>
 								{:else if profileHasSystemSources(profile)}
 									<Badge variant="secondary" class="text-[0.6rem]">Admin required</Badge>
 								{/if}
@@ -1190,7 +1334,7 @@
 									</div>
 								</div>
 								<div class="flex gap-2">
-									<Button size="sm" onclick={saveEdit}>Save</Button>
+									<Button size="sm" onclick={saveEdit} disabled={activeJobs[profile.id] !== undefined}>Save</Button>
 									<Button size="sm" variant="secondary" onclick={() => editId = null}>Cancel</Button>
 								</div>
 							</div>
@@ -1201,6 +1345,34 @@
 		</div>
 	{/if}
 </div>
+
+<!-- Backup profile history modal -->
+<Dialog.Root open={viewRunLogProfile !== null} onOpenChange={(open) => { if (!open) closeRunLogs(); }}>
+	<Dialog.Content class="flex max-h-[75vh] w-[92vw] max-w-4xl flex-col gap-0 bg-card p-0">
+		<Dialog.Header class="border-b border-border px-4 py-3 pr-12">
+			<Dialog.Title class="text-sm">Backup profile history</Dialog.Title>
+			<Dialog.Description class="text-xs">
+				{#if viewRunLogProfile && activeJobs[viewRunLogProfile.id]?.kind === 'run_backup'}
+					{viewRunLogProfile.name} — backup currently in progress
+				{:else if viewRunLogProfile?.last_run}
+					{viewRunLogProfile.name} — {formatRunTimestamp(viewRunLogProfile.last_run.timestamp)} — {viewRunLogProfile.last_run.success ? 'Succeeded' : 'Failed'} in {viewRunLogProfile.last_run.duration_secs}s
+				{/if}
+			</Dialog.Description>
+		</Dialog.Header>
+		<div class="min-h-0 flex-1 overflow-auto p-4">
+			<div class="mb-3 flex justify-end">
+				<Button size="xs" variant="secondary" disabled={runLogLoading} onclick={loadRunLogs}>
+					{runLogLoading ? 'Loading…' : 'Refresh'}
+				</Button>
+			</div>
+			{#if runLogLoading && !runLogOutput}
+				<p class="text-sm text-muted-foreground">Loading backup logs...</p>
+			{:else}
+				<pre class="min-h-32 whitespace-pre-wrap break-words rounded-md bg-black/40 p-4 font-mono text-xs leading-relaxed text-foreground">{runLogOutput}</pre>
+			{/if}
+		</div>
+	</Dialog.Content>
+</Dialog.Root>
 
 <!-- Snapshots modal -->
 <Dialog.Root open={viewSnapshotsId !== null} onOpenChange={(open) => { if (!open) viewSnapshotsId = null; }}>

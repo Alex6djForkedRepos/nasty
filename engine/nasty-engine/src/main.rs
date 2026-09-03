@@ -189,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let default_filter = "nasty_engine=debug,nasty_storage=debug,nasty_sharing=debug,nasty_snapshot=debug,nasty_system=info,tower_http=debug";
+    let default_filter = "nasty_engine=debug,nasty_storage=debug,nasty_sharing=debug,nasty_snapshot=debug,nasty_system=info,nasty_backup=info,tower_http=debug";
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| default_filter.into());
     let (filter_layer, reload_handle) = reload::Layer::new(filter);

@@ -34,6 +34,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 fn now_rfc3339() -> String {
@@ -205,6 +206,7 @@ impl JobRegistry {
 
         let job = BackupJob::new(profile_id.to_string(), kind);
         map.insert(job.id.clone(), job.clone());
+        info!("{} queued", job.log_target());
         Ok(job)
     }
 
@@ -217,6 +219,7 @@ impl JobRegistry {
         if let Some(job) = map.get_mut(job_id) {
             job.state = BackupJobState::Running;
             job.started_at = Some(now_rfc3339());
+            info!("{} started", job.log_target());
         }
     }
 
@@ -236,6 +239,7 @@ impl JobRegistry {
             job.state = BackupJobState::Succeeded;
             job.finished_at = Some(now_rfc3339());
             job.result = Some(result);
+            info!("{} succeeded", job.log_target());
         }
     }
 
@@ -249,6 +253,7 @@ impl JobRegistry {
             job.state = BackupJobState::Failed;
             job.finished_at = Some(now_rfc3339());
             job.error = Some(error);
+            warn!("{} failed", job.log_target());
         }
     }
 

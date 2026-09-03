@@ -63,6 +63,8 @@ pub enum AlertMetric {
     CertificateExpiryDays,
     /// Caddy reported a failed ACME issuance or renewal attempt.
     CertificateRenewalFailure,
+    /// The latest recorded run for a backup profile failed.
+    BackupFailure,
     // Kernel error monitoring
     KernelErrors,
 }
@@ -289,6 +291,14 @@ impl AlertService {
         (alerts, unavailable)
     }
 
+    pub async fn evaluate_backup_failures(
+        &self,
+        backup_failures: &[BackupFailure],
+    ) -> Vec<ActiveAlert> {
+        let state = self.state.read().await;
+        evaluate_backup_rules(&state.rules, backup_failures)
+    }
+
     /// Serialize evaluation and acknowledgement so neither can overwrite the
     /// other's occurrence state.
     pub async fn lock_evaluation(&self) -> OwnedMutexGuard<()> {
@@ -385,7 +395,10 @@ fn reconcile_instances(
         let mut instance = remaining
             .iter()
             .position(|instance| {
-                instance.alert.rule_id == alert.rule_id && instance.alert.source == alert.source
+                instance.alert.rule_id == alert.rule_id
+                    && instance.alert.source == alert.source
+                    && (alert.metric != AlertMetric::BackupFailure
+                        || instance.alert.message == alert.message)
             })
             .map(|position| remaining.remove(position))
             .unwrap_or_else(|| AlertInstanceState {
@@ -860,9 +873,11 @@ fn evaluate_rules(
                     });
                 }
             }
-            AlertMetric::CertificateExpiryDays | AlertMetric::CertificateRenewalFailure => {
-                // Evaluated separately because certificate state is not part
-                // of the metrics-service snapshot.
+            AlertMetric::CertificateExpiryDays
+            | AlertMetric::CertificateRenewalFailure
+            | AlertMetric::BackupFailure => {
+                // Evaluated separately because these states are not part of
+                // the metrics-service snapshot.
             }
         }
     }
@@ -939,6 +954,54 @@ fn evaluate_certificate_rules(
     alerts
 }
 
+fn evaluate_backup_rules(rules: &[AlertRule], failures: &[BackupFailure]) -> Vec<ActiveAlert> {
+    let mut alerts = Vec::new();
+    for rule in rules
+        .iter()
+        .filter(|rule| rule.enabled && rule.metric == AlertMetric::BackupFailure)
+    {
+        if !check_condition(1.0, &rule.condition, rule.threshold) {
+            continue;
+        }
+        for failure in failures {
+            let detail = backup_failure_summary(&failure.message);
+            alerts.push(ActiveAlert {
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                severity: rule.severity.clone(),
+                metric: rule.metric.clone(),
+                message: format!(
+                    "Backup profile \"{}\" failed at {}: {detail}",
+                    failure.profile_name, failure.timestamp
+                ),
+                current_value: 1.0,
+                threshold: rule.threshold,
+                source: failure.profile_id.clone(),
+            });
+        }
+    }
+    alerts
+}
+
+fn backup_failure_summary(message: &str) -> &str {
+    let lines: Vec<_> = message.lines().collect();
+    for marker in ["Caused by:", "Message:"] {
+        for (index, line) in lines.iter().enumerate().rev() {
+            if line.trim() == marker
+                && let Some(detail) = lines[index + 1..]
+                    .iter()
+                    .find(|line| !line.trim().is_empty())
+            {
+                return detail.trim();
+            }
+        }
+    }
+    lines
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .map_or("unknown error", |line| line.trim())
+}
+
 /// Minimal filesystem info for alert evaluation
 #[derive(Debug)]
 pub struct FsUsage {
@@ -952,6 +1015,14 @@ pub struct CertificateHealth {
     pub host: String,
     pub expires_in_days: Option<i64>,
     pub renewal_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct BackupFailure {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub timestamp: String,
+    pub message: String,
 }
 
 /// ATA SMART attribute IDs flagged as critical per Scrutiny's
@@ -1400,6 +1471,15 @@ fn default_rules() -> Vec<AlertRule> {
             threshold: 1.0,
             severity: AlertSeverity::Critical,
         },
+        AlertRule {
+            id: "backup-failure".into(),
+            name: "Backup failed".into(),
+            enabled: true,
+            metric: AlertMetric::BackupFailure,
+            condition: AlertCondition::Equals,
+            threshold: 1.0,
+            severity: AlertSeverity::Warning,
+        },
         // Kernel error monitoring
         AlertRule {
             id: "kernel-errors".into(),
@@ -1486,6 +1566,23 @@ mod tests {
         let (_, recurrence) = reconcile_instances(&instances, vec![test_alert(3.0)], |_| true);
         assert_ne!(recurrence[0].instance_id, first_id);
         assert!(!recurrence[0].acknowledged);
+    }
+
+    #[test]
+    fn later_backup_failure_starts_a_new_occurrence() {
+        let mut first_alert = test_alert(1.0);
+        first_alert.rule_id = "backup-failure".into();
+        first_alert.metric = AlertMetric::BackupFailure;
+        first_alert.source = "profile-a".into();
+        first_alert.message = "Backup failed at 2026-09-03T20:42:11Z".into();
+        let (mut instances, first) = reconcile_instances(&[], vec![first_alert.clone()], |_| true);
+        mark_acknowledged(&mut instances, &first[0].instance_id, "operator", "now").unwrap();
+
+        first_alert.message = "Backup failed at 2026-09-04T20:42:11Z".into();
+        let (_, later) = reconcile_instances(&instances, vec![first_alert], |_| true);
+
+        assert_ne!(later[0].instance_id, first[0].instance_id);
+        assert!(!later[0].acknowledged);
     }
 
     #[test]
@@ -2359,6 +2456,26 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].source, "nas.example.com");
         assert!(alerts[0].message.contains("Invalid access token"));
+    }
+
+    #[test]
+    fn backup_failure_rules_fire_per_profile_with_concise_message() {
+        let failure = rule(AlertMetric::BackupFailure, AlertCondition::Equals, 1.0);
+        let failures = vec![BackupFailure {
+            profile_id: "offsite-id".into(),
+            profile_name: "Offsite".into(),
+            timestamp: "2026-09-03T20:42:11Z".into(),
+            message: "Backup failed: rustic_core backend error\n\nMessage:\nBackoff failed\n\nCaused by:\nconnection refused\n\nBacktrace: hidden".into(),
+        }];
+
+        let alerts = evaluate_backup_rules(&[failure], &failures);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].source, "offsite-id");
+        assert!(alerts[0].message.contains("Offsite"));
+        assert!(alerts[0].message.contains("connection refused"));
+        assert!(!alerts[0].message.contains("rustic_core"));
+        assert!(!alerts[0].message.contains("Backtrace"));
     }
 
     // ── default_rules smoke ────────────────────────────────────────

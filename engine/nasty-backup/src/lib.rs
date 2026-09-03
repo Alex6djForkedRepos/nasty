@@ -351,6 +351,9 @@ impl BackupProfile {
         }
         clone.password_encrypted = None;
         clone.target = clone.target.redacted();
+        if let Some(last_run) = clone.last_run.as_mut() {
+            last_run.message = redact_url_credentials(&last_run.message);
+        }
         clone
     }
 }
@@ -390,7 +393,7 @@ impl BackupTarget {
                 password,
                 password_encrypted: _,
             } => BackupTarget::Rest {
-                url: url.clone(),
+                url: strip_url_userinfo(url),
                 username: username.clone(),
                 password: password.as_ref().map(|_| "***".to_string()),
                 password_encrypted: None,
@@ -398,6 +401,70 @@ impl BackupTarget {
             other => other.clone(),
         }
     }
+}
+
+fn decode_url_userinfo(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes.get(index + 1..index + 3)?;
+            let encoded = std::str::from_utf8(hex).ok()?;
+            decoded.push(u8::from_str_radix(encoded, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn strip_url_userinfo(value: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(value) else {
+        return redact_url_credentials(value);
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return value.to_string();
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.into()
+}
+
+/// Move credentials embedded by older clients into the dedicated fields so
+/// they can be encrypted without changing the configured repository.
+fn normalize_rest_url_userinfo(target: &mut BackupTarget) -> bool {
+    let BackupTarget::Rest {
+        url,
+        username,
+        password,
+        password_encrypted,
+    } = target
+    else {
+        return false;
+    };
+    let Ok(mut parsed) = url::Url::parse(url.as_str()) else {
+        return false;
+    };
+    if parsed.username().is_empty() && parsed.password().is_none() {
+        return false;
+    }
+
+    if username.as_deref().is_none_or(str::is_empty) {
+        *username = decode_url_userinfo(parsed.username());
+    }
+    if password.is_none()
+        && password_encrypted.is_none()
+        && let Some(legacy_password) = parsed.password().and_then(decode_url_userinfo)
+    {
+        *password = Some(legacy_password);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    *url = parsed.into();
+    true
 }
 
 /// Encrypt the plaintext secret fields on a profile into their
@@ -779,7 +846,10 @@ fn schedule_entries(
                 schedule: expression.to_string(),
                 next_run_at,
                 schedule_error,
-                last_run: profile.last_run.clone(),
+                last_run: profile.last_run.clone().map(|mut last_run| {
+                    last_run.message = redact_url_credentials(&last_run.message);
+                    last_run
+                }),
             })
         })
         .collect();
@@ -819,7 +889,7 @@ pub enum BackupError {
 
 impl BackupError {
     pub fn to_rpc_error(&self) -> String {
-        self.to_string()
+        redact_url_credentials(&self.to_string())
     }
 }
 
@@ -828,6 +898,45 @@ fn validate_sources(sources: &[String]) -> Result<(), BackupError> {
         return Err(BackupError::Failed("backup sources cannot be empty".into()));
     }
     Ok(())
+}
+
+pub fn redact_url_credentials(message: &str) -> String {
+    let mut redacted = message.to_string();
+    let mut search_from = 0;
+    while search_from < redacted.len() {
+        let bytes = redacted.as_bytes();
+        let Some((relative_start, scheme_len)) = (0..bytes.len() - search_from).find_map(|index| {
+            let rest = &bytes[search_from + index..];
+            if rest
+                .get(..8)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"https://"))
+            {
+                Some((index, 8))
+            } else if rest
+                .get(..7)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(b"http://"))
+            {
+                Some((index, 7))
+            } else {
+                None
+            }
+        }) else {
+            break;
+        };
+        let scheme_start = search_from + relative_start;
+        let authority_start = scheme_start + scheme_len;
+        let authority_end = redacted[authority_start..]
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || matches!(c, '/' | '?' | '#' | ')' | ']'))
+            .map_or(redacted.len(), |(index, _)| authority_start + index);
+        let Some(at) = redacted[authority_start..authority_end].rfind('@') else {
+            search_from = authority_end;
+            continue;
+        };
+        redacted.replace_range(authority_start..authority_start + at, "[redacted]");
+        search_from = authority_start + "[redacted]@".len();
+    }
+    redacted
 }
 
 fn backup_definition_matches(left: &BackupProfile, right: &BackupProfile) -> bool {
@@ -1008,6 +1117,7 @@ impl BackupService {
         let mut profiles = self.profiles.lock().await;
         let mut changed = false;
         for profile in profiles.iter_mut() {
+            let normalized = normalize_rest_url_userinfo(&mut profile.target);
             let before = (
                 profile.password_encrypted.is_some(),
                 encrypted_target_set(&profile.target),
@@ -1017,7 +1127,7 @@ impl BackupService {
                 profile.password_encrypted.is_some(),
                 encrypted_target_set(&profile.target),
             );
-            if before != after {
+            if normalized || before != after {
                 changed = true;
                 info!(
                     "Migrated secrets for backup profile '{}' ({})",
@@ -1051,6 +1161,7 @@ impl BackupService {
         if let Some(pem) = &profile.trusted_cacert {
             validate_pem_cert(pem)?;
         }
+        normalize_rest_url_userinfo(&mut profile.target);
         encrypt_profile_secrets_in_place(&mut profile).await;
 
         let mut profiles = self.profiles.lock().await;
@@ -1077,6 +1188,7 @@ impl BackupService {
         // existing); we carry the existing encrypted value forward
         // when the update doesn't supply a new one.
         let existing = self.get_profile_internal(id).await?;
+        normalize_rest_url_userinfo(&mut update.target);
         carry_forward_existing_secrets(&mut update, &existing);
         invalidate_last_run_if_definition_changed(&mut update, &existing);
         if let Some(pem) = &update.trusted_cacert {
@@ -1148,7 +1260,9 @@ impl BackupService {
                         .await;
                 }
                 Err(e) => {
-                    registry.mark_failed(&job_id, e.to_string()).await;
+                    registry
+                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                        .await;
                 }
             }
         });
@@ -1182,7 +1296,9 @@ impl BackupService {
                     }
                 }
                 Err(e) => {
-                    registry.mark_failed(&job_id, e.to_string()).await;
+                    registry
+                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                        .await;
                 }
             }
         });
@@ -1205,7 +1321,9 @@ impl BackupService {
                         .await;
                 }
                 Err(e) => {
-                    registry.mark_failed(&job_id, e.to_string()).await;
+                    registry
+                        .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                        .await;
                 }
             }
         });
@@ -1265,7 +1383,11 @@ impl BackupService {
                                 registry.mark_progress(&job_id, 1.0).await;
                                 registry.mark_succeeded(&job_id, value).await;
                             }
-                            Err(e) => registry.mark_failed(&job_id, e.to_string()).await,
+                            Err(e) => {
+                                registry
+                                    .mark_failed(&job_id, redact_url_credentials(&e.to_string()))
+                                    .await
+                            }
                         }
                         break;
                     }
@@ -1281,6 +1403,7 @@ impl BackupService {
 
     pub async fn init_repo(&self, id: &str) -> Result<String, BackupError> {
         let profile = self.get_profile_internal(id).await?;
+        let initialized_profile = profile.clone();
         let password = resolve_profile_password(&profile).await?;
         let resolved = profile.resolve_runtime().await?;
         nasty_common::priority::spawn_bulk(move || {
@@ -1297,64 +1420,75 @@ impl BackupService {
         .map_err(|e| BackupError::Failed(format!("spawn: {e}")))??;
 
         let mut profiles = self.profiles.lock().await;
-        if let Some(p) = profiles.iter_mut().find(|p| p.id == id) {
-            p.repo_initialized = true;
+        let current = profiles
+            .iter_mut()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| BackupError::NotFound(id.into()))?;
+        if !backup_definition_matches(current, &initialized_profile) {
+            return Err(BackupError::Failed(
+                "profile changed during repository initialization; initialize the current target again"
+                    .into(),
+            ));
         }
+        current.repo_initialized = true;
         save_profiles(&profiles).await;
         info!("Initialized backup repo for profile '{id}'");
         Ok("Repository initialized".into())
     }
 
     pub async fn run_backup(&self, id: &str) -> Result<BackupRunResult, BackupError> {
-        let profile = self.get_profile_internal(id).await?;
-        validate_sources(&profile.sources)?;
-
-        // Auto-init repo if not yet initialized
-        if !profile.repo_initialized {
-            info!(
-                "Auto-initializing backup repo for profile '{}'",
-                profile.name
-            );
-            self.init_repo(id).await?;
-        }
-
-        let profile = self.get_profile_internal(id).await?;
-        let password = resolve_profile_password(&profile).await?;
-        let resolved = profile.resolve_runtime().await?;
+        let run_profile = self.get_profile_internal(id).await?;
+        let mut executed_profile = run_profile.clone();
         let start = std::time::Instant::now();
         *self.running.lock().await = Some(id.to_string());
+        info!("Starting backup for profile '{}' ({id})", run_profile.name);
 
-        let run_profile = profile.clone();
-        let sources = profile.sources.clone();
-        let backup_result = nasty_common::priority::spawn_bulk(move || {
-            let repo = make_repo(&profile, &resolved)?;
-            let repo = repo
-                .open(&creds(&password))
-                .map_err(|e| BackupError::Failed(format!("open: {e}")))?;
-            let repo = repo
-                .to_indexed_ids()
-                .map_err(|e| BackupError::Failed(format!("index: {e}")))?;
+        let backup_result: Result<_, BackupError> = async {
+            validate_sources(&run_profile.sources)?;
 
-            let source = PathList::from_iter(sources.iter().map(|s| s.as_str()));
-            let snap = SnapshotOptions::default()
-                .to_snapshot()
-                .map_err(|e| BackupError::Failed(format!("snapshot opts: {e}")))?;
+            if !run_profile.repo_initialized {
+                info!(
+                    "Auto-initializing backup repo for profile '{}' ({id})",
+                    run_profile.name
+                );
+                self.init_repo(id).await?;
+            }
 
-            let result = repo
-                .backup(&BackupOptions::default(), &source, snap)
-                .map_err(|e| BackupError::Failed(format!("backup: {e}")))?;
+            let profile = self.get_profile_internal(id).await?;
+            executed_profile = profile.clone();
+            let password = resolve_profile_password(&profile).await?;
+            let resolved = profile.resolve_runtime().await?;
+            let sources = profile.sources.clone();
+            nasty_common::priority::spawn_bulk(move || {
+                let repo = make_repo(&profile, &resolved)?;
+                let repo = repo
+                    .open(&creds(&password))
+                    .map_err(|e| BackupError::Failed(format!("open: {e}")))?;
+                let repo = repo
+                    .to_indexed_ids()
+                    .map_err(|e| BackupError::Failed(format!("index: {e}")))?;
 
-            Ok::<_, BackupError>((
-                result.summary.as_ref().map(|s| s.data_added),
-                result.summary.as_ref().map(|s| s.files_new),
-                result.summary.as_ref().map(|s| s.files_changed),
-            ))
-        })
+                let source = PathList::from_iter(sources.iter().map(|s| s.as_str()));
+                let snap = SnapshotOptions::default()
+                    .to_snapshot()
+                    .map_err(|e| BackupError::Failed(format!("snapshot opts: {e}")))?;
+
+                let result = repo
+                    .backup(&BackupOptions::default(), &source, snap)
+                    .map_err(|e| BackupError::Failed(format!("backup: {e}")))?;
+
+                Ok::<_, BackupError>((
+                    result.summary.as_ref().map(|s| s.data_added),
+                    result.summary.as_ref().map(|s| s.files_new),
+                    result.summary.as_ref().map(|s| s.files_changed),
+                ))
+            })
+            .await
+            .map_err(|e| BackupError::Failed(format!("spawn: {e}")))?
+        }
         .await;
 
         *self.running.lock().await = None;
-        let backup_result =
-            backup_result.map_err(|e| BackupError::Failed(format!("spawn: {e}")))?;
         let duration = start.elapsed().as_secs();
 
         let result = match backup_result {
@@ -1370,7 +1504,7 @@ impl BackupService {
             Err(e) => BackupRunResult {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 success: false,
-                message: format!("Backup failed: {e}"),
+                message: format!("Backup failed: {}", redact_url_credentials(&e.to_string())),
                 duration_secs: duration,
                 bytes_added: None,
                 files_new: None,
@@ -1383,7 +1517,7 @@ impl BackupService {
             let unchanged = profiles
                 .iter_mut()
                 .find(|profile| profile.id == id)
-                .filter(|profile| backup_definition_matches(profile, &run_profile));
+                .filter(|profile| backup_definition_matches(profile, &executed_profile));
             if let Some(p) = unchanged {
                 p.last_run = Some(result.clone());
                 save_profiles(&profiles).await;
@@ -1397,12 +1531,21 @@ impl BackupService {
         };
 
         if result.success {
-            info!("Backup completed in {}s", duration);
-            if result_recorded && let Err(e) = self.prune(run_profile).await {
-                warn!("Auto-prune failed: {e}");
+            info!(
+                "Backup completed for profile '{}' ({id}) in {duration}s",
+                run_profile.name
+            );
+            if result_recorded && let Err(e) = self.prune(executed_profile).await {
+                warn!(
+                    "Auto-prune failed for profile '{id}': {}",
+                    redact_url_credentials(&e.to_string())
+                );
             }
         } else {
-            error!("Backup failed: {}", result.message);
+            error!(
+                "Backup failed for profile '{}' ({id}): {}",
+                run_profile.name, result.message
+            );
         }
         Ok(result)
     }
@@ -1685,6 +1828,19 @@ mod tests {
         };
         invalidate_last_run_if_definition_changed(&mut retargeted, &existing);
         assert!(retargeted.last_run.is_none());
+    }
+
+    #[test]
+    fn backup_errors_redact_http_userinfo() {
+        let message = "request failed for HTTPS://alice:p%40ss@example.com/repo/config; retry http://bob:secret@backup.test/x";
+        let redacted = redact_url_credentials(message);
+
+        assert_eq!(
+            redacted,
+            "request failed for HTTPS://[redacted]@example.com/repo/config; retry http://[redacted]@backup.test/x"
+        );
+        assert!(!redacted.contains("p%40ss"));
+        assert!(!redacted.contains("secret"));
     }
 
     #[test]
@@ -2080,6 +2236,16 @@ mod tests {
     }
 
     #[test]
+    fn error_to_rpc_error_redacts_url_credentials() {
+        let error = BackupError::Failed("open HTTPS://user:secret@example.com/config".into());
+
+        assert_eq!(
+            error.to_rpc_error(),
+            "backup failed: open HTTPS://[redacted]@example.com/config"
+        );
+    }
+
+    #[test]
     fn redacted_blanks_password_and_cloud_secrets() {
         // Single most important property of redacted(): the JSON
         // returned by backup.profile.list / backup.profile.get NEVER
@@ -2105,6 +2271,94 @@ mod tests {
         } else {
             panic!("expected S3 variant");
         }
+    }
+
+    #[test]
+    fn redacted_sanitizes_historical_run_errors() {
+        let mut profile = baseline_profile(BackupTarget::Local {
+            path: "/srv".into(),
+        });
+        profile.last_run = Some(BackupRunResult {
+            timestamp: "2026-09-03T20:42:11Z".into(),
+            success: false,
+            message: "request https://user:secret@example.com/config failed".into(),
+            duration_secs: 1,
+            bytes_added: None,
+            files_new: None,
+            files_changed: None,
+        });
+
+        let redacted = profile.redacted();
+
+        assert_eq!(
+            redacted.last_run.unwrap().message,
+            "request https://[redacted]@example.com/config failed"
+        );
+    }
+
+    #[test]
+    fn redacted_strips_legacy_rest_url_userinfo() {
+        let profile = baseline_profile(BackupTarget::Rest {
+            url: "https://alice:secret@example.com/repo".into(),
+            username: None,
+            password: None,
+            password_encrypted: None,
+        });
+
+        let BackupTarget::Rest { url, .. } = profile.redacted().target else {
+            panic!("expected REST target");
+        };
+        assert_eq!(url, "https://example.com/repo");
+    }
+
+    #[test]
+    fn legacy_rest_url_userinfo_moves_to_dedicated_fields() {
+        let mut target = BackupTarget::Rest {
+            url: "https://alice%40home:p%40ss@example.com/repo".into(),
+            username: None,
+            password: None,
+            password_encrypted: None,
+        };
+
+        assert!(normalize_rest_url_userinfo(&mut target));
+        let BackupTarget::Rest {
+            url,
+            username,
+            password,
+            ..
+        } = target
+        else {
+            panic!("expected REST target");
+        };
+        assert_eq!(url, "https://example.com/repo");
+        assert_eq!(username.as_deref(), Some("alice@home"));
+        assert_eq!(password.as_deref(), Some("p@ss"));
+    }
+
+    #[test]
+    fn schedule_entries_redact_historical_run_errors() {
+        let mut profile = baseline_profile(BackupTarget::Local {
+            path: "/srv".into(),
+        });
+        profile.schedule = Some("0 3 * * *".into());
+        profile.last_run = Some(BackupRunResult {
+            timestamp: "2026-09-03T20:42:11Z".into(),
+            success: false,
+            message: "request https://user:secret@example.com/config failed".into(),
+            duration_secs: 1,
+            bytes_added: None,
+            files_new: None,
+            files_changed: None,
+        });
+
+        let entries = schedule_entries(
+            &[profile],
+            chrono::Utc.with_ymd_and_hms(2026, 9, 3, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(
+            entries[0].last_run.as_ref().unwrap().message,
+            "request https://[redacted]@example.com/config failed"
+        );
     }
 
     #[test]
