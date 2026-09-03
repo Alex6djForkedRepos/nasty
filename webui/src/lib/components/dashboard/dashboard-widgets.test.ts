@@ -336,6 +336,20 @@ describe('dashboard clock and schedule widgets', () => {
 		expect(body).toContain('Storage maintenance tonight.');
 	});
 
+	test('uses the configured timezone when runtime timezone detection falls back to UTC', () => {
+		const body = render(ClockWidget, {
+			props: {
+				info: { ...info, current_time: '2026-09-02T02:00:00.500Z', timezone: 'UTC' },
+				settings: { ...settings, timezone: 'America/New_York' },
+				loaded: true,
+				density: 'comfortable',
+			},
+		}).body;
+
+		expect(body).toContain('America/New_York');
+		expect(body).toContain('rotate(300 50 50)');
+	});
+
 	test('does not substitute browser time when host time is unavailable', () => {
 		const legacyInfo = { ...info, current_time: undefined } as unknown as SystemInfo;
 		const body = render(ClockWidget, {
