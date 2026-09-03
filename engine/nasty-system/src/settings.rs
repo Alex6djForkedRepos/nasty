@@ -254,6 +254,9 @@ pub struct Settings {
     /// Whether to display clocks in 24-hour format.
     #[serde(default = "default_clock_24h")]
     pub clock_24h: bool,
+    /// Optional message shown with the dashboard clock.
+    #[serde(default)]
+    pub dashboard_motd: String,
     /// Unit for displayed temperatures (CPU, disks, alert thresholds).
     /// Storage and alert evaluation always use Celsius internally — this
     /// only affects rendering in the WebUI.
@@ -535,6 +538,7 @@ impl Default for Settings {
             timezone: default_timezone(),
             hostname: None,
             clock_24h: default_clock_24h(),
+            dashboard_motd: String::new(),
             temp_unit: TempUnit::default(),
             tls_domain: None,
             files_domain: None,
@@ -561,6 +565,8 @@ pub struct SettingsUpdate {
     pub hostname: Option<String>,
     /// Whether to use 24-hour clock display (optional).
     pub clock_24h: Option<bool>,
+    /// Message shown with the dashboard clock (optional, empty clears it).
+    pub dashboard_motd: Option<String>,
     /// Display unit for temperatures (optional).
     pub temp_unit: Option<TempUnit>,
     /// Domain name for Let's Encrypt TLS (set to empty string to disable).
@@ -685,6 +691,11 @@ impl SettingsService {
     pub async fn update(&self, update: SettingsUpdate) -> Result<Settings, String> {
         let mut current = self.state.write().await;
         let mut settings = current.clone();
+        let dashboard_motd = update
+            .dashboard_motd
+            .as_deref()
+            .map(normalize_dashboard_motd)
+            .transpose()?;
         // Validate and stage the coupled TLS fields before applying any
         // external side effects such as timezone or hostname changes.
         let mut tls_changed = apply_domain_updates(
@@ -711,6 +722,9 @@ impl SettingsService {
         }
         if let Some(h24) = update.clock_24h {
             settings.clock_24h = h24;
+        }
+        if let Some(motd) = dashboard_motd {
+            settings.dashboard_motd = motd;
         }
         if let Some(unit) = update.temp_unit {
             settings.temp_unit = unit;
@@ -810,6 +824,19 @@ impl SettingsService {
         }
         Ok(settings)
     }
+}
+
+const DASHBOARD_MOTD_MAX_CHARS: usize = 500;
+
+fn normalize_dashboard_motd(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let length = value.chars().count();
+    if length > DASHBOARD_MOTD_MAX_CHARS {
+        return Err(format!(
+            "dashboard message is too long ({length} > {DASHBOARD_MOTD_MAX_CHARS} characters)"
+        ));
+    }
+    Ok(value.to_string())
 }
 
 /// Validate a non-empty files portal hostname as an ASCII FQDN suitable for a
@@ -2089,11 +2116,12 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcmeJournalState, EncryptedBlob, OidcSettings, Settings, SettingsUpdate,
-        apply_domain_updates, build_policy_set, caddy_acme_env, certificate_endpoint_allowed,
-        certificate_expires_in_days, certificate_state, classify_acme_journal_event,
-        merge_host_lists, redact_oidc_secret, resolve_dns_credentials, to_nix_string,
-        validate_files_domain, wildcard_covers_host,
+        AcmeJournalState, DASHBOARD_MOTD_MAX_CHARS, EncryptedBlob, OidcSettings, Settings,
+        SettingsUpdate, apply_domain_updates, build_policy_set, caddy_acme_env,
+        certificate_endpoint_allowed, certificate_expires_in_days, certificate_state,
+        classify_acme_journal_event, merge_host_lists, normalize_dashboard_motd,
+        redact_oidc_secret, resolve_dns_credentials, to_nix_string, validate_files_domain,
+        wildcard_covers_host,
     };
 
     fn fake_blob() -> EncryptedBlob {
@@ -2266,6 +2294,19 @@ mod tests {
         value.as_object_mut().unwrap().remove("files_domain");
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert_eq!(settings.files_domain, None);
+    }
+
+    #[test]
+    fn dashboard_motd_defaults_and_normalizes_safely() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("dashboard_motd");
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.dashboard_motd.is_empty());
+        assert_eq!(
+            normalize_dashboard_motd("  Storage maintenance tonight.  ").unwrap(),
+            "Storage maintenance tonight."
+        );
+        assert!(normalize_dashboard_motd(&"x".repeat(DASHBOARD_MOTD_MAX_CHARS + 1)).is_err());
     }
 
     #[test]

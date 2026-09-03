@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getClient } from '$lib/client';
-	import { withToast } from '$lib/toast.svelte';
+	import { error as toastError, success as toastSuccess, withToast } from '$lib/toast.svelte';
 	import { applyNetworkUpdate } from '$lib/rollbackState.svelte';
 	import { tempUnit } from '$lib/temperature.svelte';
 	import { requiredFieldCls } from '$lib/utils';
@@ -86,7 +86,12 @@
 	let timezones: string[] = $state([]);
 	let saving = $state(false);
 	let savingHostname = $state(false);
+	let savingDashboardMotd = $state(false);
 	let hostnameInput = $state('');
+
+	function unicodeLength(value: string): number {
+		return [...value].length;
+	}
 
 	// Network
 	let networkState: NetworkState | null = $state(null);
@@ -296,6 +301,7 @@
 				// only when the operator clears the field.
 				client.call<string>('system.log.level').catch(() => ''),
 			]);
+			settings = { ...settings, dashboard_motd: settings.dashboard_motd ?? '' };
 			hostnameInput = settings.hostname ?? info.hostname;
 			logFilter = liveLogFilter;
 			try {
@@ -348,6 +354,25 @@
 			() => client.call('system.settings.update', { clock_24h: val }),
 			val ? '24-hour clock enabled' : '12-hour clock enabled'
 		);
+	}
+
+	async function saveDashboardMotd() {
+		if (!settings) return;
+		savingDashboardMotd = true;
+		try {
+			const updated = await withToast(
+				() => client.call<Settings>('system.settings.update', { dashboard_motd: settings!.dashboard_motd })
+			);
+			if (!updated) return;
+			if (typeof updated.dashboard_motd !== 'string') {
+				toastError('Dashboard notices require a newer engine version.');
+				return;
+			}
+			settings = updated;
+			toastSuccess('Dashboard notice updated');
+		} finally {
+			savingDashboardMotd = false;
+		}
 	}
 
 	async function saveTempUnit(val: 'celsius' | 'fahrenheit') {
@@ -900,6 +925,27 @@
 						</select>
 						<Button size="sm" onclick={saveTimezone} disabled={saving}>
 							{saving ? 'Saving…' : 'Apply'}
+						</Button>
+					</div>
+				</section>
+
+				<section class="rounded-lg border border-border p-5">
+					<h2 class="mb-2 text-base font-semibold">Dashboard Notice</h2>
+					<label for="dashboard-motd" class="text-sm font-medium">Message of the day</label>
+					<p id="dashboard-motd-help" class="mb-4 mt-1 text-sm text-muted-foreground">Shown below the dashboard clock. Leave empty to hide the notice.</p>
+					<textarea
+						id="dashboard-motd"
+						bind:value={settings.dashboard_motd}
+						aria-describedby="dashboard-motd-help dashboard-motd-count"
+						aria-invalid={unicodeLength(settings.dashboard_motd) > 500}
+						rows="3"
+						placeholder="Storage maintenance tonight at 22:00."
+						class="w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+					></textarea>
+					<div class="mt-3 flex items-center justify-between gap-3">
+						<span id="dashboard-motd-count" class="text-xs {unicodeLength(settings.dashboard_motd) > 500 ? 'text-destructive' : 'text-muted-foreground'}">{unicodeLength(settings.dashboard_motd)}/500 characters</span>
+						<Button size="sm" onclick={saveDashboardMotd} disabled={savingDashboardMotd || unicodeLength(settings.dashboard_motd) > 500}>
+							{savingDashboardMotd ? 'Saving...' : 'Save notice'}
 						</Button>
 					</div>
 				</section>

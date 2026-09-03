@@ -95,6 +95,8 @@ pub struct SystemInfo {
     pub timezone: String,
     /// Whether the system clock is NTP-synchronized.
     pub ntp_synced: bool,
+    /// Current system time in UTC, formatted as RFC 3339.
+    pub current_time: String,
     /// Whether the loaded bcachefs kernel module contains debug symbols.
     pub bcachefs_debug_symbols: bool,
     /// Whether the RUNNING bcachefs module was built with debug checks.
@@ -353,6 +355,7 @@ impl SystemService {
             bcachefs_is_custom,
             timezone,
             ntp_synced,
+            current_time: chrono::Utc::now().to_rfc3339(),
             bcachefs_debug_symbols: cached.debug_symbols,
             bcachefs_debug_checks: cached.bcachefs_debug_checks,
             kvm_available: std::path::Path::new("/dev/kvm").exists(),
