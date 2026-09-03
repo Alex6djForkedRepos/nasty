@@ -18,6 +18,7 @@
 		resolveDashboardDensity,
 		resolveDashboardWidgets,
 		selectDashboardView,
+		setDashboardWidgetVisibility,
 		updateActiveDashboardView,
 		updateDashboardWidgetAppearance,
 		type DashboardPreferences,
@@ -70,7 +71,7 @@
 	import SummaryWidget from '$lib/components/dashboard/summary-widget.svelte';
 	import SystemWidget from '$lib/components/dashboard/system-widget.svelte';
 	import WidgetOptions from '$lib/components/dashboard/widget-options.svelte';
-	import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, GripVertical, Settings2 } from '@lucide/svelte';
+	import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, GripVertical, Settings2, X } from '@lucide/svelte';
 
 	type MetricsRange = '5m' | '1h' | '1d' | '7d' | '30d';
 	type DiskRate = { readRate: number; writeRate: number };
@@ -248,6 +249,23 @@
 			widgets: updateDashboardWidgetAppearance(getActiveDashboardView(preferences).widgets, id, patch),
 		}));
 		if (reloadHistory) void loadMetrics(true);
+	}
+
+	async function hideWidget(id: DashboardWidgetId) {
+		const preferences = dashboardPrefs.value;
+		if (preferences.preset !== 'custom' || widgets.length <= 1) return;
+		const index = widgets.findIndex((widget) => widget.id === id);
+		if (index < 0) return;
+		const nextWidgetId = widgets[index + 1]?.id ?? widgets[index - 1]?.id;
+		const activeView = getActiveDashboardView(preferences);
+		dashboardPrefs.set(updateActiveDashboardView(preferences, {
+			widgets: setDashboardWidgetVisibility(activeView.widgets, id, false),
+		}));
+		announceMovement(`${dashboardWidgetMeta[id].label} removed from ${activeView.name}.`);
+		await tick();
+		const nextRemoveButton = document.querySelector<HTMLButtonElement>(`[data-dashboard-remove="${nextWidgetId}"]`);
+		if (nextRemoveButton && !nextRemoveButton.disabled) nextRemoveButton.focus();
+		else editDoneButton?.focus();
 	}
 
 	async function beginDashboardEditing() {
@@ -835,7 +853,7 @@
 		<div>
 			<div class="text-sm font-semibold">{presetLabel} dashboard</div>
 			<div class="text-xs text-muted-foreground">{widgets.length} visible widget{widgets.length === 1 ? '' : 's'} - {density} density</div>
-			{#if editingDashboard}<div class="text-xs text-muted-foreground">Move widgets with the direction controls or drag handle. Use each options menu to change its size or presentation.</div>{/if}
+			{#if editingDashboard}<div class="text-xs text-muted-foreground">Move widgets with the direction controls or drag handle. Use each options menu to change its size or presentation, or X to remove it from this view.</div>{/if}
 		</div>
 		{#if editingDashboard}
 			<div class="flex items-center gap-2">
@@ -923,6 +941,15 @@
 									<span draggable={true} ondragstart={(event) => startWidgetDrag(event, widget.id)} ondragend={endWidgetDrag} class="inline-flex cursor-grab rounded p-1.5 hover:bg-accent hover:text-foreground active:cursor-grabbing" title="Drag to a grid position" aria-hidden="true"><GripVertical class="h-3.5 w-3.5" /></span>
 								</div>
 								<WidgetOptions {widget} onChange={(patch) => updateWidgetAppearance(widget.id, patch)} />
+								<button
+									type="button"
+									onclick={() => void hideWidget(widget.id)}
+									disabled={widgets.length <= 1}
+									data-dashboard-remove={widget.id}
+									class="rounded p-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-20"
+									aria-label={`Remove ${dashboardWidgetMeta[widget.id].label} from this view`}
+									title={widgets.length <= 1 ? 'At least one widget must remain visible' : 'Remove from this view'}
+								><X class="h-3.5 w-3.5" /></button>
 							</div>
 						{/if}
 					</div>

@@ -29,6 +29,7 @@ import {
 	resolveDashboardDensity,
 	resolveDashboardWidgets,
 	selectDashboardView,
+	setDashboardWidgetVisibility,
 	setDashboardPresetTabVisible,
 	updateActiveDashboardView,
 	updateDashboardWidgetAppearance,
@@ -308,6 +309,19 @@ describe('dashboard preferences', () => {
 		const unsupportedNarrow = updateDashboardWidgetAppearance(widgets, 'storage', { width: 'quarter' });
 		expect(unsupportedNarrow[1]).toMatchObject({ width: 'half', presentation: 'standard', column: 0 });
 		expect(widgets[0]).toMatchObject({ width: 'quarter', presentation: 'tiny', column: 9 });
+	});
+
+	test('hides a widget without discarding its configuration or hiding the last widget', () => {
+		const widgets: DashboardWidgetConfig[] = [
+			{ id: 'alerts', visible: true, width: 'quarter', presentation: 'tiny', column: 9, row: 2, priority: 4 },
+			{ id: 'storage', visible: true, width: 'full', presentation: 'standard', column: 0, row: 0, priority: 0 },
+		];
+
+		const hidden = setDashboardWidgetVisibility(widgets, 'alerts', false);
+		expect(hidden[0]).toEqual({ ...widgets[0], visible: false });
+		expect(widgets[0].visible).toBe(true);
+		expect(setDashboardWidgetVisibility(hidden, 'storage', false)[1].visible).toBe(true);
+		expect(setDashboardWidgetVisibility(hidden, 'alerts', true)[0]).toEqual(widgets[0]);
 	});
 
 	test('hides any built-in preset tab and falls back to a custom view', () => {

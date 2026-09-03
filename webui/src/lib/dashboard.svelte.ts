@@ -162,6 +162,16 @@ export function updateDashboardWidgetAppearance(
 	});
 }
 
+export function setDashboardWidgetVisibility(
+	widgets: DashboardWidgetConfig[],
+	id: DashboardWidgetId,
+	visible: boolean,
+): DashboardWidgetConfig[] {
+	if (!widgets.some((widget) => widget.id === id)) return cloneWidgets(widgets);
+	if (!visible && widgets.filter((widget) => widget.visible).length <= 1) return cloneWidgets(widgets);
+	return widgets.map((widget) => widget.id === id ? { ...widget, visible } : { ...widget });
+}
+
 type DashboardWidgetDefinition = Omit<DashboardWidgetConfig, 'column' | 'row' | 'priority'>;
 
 function positionWidgets(widgets: DashboardWidgetDefinition[]): DashboardWidgetConfig[] {
