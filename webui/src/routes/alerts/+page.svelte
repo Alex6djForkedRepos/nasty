@@ -54,6 +54,7 @@
 		boot_disk_free_mb: '/boot (ESP) Free (MB)',
 		certificate_expiry_days: 'TLS Certificate Validity (days)',
 		certificate_renewal_failure: 'TLS Certificate Renewal Failure',
+		backup_failure: 'Backup Failure',
 		kernel_errors: 'Kernel Errors',
 	});
 
@@ -156,17 +157,19 @@
 		// disk_temperature thresholds are stored in Celsius. If the user is
 		// viewing Fahrenheit, the value typed in the input is in °F — convert
 		// before sending so the alert evaluator sees the canonical unit.
+		const condition = newMetric === 'backup_failure' ? 'equals' : newCondition;
+		const threshold = newMetric === 'backup_failure' ? 1 : newThreshold;
 		const stored =
 			newMetric === 'disk_temperature' && tempUnit.current === 'fahrenheit'
-				? Math.round(((newThreshold - 32) * 5) / 9)
-				: newThreshold;
+				? Math.round(((threshold - 32) * 5) / 9)
+				: threshold;
 		const ok = await withToast(
 			() => client.call('alert.rules.create', {
 				id: '',
 				name: newName,
 				enabled: true,
 				metric: newMetric,
-				condition: newCondition,
+				condition,
 				threshold: stored,
 				severity: newSeverity,
 			}),
@@ -176,6 +179,7 @@
 			showCreate = false;
 			newName = '';
 			createTried = false;
+			newCondition = 'above';
 			newThreshold = 80;
 			await refresh();
 		}
@@ -259,20 +263,24 @@
 						{/each}
 					</select>
 				</div>
-				<div class="flex-1">
-					<Label for="rule-condition">Condition</Label>
-					<select id="rule-condition" bind:value={newCondition} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-						{#each Object.entries(conditionLabels) as [val, label]}
-							<option value={val}>{label}</option>
-						{/each}
-					</select>
-				</div>
+				{#if newMetric !== 'backup_failure'}
+					<div class="flex-1">
+						<Label for="rule-condition">Condition</Label>
+						<select id="rule-condition" bind:value={newCondition} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
+							{#each Object.entries(conditionLabels) as [val, label]}
+								<option value={val}>{label}</option>
+							{/each}
+						</select>
+					</div>
+				{/if}
 			</div>
 			<div class="mb-4 flex gap-4">
-				<div class="flex-1">
-					<Label for="rule-threshold">Threshold</Label>
-					<Input id="rule-threshold" type="number" bind:value={newThreshold} class="mt-1" />
-				</div>
+				{#if newMetric !== 'backup_failure'}
+					<div class="flex-1">
+						<Label for="rule-threshold">Threshold</Label>
+						<Input id="rule-threshold" type="number" bind:value={newThreshold} class="mt-1" />
+					</div>
+				{/if}
 				<div class="flex-1">
 					<Label for="rule-severity">Severity</Label>
 					<select id="rule-severity" bind:value={newSeverity} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">

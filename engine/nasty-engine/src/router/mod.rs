@@ -1316,6 +1316,22 @@ pub(crate) async fn evaluate_active_alerts_inner(
 ) -> Vec<nasty_system::alerts::AlertOccurrence> {
     use nasty_system::alerts;
 
+    let backup_failures: Vec<alerts::BackupFailure> = state
+        .backups
+        .list_profiles()
+        .await
+        .into_iter()
+        .filter_map(|profile| {
+            let last_run = profile.last_run?;
+            (!last_run.success).then(|| alerts::BackupFailure {
+                profile_id: profile.id,
+                profile_name: profile.name,
+                timestamp: last_run.timestamp,
+                message: last_run.message,
+            })
+        })
+        .collect();
+
     // System stats — required for CPU/memory/temp rules. If the metrics
     // service is down, evaluating those rules without data is meaningless;
     // return an empty alert set rather than fabricating false positives.
@@ -1326,7 +1342,16 @@ pub(crate) async fn evaluate_active_alerts_inner(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("alert evaluation: stats fetch failed: {e}");
-                return state.alerts.reconcile_active(Vec::new(), |_| false).await;
+                let active = state
+                    .alerts
+                    .evaluate_backup_failures(&backup_failures)
+                    .await;
+                return state
+                    .alerts
+                    .reconcile_active(active, |alert| {
+                        alert.metric == alerts::AlertMetric::BackupFailure
+                    })
+                    .await;
             }
         };
 
@@ -1598,6 +1623,7 @@ pub(crate) async fn evaluate_active_alerts_inner(
             &bcachefs_health,
             &kernel_alert,
             &certificates,
+            &backup_failures,
         )
         .await;
     for metric in unavailable_disk_metrics {

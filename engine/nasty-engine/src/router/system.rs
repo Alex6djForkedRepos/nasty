@@ -289,7 +289,14 @@ pub(super) async fn try_route(
                 .output()
                 .await;
             match output {
-                Ok(o) => ok(req, String::from_utf8_lossy(&o.stdout).to_string()),
+                Ok(o) if o.status.success() => ok(
+                    req,
+                    nasty_backup::redact_url_credentials(&String::from_utf8_lossy(&o.stdout)),
+                ),
+                Ok(o) => err(
+                    req,
+                    format!("journalctl: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                ),
                 Err(e) => err(req, format!("journalctl: {e}")),
             }
         }

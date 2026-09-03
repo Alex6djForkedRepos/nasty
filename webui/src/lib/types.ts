@@ -1485,7 +1485,7 @@ export interface AlertRule {
 	severity: AlertSeverity;
 }
 
-export type AlertMetric = 'fs_usage_percent' | 'cpu_load_percent' | 'memory_usage_percent' | 'disk_temperature' | 'smart_health' | 'smart_attribute' | 'swap_usage_percent' | 'bcachefs_degraded' | 'bcachefs_device_error' | 'bcachefs_device_state' | 'bcachefs_io_errors' | 'bcachefs_scrub_errors' | 'bcachefs_reconcile_stalled' | 'root_disk_free_gb' | 'boot_disk_free_mb' | 'certificate_expiry_days' | 'certificate_renewal_failure' | 'kernel_errors';
+export type AlertMetric = 'fs_usage_percent' | 'cpu_load_percent' | 'memory_usage_percent' | 'disk_temperature' | 'smart_health' | 'smart_attribute' | 'swap_usage_percent' | 'bcachefs_degraded' | 'bcachefs_device_error' | 'bcachefs_device_state' | 'bcachefs_io_errors' | 'bcachefs_scrub_errors' | 'bcachefs_reconcile_stalled' | 'root_disk_free_gb' | 'boot_disk_free_mb' | 'certificate_expiry_days' | 'certificate_renewal_failure' | 'backup_failure' | 'kernel_errors';
 export type AlertCondition = 'above' | 'below' | 'equals';
 export type AlertSeverity = 'warning' | 'critical';
 

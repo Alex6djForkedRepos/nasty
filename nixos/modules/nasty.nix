@@ -174,7 +174,7 @@ in {
         # log non-zero exits + spawn errors there). Without it in the
         # allowlist those warnings are dropped — e.g. a compose stack that
         # fails to come up at boot logged nothing engine-side (#437 testing).
-        default = "nasty_engine=info,nasty_storage=info,nasty_sharing=info,nasty_snapshot=info,nasty_system=info,nasty_apps=info,nasty::cmd=info,tower_http=info";
+        default = "nasty_engine=info,nasty_storage=info,nasty_sharing=info,nasty_snapshot=info,nasty_system=info,nasty_apps=info,nasty_backup=info,nasty::cmd=info,tower_http=info";
         description = "RUST_LOG filter for engine";
       };
     };

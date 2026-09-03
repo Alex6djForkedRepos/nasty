@@ -159,6 +159,10 @@ impl SchedulerTick {
         }
         to_fire
     }
+
+    fn retry(&mut self, profile_id: &str) {
+        self.last_attempted.remove(profile_id);
+    }
 }
 
 /// Tick interval for the scheduler loop. 60 s is well under any
@@ -169,8 +173,8 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Long-running scheduler loop. Polls the profile list every
 /// [`TICK_INTERVAL`], evaluates each enabled profile's schedule, and
-/// spawns `run_backup(id)` for every due fire. Each fire is its own
-/// `tokio::spawn` so a slow / hung backup on one profile doesn't
+/// starts a tracked backup job for every due fire. The job wrapper
+/// spawns the actual work, so a slow backup on one profile doesn't
 /// block the scheduler from advancing the others.
 ///
 /// Never returns. Call once from `main` as a long-lived
@@ -190,26 +194,17 @@ pub async fn run_scheduler_loop(service: BackupService) {
         let due = tick_state.evaluate(&profiles, now);
 
         for profile_id in due {
-            let scheduler_service = service.clone_for_task();
-            tokio::spawn(async move {
-                match scheduler_service.run_backup(&profile_id).await {
-                    Ok(result) if result.success => {
-                        info!(
-                            "scheduled backup completed for '{profile_id}' in {}s",
-                            result.duration_secs
-                        );
-                    }
-                    Ok(result) => {
-                        warn!(
-                            "scheduled backup for '{profile_id}' finished with error: {}",
-                            result.message
-                        );
-                    }
-                    Err(e) => {
-                        warn!("scheduled backup for '{profile_id}' failed to start: {e}");
-                    }
+            match service.start_run_backup(&profile_id).await {
+                Ok(job) => {
+                    info!("scheduled backup job {} started for '{profile_id}'", job.id);
                 }
-            });
+                Err(e) => {
+                    tick_state.retry(&profile_id);
+                    warn!(
+                        "scheduled backup for '{profile_id}' could not start and will retry next tick: {e}"
+                    );
+                }
+            }
         }
     }
 }
@@ -315,6 +310,17 @@ mod tests {
         // re-fire.
         let fired = tick.evaluate(&profiles, ts(2026, 6, 5, 3, 1));
         assert!(fired.is_empty(), "got unexpected re-fire: {fired:?}");
+    }
+
+    #[test]
+    fn rejected_job_is_due_again_after_retry() {
+        let started = ts(2026, 6, 5, 2, 59);
+        let mut tick = SchedulerTick::new(started);
+        let profiles = vec![profile_with_schedule("p", "0 3 * * *", true)];
+
+        assert_eq!(tick.evaluate(&profiles, ts(2026, 6, 5, 3, 0)), ["p"]);
+        tick.retry("p");
+        assert_eq!(tick.evaluate(&profiles, ts(2026, 6, 5, 3, 1)), ["p"]);
     }
 
     #[test]
