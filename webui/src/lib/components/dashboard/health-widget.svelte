@@ -116,10 +116,7 @@
 					<div class="text-xs font-semibold {labelClass(state.tone)}">{state.label}</div>
 				</div>
 				{#if containers?.expected != null && containers.running != null}
-					<div class="mt-2 flex items-baseline gap-2">
-						<span class="text-xl font-bold tabular-nums">{containers.expected} expected <span class="text-muted-foreground">/</span> {containers.running} running</span>
-						<span class="hidden min-w-0 truncate text-[0.65rem] text-muted-foreground/80 2xl:inline" title="Simple apps count once; Compose service instances count individually.">apps + Compose services</span>
-					</div>
+					<div class="mt-2 text-xl font-bold tabular-nums">{containers.expected} expected <span class="text-muted-foreground">/</span> {containers.running} running</div>
 				{:else}
 					<div class="mt-2 text-xl font-bold text-muted-foreground">{state.label}</div>
 				{/if}
