@@ -985,6 +985,32 @@ fn make_repo(
     Repository::new(&repo_opts, &backends).map_err(|e| BackupError::Failed(format!("repo: {e}")))
 }
 
+/// Open a valid existing repository before attempting creation. This makes a
+/// retry recover when repository creation succeeded but saving the profile's
+/// `repo_initialized` marker failed.
+fn initialize_or_open_repo(
+    profile: &BackupProfile,
+    resolved: &ResolvedTargetSecrets,
+    password: &str,
+) -> Result<bool, BackupError> {
+    let credentials = creds(password);
+    match make_repo(profile, resolved)?.open(&credentials) {
+        Ok(_) => Ok(true),
+        Err(open_error) => make_repo(profile, resolved)?
+            .init(
+                &credentials,
+                &KeyOptions::default(),
+                &ConfigOptions::default(),
+            )
+            .map(|_| false)
+            .map_err(|init_error| {
+                BackupError::Failed(format!(
+                    "open existing repository: {open_error}; initialize repository: {init_error}"
+                ))
+            }),
+    }
+}
+
 /// Like [`make_repo`] but builds the repository with a live progress-bar
 /// backend so restore-byte progress can be surfaced on the job. Same
 /// secret-resolution contract as `make_repo`.
@@ -1026,6 +1052,7 @@ impl Default for BackupService {
 
 impl BackupService {
     pub fn new() -> Self {
+        cleanup_stale_state_temp(std::path::Path::new(STATE_PATH));
         Self {
             profiles: std::sync::Arc::new(tokio::sync::Mutex::new(load_profiles())),
             running: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -1113,10 +1140,11 @@ impl BackupService {
     /// engine boot does not fail because of a degraded secrets
     /// backend; backups keep working with plaintext-on-disk until
     /// the operator fixes the underlying issue.
-    pub async fn migrate_secrets(&self) {
+    pub async fn migrate_secrets(&self) -> Result<(), BackupError> {
         let mut profiles = self.profiles.lock().await;
+        let mut next = profiles.clone();
         let mut changed = false;
-        for profile in profiles.iter_mut() {
+        for profile in &mut next {
             let normalized = normalize_rest_url_userinfo(&mut profile.target);
             let before = (
                 profile.password_encrypted.is_some(),
@@ -1129,15 +1157,13 @@ impl BackupService {
             );
             if normalized || before != after {
                 changed = true;
-                info!(
-                    "Migrated secrets for backup profile '{}' ({})",
-                    profile.name, profile.id
-                );
             }
         }
         if changed {
-            save_profiles(&profiles).await;
+            persist_profiles(&mut profiles, next)?;
+            info!("Migrated backup profile secrets");
         }
+        Ok(())
     }
 
     pub async fn create_profile(
@@ -1171,8 +1197,9 @@ impl BackupService {
         {
             return Err(BackupError::AlreadyExists(profile.name));
         }
-        profiles.push(profile.clone());
-        save_profiles(&profiles).await;
+        let mut next = profiles.clone();
+        next.push(profile.clone());
+        persist_profiles(&mut profiles, next)?;
         info!("Created backup profile '{}' ({})", profile.name, profile.id);
         Ok(profile.redacted())
     }
@@ -1201,8 +1228,10 @@ impl BackupService {
             .iter()
             .position(|p| p.id == id)
             .ok_or_else(|| BackupError::NotFound(id.into()))?;
-        profiles[idx] = update.clone();
-        save_profiles(&profiles).await;
+        let mut next = profiles.clone();
+        next[idx] = update.clone();
+        let persistence = persist_profiles(&mut profiles, next);
+        let committed = persistence_committed(&persistence);
         drop(profiles);
         // Operator cleared the textarea ⇒ trusted_cacert is now None
         // ⇒ the materialized PEM at /var/lib/nasty/cacerts/<id>.pem
@@ -1210,24 +1239,33 @@ impl BackupService {
         // clean and a stale file can't surprise a future audit. If a
         // new cert is set on a subsequent call, materialize_cacert
         // recreates the file.
-        if update.trusted_cacert.is_none() {
+        if committed && update.trusted_cacert.is_none() {
             drop_cacert(id).await;
         }
+        persistence?;
         Ok(update.redacted())
     }
 
     pub async fn delete_profile(&self, id: &str) -> Result<(), BackupError> {
         let mut profiles = self.profiles.lock().await;
-        let len = profiles.len();
-        profiles.retain(|p| p.id != id);
-        if profiles.len() == len {
+        if !profiles.iter().any(|profile| profile.id == id) {
             return Err(BackupError::NotFound(id.into()));
         }
-        save_profiles(&profiles).await;
+        let next = profiles
+            .iter()
+            .filter(|profile| profile.id != id)
+            .cloned()
+            .collect();
+        let persistence = persist_profiles(&mut profiles, next);
+        let committed = persistence_committed(&persistence);
+        drop(profiles);
         // Drop the per-profile cacert file (if any) so the cacerts
         // directory doesn't accumulate dead files across profile
         // churn. Idempotent — missing file is fine.
-        drop_cacert(id).await;
+        if committed {
+            drop_cacert(id).await;
+        }
+        persistence?;
         info!("Deleted backup profile '{id}'");
         Ok(())
     }
@@ -1406,34 +1444,34 @@ impl BackupService {
         let initialized_profile = profile.clone();
         let password = resolve_profile_password(&profile).await?;
         let resolved = profile.resolve_runtime().await?;
-        nasty_common::priority::spawn_bulk(move || {
-            let repo = make_repo(&profile, &resolved)?;
-            repo.init(
-                &creds(&password),
-                &KeyOptions::default(),
-                &ConfigOptions::default(),
-            )
-            .map_err(|e| BackupError::Failed(format!("init: {e}")))?;
-            Ok::<_, BackupError>(())
+        let already_initialized = nasty_common::priority::spawn_bulk(move || {
+            initialize_or_open_repo(&profile, &resolved, &password)
         })
         .await
         .map_err(|e| BackupError::Failed(format!("spawn: {e}")))??;
 
         let mut profiles = self.profiles.lock().await;
-        let current = profiles
-            .iter_mut()
-            .find(|profile| profile.id == id)
+        let current_index = profiles
+            .iter()
+            .position(|profile| profile.id == id)
             .ok_or_else(|| BackupError::NotFound(id.into()))?;
+        let current = &profiles[current_index];
         if !backup_definition_matches(current, &initialized_profile) {
             return Err(BackupError::Failed(
                 "profile changed during repository initialization; initialize the current target again"
                     .into(),
             ));
         }
-        current.repo_initialized = true;
-        save_profiles(&profiles).await;
+        let mut next = profiles.clone();
+        next[current_index].repo_initialized = true;
+        persist_profiles(&mut profiles, next)?;
         info!("Initialized backup repo for profile '{id}'");
-        Ok("Repository initialized".into())
+        Ok(if already_initialized {
+            "Repository already initialized"
+        } else {
+            "Repository initialized"
+        }
+        .into())
     }
 
     pub async fn run_backup(&self, id: &str) -> Result<BackupRunResult, BackupError> {
@@ -1514,13 +1552,21 @@ impl BackupService {
 
         let result_recorded = {
             let mut profiles = self.profiles.lock().await;
-            let unchanged = profiles
-                .iter_mut()
-                .find(|profile| profile.id == id)
-                .filter(|profile| backup_definition_matches(profile, &executed_profile));
-            if let Some(p) = unchanged {
-                p.last_run = Some(result.clone());
-                save_profiles(&profiles).await;
+            let unchanged = profiles.iter().position(|profile| {
+                profile.id == id && backup_definition_matches(profile, &executed_profile)
+            });
+            if let Some(index) = unchanged {
+                let mut next = profiles.clone();
+                next[index].last_run = Some(result.clone());
+                if let Err(error) = persist_profiles(&mut profiles, next) {
+                    let error = BackupError::from(error);
+                    let message = if result.success {
+                        "backup data was written, but recording its result failed; automatic pruning was skipped"
+                    } else {
+                        "the backup failed, and recording its result also failed"
+                    };
+                    return Err(BackupError::Failed(format!("{message}: {error}")));
+                }
                 true
             } else {
                 warn!(
@@ -1725,29 +1771,194 @@ fn load_profiles() -> Vec<BackupProfile> {
 }
 
 fn load_profiles_strict() -> Result<Vec<BackupProfile>, BackupError> {
-    let content = match std::fs::read_to_string(STATE_PATH) {
+    load_profiles_from(std::path::Path::new(STATE_PATH))
+}
+
+fn load_profiles_from(path: &std::path::Path) -> Result<Vec<BackupProfile>, BackupError> {
+    let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(BackupError::Io(error)),
     };
     serde_json::from_str(&content)
-        .map_err(|error| BackupError::Failed(format!("parse {STATE_PATH}: {error}")))
+        .map_err(|error| BackupError::Failed(format!("parse {}: {error}", path.display())))
 }
 
-async fn save_profiles(profiles: &[BackupProfile]) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(json) = serde_json::to_string_pretty(profiles) {
-        if let Err(e) = tokio::fs::write(STATE_PATH, json).await {
-            error!("Failed to save backup profiles: {e}");
-            return;
-        }
-        // Contains S3/B2/SFTP credentials and the repo passphrase.
-        if let Err(e) =
-            tokio::fs::set_permissions(STATE_PATH, std::fs::Permissions::from_mode(0o600)).await
-        {
-            error!("Failed to chmod backup profiles: {e}");
+struct TemporaryStateFile {
+    path: std::path::PathBuf,
+    finished: bool,
+}
+
+#[derive(Debug)]
+enum StatePersistFailure {
+    BeforeRename(BackupError),
+    AfterRename {
+        directory: std::path::PathBuf,
+        error: std::io::Error,
+    },
+}
+
+impl StatePersistFailure {
+    fn committed(&self) -> bool {
+        matches!(self, Self::AfterRename { .. })
+    }
+}
+
+impl From<StatePersistFailure> for BackupError {
+    fn from(failure: StatePersistFailure) -> Self {
+        match failure {
+            StatePersistFailure::BeforeRename(error) => error,
+            StatePersistFailure::AfterRename { directory, error } => BackupError::Failed(format!(
+                "backup profile state update was applied, but parent directory {} could not be synced; durability is not guaranteed, check storage health: {error}",
+                directory.display()
+            )),
         }
     }
+}
+
+impl Drop for TemporaryStateFile {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn persist_profiles(
+    profiles: &mut Vec<BackupProfile>,
+    next: Vec<BackupProfile>,
+) -> Result<(), StatePersistFailure> {
+    let persistence = save_profiles_to(std::path::Path::new(STATE_PATH), &next);
+    publish_profiles(profiles, next, persistence)
+}
+
+fn publish_profiles(
+    profiles: &mut Vec<BackupProfile>,
+    next: Vec<BackupProfile>,
+    persistence: Result<(), StatePersistFailure>,
+) -> Result<(), StatePersistFailure> {
+    match persistence {
+        Ok(()) => {
+            *profiles = next;
+            Ok(())
+        }
+        Err(error) => {
+            if error.committed() {
+                *profiles = next;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn persistence_committed(persistence: &Result<(), StatePersistFailure>) -> bool {
+    match persistence {
+        Ok(()) => true,
+        Err(error) => error.committed(),
+    }
+}
+
+fn state_temp_path(path: &std::path::Path) -> Result<std::path::PathBuf, BackupError> {
+    let parent = path.parent().ok_or_else(|| {
+        BackupError::Failed(format!("state path has no parent: {}", path.display()))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        BackupError::Failed(format!("state path has no name: {}", path.display()))
+    })?;
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(".tmp");
+    Ok(parent.join(temp_name))
+}
+
+fn cleanup_stale_state_temp(path: &std::path::Path) {
+    let temp = match state_temp_path(path) {
+        Ok(temp) => temp,
+        Err(error) => {
+            warn!("Cannot resolve backup state temporary path: {error}");
+            return;
+        }
+    };
+    if let Err(error) = std::fs::remove_file(&temp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Cannot remove stale backup state temporary file {}: {error}",
+            temp.display()
+        );
+    }
+}
+
+fn state_write_error(
+    operation: &str,
+    path: &std::path::Path,
+    error: std::io::Error,
+) -> BackupError {
+    BackupError::Failed(format!("{operation} {}: {error}", path.display()))
+}
+
+fn save_profiles_to(
+    path: &std::path::Path,
+    profiles: &[BackupProfile],
+) -> Result<(), StatePersistFailure> {
+    let temp = state_temp_path(path).map_err(StatePersistFailure::BeforeRename)?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| BackupError::Failed(format!("state path has no parent: {}", path.display())))
+        .map_err(StatePersistFailure::BeforeRename)?;
+    let json = serde_json::to_vec_pretty(profiles)
+        .map_err(|error| BackupError::Failed(format!("serialize backup profiles: {error}")))
+        .map_err(StatePersistFailure::BeforeRename)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    // The state can contain repository and remote-storage credentials.
+    options.write(true).create_new(true).mode(0o600);
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| state_write_error("create temporary backup state", &temp, error))
+        .map_err(StatePersistFailure::BeforeRename)?;
+    let mut temp_file = TemporaryStateFile {
+        path: temp.clone(),
+        finished: false,
+    };
+
+    let commit = (|| {
+        file.write_all(&json)
+            .map_err(|error| state_write_error("write temporary backup state", &temp, error))?;
+        file.sync_all()
+            .map_err(|error| state_write_error("sync temporary backup state", &temp, error))?;
+        drop(file);
+
+        std::fs::rename(&temp, path)
+            .map_err(|error| state_write_error("replace backup state", path, error))
+    })();
+
+    if let Err(error) = commit {
+        return match std::fs::remove_file(&temp) {
+            Ok(()) => {
+                temp_file.finished = true;
+                Err(StatePersistFailure::BeforeRename(error))
+            }
+            Err(cleanup_error) => Err(StatePersistFailure::BeforeRename(BackupError::Failed(
+                format!(
+                    "{error}; remove temporary backup state {}: {cleanup_error}",
+                    temp.display()
+                ),
+            ))),
+        };
+    }
+    temp_file.finished = true;
+
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| StatePersistFailure::AfterRename {
+            directory: parent.to_path_buf(),
+            error,
+        })?;
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -1796,6 +2007,141 @@ mod tests {
             last_run: None,
             trusted_cacert: None,
         }
+    }
+
+    #[test]
+    fn pre_rename_failure_does_not_publish_profiles() {
+        let mut profiles = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/old".into(),
+        })];
+        let mut next = profiles.clone();
+        next[0].name = "new name".into();
+
+        let persistence = publish_profiles(
+            &mut profiles,
+            next,
+            Err(StatePersistFailure::BeforeRename(BackupError::Failed(
+                "write failed".into(),
+            ))),
+        );
+
+        assert!(!persistence_committed(&persistence));
+        assert_eq!(profiles[0].name, "test");
+    }
+
+    #[test]
+    fn post_rename_failure_publishes_profiles_and_reports_durability_risk() {
+        let mut profiles = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/old".into(),
+        })];
+        let mut next = profiles.clone();
+        next[0].name = "new name".into();
+
+        let persistence = publish_profiles(
+            &mut profiles,
+            next,
+            Err(StatePersistFailure::AfterRename {
+                directory: "/var/lib/nasty".into(),
+                error: std::io::Error::other("directory sync failed"),
+            }),
+        );
+
+        assert!(persistence_committed(&persistence));
+        assert_eq!(profiles[0].name, "new name");
+        let error = BackupError::from(persistence.unwrap_err()).to_string();
+        assert!(error.contains("was applied"), "{error}");
+        assert!(error.contains("durability is not guaranteed"), "{error}");
+    }
+
+    #[test]
+    fn profile_state_commit_is_synchronous_and_round_trips_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backups.json");
+        std::fs::write(&path, "old state").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let profiles = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/backup".into(),
+        })];
+
+        save_profiles_to(&path, &profiles).unwrap();
+
+        let restored = load_profiles_from(&path).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].id, profiles[0].id);
+        assert_eq!(restored[0].name, profiles[0].name);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_profile_state_write_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backups.json");
+        let temp = state_temp_path(&path).unwrap();
+        let old = b"existing backup state";
+        std::fs::write(&path, old).unwrap();
+        std::fs::create_dir(&temp).unwrap();
+        let profiles = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/new-backup".into(),
+        })];
+
+        save_profiles_to(&path, &profiles).unwrap_err();
+
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert!(
+            temp.is_dir(),
+            "a pre-existing temp path must not be removed"
+        );
+    }
+
+    #[test]
+    fn failed_profile_state_rename_cleans_up_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backups.json");
+        let temp = state_temp_path(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("marker"), "preserve me").unwrap();
+        let profiles = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/new-backup".into(),
+        })];
+
+        save_profiles_to(&path, &profiles).unwrap_err();
+
+        assert!(!temp.exists());
+        assert_eq!(
+            std::fs::read_to_string(path.join("marker")).unwrap(),
+            "preserve me"
+        );
+    }
+
+    #[test]
+    fn startup_removes_stale_profile_state_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backups.json");
+        let temp = state_temp_path(&path).unwrap();
+        std::fs::write(&temp, "credential-bearing interrupted write").unwrap();
+
+        cleanup_stale_state_temp(&path);
+
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn repository_initialization_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("repository");
+        let profile = baseline_profile(BackupTarget::Local {
+            path: repo_path.to_string_lossy().into_owned(),
+        });
+        let resolved = ResolvedTargetSecrets::default();
+
+        assert!(!initialize_or_open_repo(&profile, &resolved, "hunter2").unwrap());
+        assert!(initialize_or_open_repo(&profile, &resolved, "hunter2").unwrap());
     }
 
     #[test]

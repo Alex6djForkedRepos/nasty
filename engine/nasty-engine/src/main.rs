@@ -737,14 +737,21 @@ async fn main() -> anyhow::Result<()> {
     // profiles whose secrets are already encrypted are skipped. No-op
     // on hosts where systemd-creds is unavailable (warns once per
     // profile, leaves plaintext in place so backups keep working).
-    state
+    let backup_migration = state
         .boot_status
         .run_phase(
             "backups.migrate_secrets",
             secs(30), // a handful of profiles, each two systemd-creds shellouts
-            state.backups.migrate_secrets(),
+            async { Some(state.backups.migrate_secrets().await) },
         )
         .await;
+    if let Some(Err(error)) = backup_migration {
+        error!("backup secret migration failed: {error}");
+        state
+            .boot_status
+            .mark_failed("backups.migrate_secrets", error.to_string())
+            .await;
+    }
 
     // Seal a plaintext NUT remote-server password left on disk from
     // before encrypt-at-rest. One config, one systemd-creds shellout;
