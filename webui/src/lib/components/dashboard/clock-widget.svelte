@@ -68,7 +68,7 @@
 	}
 </script>
 
-<Card class="h-full overflow-hidden">
+<Card class="h-full gap-0 overflow-hidden py-0">
 	<CardContent class={density === 'compact' ? 'p-3' : 'p-4'}>
 		{#if hostNow}
 			<div class="flex items-center gap-4">

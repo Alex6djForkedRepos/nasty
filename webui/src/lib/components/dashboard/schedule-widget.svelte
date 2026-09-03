@@ -69,7 +69,7 @@
 	}
 </script>
 
-<Card class="h-full overflow-hidden">
+<Card class="h-full gap-0 overflow-hidden py-0">
 	<CardContent class={density === 'compact' ? 'p-3' : 'p-4'}>
 		<div class="mb-3 flex items-center justify-between gap-3">
 			<div class="flex items-center gap-2">
