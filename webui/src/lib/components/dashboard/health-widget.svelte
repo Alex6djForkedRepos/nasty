@@ -109,21 +109,21 @@
 			</CardContent>
 		</a>
 	{:else}
-		<a href="/apps" class="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background" aria-label={`Managed containers: ${state.label}. ${containers?.expected != null ? `${containers.expected} expected, ${containers.running} running.` : state.detail}`}>
+		<a href="/apps" class="block h-full rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background" aria-label={`Managed containers: ${state.label}. ${containers?.expected != null ? `${containers.expected} expected, ${containers.running} running. Simple apps count once; Compose service instances count individually.` : state.detail}`}>
 			<CardContent class={density === 'compact' ? 'px-4 py-3' : 'px-5 py-4'}>
 				<div class="flex items-center justify-between gap-3">
 					<div class="text-xs font-medium uppercase tracking-wide text-muted-foreground">Managed containers</div>
 					<div class="text-xs font-semibold {labelClass(state.tone)}">{state.label}</div>
 				</div>
 				{#if containers?.expected != null && containers.running != null}
-					<div class="mt-2 text-xl font-bold tabular-nums">{containers.expected} expected <span class="text-muted-foreground">/</span> {containers.running} running</div>
+					<div class="mt-2 flex items-baseline gap-2">
+						<span class="text-xl font-bold tabular-nums">{containers.expected} expected <span class="text-muted-foreground">/</span> {containers.running} running</span>
+						<span class="hidden min-w-0 truncate text-[0.65rem] text-muted-foreground/80 2xl:inline" title="Simple apps count once; Compose service instances count individually.">apps + Compose services</span>
+					</div>
 				{:else}
 					<div class="mt-2 text-xl font-bold text-muted-foreground">{state.label}</div>
 				{/if}
 				<div class="mt-1 text-xs text-muted-foreground" role={freshness === 'refreshing' || freshness === 'stale' || freshness === 'unavailable' ? 'status' : undefined}>{state.detail}</div>
-				{#if containers && containers.runtime !== 'disabled'}
-					<div class="mt-1 text-[0.68rem] text-muted-foreground/80">Simple apps count once; Compose service instances count individually.</div>
-				{/if}
 			</CardContent>
 		</a>
 	{/if}
