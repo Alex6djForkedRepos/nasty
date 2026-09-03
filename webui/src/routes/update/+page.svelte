@@ -84,6 +84,7 @@
 		checkInfo?.inputs ?? info?.inputs ?? null
 	);
 	let checking = $state(initialReleaseUpdate?.requestState === 'loading');
+	let manualReleaseCheckPending = false;
 	let startingDevUpgrade = $state(false);
 	let taggedReleaseBanner: TaggedReleaseBannerState = $state({ kind: 'loading' });
 	let versionRows: VersionRow[] = $state([]);
@@ -189,6 +190,7 @@
 
 	onMount(() => {
 		const applyReleaseUpdate = (detail: ReleaseUpdateChangedDetail) => {
+			if (manualReleaseCheckPending) return;
 			checking = detail.requestState === 'loading';
 			if (detail.requestState === 'ready') checkInfo = detail.info;
 		};
@@ -470,6 +472,7 @@
 
 	async function checkForUpdates() {
 		const requestId = ++releaseCheckRequestId;
+		manualReleaseCheckPending = true;
 		checking = true;
 		publishReleaseUpdate(checkInfo ?? info, 'loading');
 		try {
@@ -482,12 +485,16 @@
 			checkInfo = null;
 			publishReleaseUpdate(null, 'failed');
 		} finally {
-			if (requestId === releaseCheckRequestId) checking = false;
+			if (requestId === releaseCheckRequestId) {
+				manualReleaseCheckPending = false;
+				checking = false;
+			}
 		}
 	}
 
 	function clearReleaseUpdateCheck() {
 		releaseCheckRequestId++;
+		manualReleaseCheckPending = false;
 		invalidateReleaseUpdateCheck();
 		checking = false;
 		checkInfo = null;

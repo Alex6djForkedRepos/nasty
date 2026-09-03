@@ -4,8 +4,9 @@ use rowan::ast::AstNode;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// Primary version path — writable by the update script, not managed by NixOS.
@@ -71,6 +72,9 @@ const EMBEDDED_WRAPPER_TEMPLATE: &str =
 const EMBEDDED_NASTY_FLAKE: &str = include_str!("../../../flake.nix");
 
 const GITHUB_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const RELEASE_CHECK_TIMEOUT: Duration = Duration::from_secs(150);
+const RELEASE_CHECK_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const SYSTEMCTL_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -716,7 +720,7 @@ pub struct UpdateBuildDirConfig {
     pub resolved: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct VersionInputInfo {
     /// Flake input name (e.g. `bcachefs-tools`, `nasty`).
     pub name: String,
@@ -786,7 +790,7 @@ pub enum UpdateError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct UpdateInfo {
     /// Currently installed version (short commit SHA or `dev`).
     pub current_version: String,
@@ -832,11 +836,21 @@ pub struct UpdateStatus {
     pub webui_changed: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NastyInputSource {
     owner: String,
     repo: String,
     tracked_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseCheckContext {
+    current_version: String,
+    channel: ReleaseChannel,
+    nasty_input: NastyInputSource,
+    wrapper_flake_version: Option<String>,
+    last_attempt: Option<String>,
+    inputs: Option<Vec<VersionInputInfo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -891,7 +905,9 @@ struct NixosGeneration {
     current: bool,
 }
 
-pub struct UpdateService;
+pub struct UpdateService {
+    release_check_cache: Mutex<Option<(Instant, ReleaseCheckContext, UpdateInfo)>>,
+}
 
 impl Default for UpdateService {
     fn default() -> Self {
@@ -901,7 +917,9 @@ impl Default for UpdateService {
 
 impl UpdateService {
     pub fn new() -> Self {
-        Self
+        Self {
+            release_check_cache: Mutex::new(None),
+        }
     }
 
     /// Get current installed version
@@ -1189,9 +1207,70 @@ impl UpdateService {
 
     /// Check if an update is available by comparing local rev to GitHub
     pub async fn check(&self) -> Result<UpdateInfo, UpdateError> {
-        let current = read_current_version().await;
-        let channel = read_channel().await;
-        let nasty_input = read_nasty_input_source().await;
+        self.run_check(false).await
+    }
+
+    /// Check for updates, reusing a recent appliance-wide result for polling.
+    pub async fn check_cached(&self) -> Result<UpdateInfo, UpdateError> {
+        self.run_check(true).await
+    }
+
+    async fn run_check(&self, allow_cached: bool) -> Result<UpdateInfo, UpdateError> {
+        tokio::time::timeout(RELEASE_CHECK_TIMEOUT, self.run_check_inner(allow_cached))
+            .await
+            .map_err(|_| UpdateError::CommandFailed("update check timed out".to_string()))?
+    }
+
+    async fn run_check_inner(&self, allow_cached: bool) -> Result<UpdateInfo, UpdateError> {
+        let requested_at = Instant::now();
+        let context = self.release_check_context().await;
+
+        // Keep the lock across the lookup so simultaneous browser sessions
+        // coalesce into one upstream request rather than racing GitHub.
+        let mut cache = self.release_check_cache.lock().await;
+        if let Some((checked_at, cached_context, info)) = cache.as_ref() {
+            let is_recent = checked_at.elapsed() < RELEASE_CHECK_CACHE_TTL;
+            let refreshed_while_waiting = *checked_at >= requested_at;
+            if cached_context == &context
+                && ((allow_cached && is_recent) || refreshed_while_waiting)
+            {
+                return Ok(info.clone());
+            }
+        }
+
+        let info = self.check_uncached(&context).await?;
+        *cache = Some((Instant::now(), context, info.clone()));
+        Ok(info)
+    }
+
+    async fn release_check_context(&self) -> ReleaseCheckContext {
+        let (current_version, channel, nasty_input, wrapper_flake, last_attempt, inputs) = tokio::join!(
+            read_current_version(),
+            read_channel(),
+            read_nasty_input_source(),
+            tokio::fs::read_to_string(format!("{NIXOS_FLAKE_DIR}/flake.nix")),
+            last_upgrade_attempt_result(),
+            self.version_info(),
+        );
+        ReleaseCheckContext {
+            current_version,
+            channel,
+            nasty_input,
+            wrapper_flake_version: wrapper_flake
+                .ok()
+                .and_then(|content| read_wrapper_flake_version(&content).ok().flatten()),
+            last_attempt,
+            inputs: inputs.ok().map(|info| info.inputs),
+        }
+    }
+
+    async fn check_uncached(
+        &self,
+        context: &ReleaseCheckContext,
+    ) -> Result<UpdateInfo, UpdateError> {
+        let current = &context.current_version;
+        let channel = context.channel;
+        let nasty_input = &context.nasty_input;
 
         // Mild follows only published stable GitHub releases. Spicy follows s*
         // tags, while Nasty tracks the wrapper flake's configured branch/ref.
@@ -1289,21 +1368,19 @@ impl UpdateService {
         // operator can retry. The version comparison alone would say
         // "up to date" in this state because `nix flake update` rewrites
         // flake.lock *before* the rebuild runs.
-        let last_attempt = last_upgrade_attempt_result().await;
+        let last_attempt = context.last_attempt.clone();
         if last_attempt.as_deref() == Some("failed") {
             available = Some(true);
         }
 
-        let inputs = self.version_info().await.ok().map(|v| v.inputs);
-
         Ok(UpdateInfo {
-            current_version: current,
+            current_version: current.clone(),
             latest_version: Some(latest),
             update_available: available,
             channel,
             last_attempt,
             error: lookup_error,
-            inputs,
+            inputs: context.inputs.clone(),
         })
     }
 
@@ -1970,10 +2047,11 @@ async fn check_latest_tag(
     args.push(&url);
     args.push(&ref_pattern);
 
-    let output = tokio::process::Command::new("git")
-        .args(&args)
-        .output()
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(&args).kill_on_drop(true);
+    let output = tokio::time::timeout(GITHUB_FETCH_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| UpdateError::CommandFailed("git ls-remote timed out".to_string()))?
         .map_err(|e| UpdateError::CommandFailed(format!("git ls-remote: {e}")))?;
 
     if !output.status.success() {
@@ -2881,10 +2959,11 @@ async fn check_via_git_ls_remote(
         ));
     }
     cmd.args(["ls-remote", repo_url, git_ref]);
+    cmd.kill_on_drop(true);
 
-    let output = cmd
-        .output()
+    let output = tokio::time::timeout(GITHUB_FETCH_TIMEOUT, cmd.output())
         .await
+        .map_err(|_| UpdateError::CommandFailed("git ls-remote timed out".to_string()))?
         .map_err(|e| UpdateError::CommandFailed(format!("git ls-remote: {e}")))?;
 
     if !output.status.success() {
@@ -3179,10 +3258,12 @@ fn unquote_nix_string(raw: &str) -> Option<String> {
 /// would say "up to date" because `nix flake update` updates the lock
 /// BEFORE the rebuild runs.
 async fn last_upgrade_attempt_result() -> Option<String> {
-    let out = tokio::process::Command::new("systemctl")
-        .args(["show", UPDATE_UNIT, "--property=ActiveState,Result"])
-        .output()
+    let mut cmd = tokio::process::Command::new("systemctl");
+    cmd.args(["show", UPDATE_UNIT, "--property=ActiveState,Result"])
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(SYSTEMCTL_QUERY_TIMEOUT, cmd.output())
         .await
+        .ok()?
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut active = "";
@@ -3434,14 +3515,40 @@ async fn read_flake_lock_bcachefs() -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubRelease, ReleaseChannel, is_booted_generation, map_systemd_state,
-        normalize_git_tag_ref, parse_flake_input_urls, parse_official_nasty_ref,
+        GitHubRelease, ReleaseChannel, UpdateInfo, UpdateService, is_booted_generation,
+        map_systemd_state, normalize_git_tag_ref, parse_flake_input_urls, parse_official_nasty_ref,
         parse_release_tag_version, published_stable_release_tag, read_wrapper_flake_version,
         rewrite_flake_input_urls, should_rebootstrap_wrapper_flake, unquote_nix_string,
         wrapper_flake_content_hash,
     };
     use std::collections::HashMap;
     use std::path::Path;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn cached_update_check_reuses_recent_appliance_result() {
+        let service = UpdateService::new();
+        let context = service.release_check_context().await;
+        *service.release_check_cache.lock().await = Some((
+            Instant::now(),
+            context,
+            UpdateInfo {
+                current_version: "cached-current".to_string(),
+                latest_version: Some("cached-latest".to_string()),
+                update_available: Some(true),
+                channel: ReleaseChannel::Mild,
+                last_attempt: None,
+                error: None,
+                inputs: None,
+            },
+        ));
+
+        let info = service.check_cached().await.unwrap();
+
+        assert_eq!(info.current_version, "cached-current");
+        assert_eq!(info.latest_version.as_deref(), Some("cached-latest"));
+        assert_eq!(info.update_available, Some(true));
+    }
 
     #[test]
     fn normalizes_annotated_git_tag_refs() {

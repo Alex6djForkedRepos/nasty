@@ -304,6 +304,7 @@ fn is_read_only(method: &str) -> bool {
                 | "service.base_names.get"
                 | "system.update.version"
                 | "system.update.check"
+                | "system.update.check_cached"
                 | "backup.secrets_status"
                 | "system.update.status"
                 | "system.update.build_dir.get"

@@ -311,6 +311,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     result: Some(gen_schema::<UpdateInfo>(generator)),
                 },
                 Method {
+                    name: "system.update.check_cached",
+                    desc: "Check for available updates, reusing an appliance-wide result for up to five minutes.",
+                    role: MethodRole::Any,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<UpdateInfo>(generator)),
+                },
+                Method {
                     name: "system.update.apply",
                     desc: "Fetch and apply the latest NixOS generation. Runs `nixos-rebuild switch` in the background.",
                     role: MethodRole::Admin,
