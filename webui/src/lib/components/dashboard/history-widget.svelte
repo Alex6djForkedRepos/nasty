@@ -38,7 +38,7 @@
 
 {#if presentation === 'tiny'}
 	<div class="grid grid-cols-2 gap-3 {width === 'third' || width === 'quarter' ? 'xl:grid-cols-1' : ''}">
-		<Card>
+		<Card class="gap-0 py-0">
 			<CardContent class="px-4 py-3">
 				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">CPU usage</CardTitle>
 				{#if cpu}
@@ -49,7 +49,7 @@
 				{/if}
 			</CardContent>
 		</Card>
-		<Card>
+		<Card class="gap-0 py-0">
 			<CardContent class="px-4 py-3">
 				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">Memory usage</CardTitle>
 				{#if memory}
