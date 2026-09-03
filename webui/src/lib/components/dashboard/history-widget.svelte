@@ -32,6 +32,10 @@
 		};
 	}
 
+	function boundedPercent(value: number): number {
+		return Math.min(100, Math.max(0, value));
+	}
+
 	let cpu = $derived(summarize(cpuSamples));
 	let memory = $derived(summarize(memorySamples));
 </script>
@@ -43,7 +47,8 @@
 				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">CPU usage</CardTitle>
 				{#if cpu}
 					<div class="mt-1 text-2xl font-bold tabular-nums">{cpu.current.toFixed(1)}%</div>
-					<div class="mt-1 text-xs text-muted-foreground">{range} peak {cpu.peak.toFixed(1)}%</div>
+					<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary" aria-hidden="true"><div class="h-full rounded-full bg-[var(--chart-3)]" style="width: {boundedPercent(cpu.current)}%"></div></div>
+					<div class="mt-1.5 text-xs text-muted-foreground">{range} peak {cpu.peak.toFixed(1)}%</div>
 				{:else}
 					<div class="mt-2 text-sm font-medium text-muted-foreground" role="status">{loading ? 'Loading...' : 'Unavailable'}</div>
 				{/if}
@@ -54,7 +59,8 @@
 				<CardTitle class="text-xs uppercase tracking-wide text-muted-foreground">Memory usage</CardTitle>
 				{#if memory}
 					<div class="mt-1 text-2xl font-bold tabular-nums">{memory.current.toFixed(1)}%</div>
-					<div class="mt-1 text-xs text-muted-foreground">{range} peak {memory.peak.toFixed(1)}%</div>
+					<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary" aria-hidden="true"><div class="h-full rounded-full bg-[var(--chart-5)]" style="width: {boundedPercent(memory.current)}%"></div></div>
+					<div class="mt-1.5 text-xs text-muted-foreground">{range} peak {memory.peak.toFixed(1)}%</div>
 				{:else}
 					<div class="mt-2 text-sm font-medium text-muted-foreground" role="status">{loading ? 'Loading...' : 'Unavailable'}</div>
 				{/if}

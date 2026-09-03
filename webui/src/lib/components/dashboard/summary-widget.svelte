@@ -2,7 +2,7 @@
 	import type { DashboardDensity } from '$lib/dashboard.svelte';
 	import type { Filesystem, SystemStats } from '$lib/types';
 	import { formatBytes, formatPercent } from '$lib/format';
-	import { formatTemp } from '$lib/temperature.svelte';
+	import { formatTemp, tempUnit } from '$lib/temperature.svelte';
 	import { Card, CardContent } from '$lib/components/ui/card';
 
 	let { kind, stats = null, filesystems = [], filesystemsLoaded = true, density }: {
@@ -19,6 +19,14 @@
 
 	function memoryPercent(): number {
 		return stats && stats.memory.total_bytes > 0 ? (stats.memory.used_bytes / stats.memory.total_bytes) * 100 : 0;
+	}
+
+	function cpuTemperatureScale(): number {
+		return stats?.cpu.temp_c == null ? 0 : Math.min(100, Math.max(0, stats.cpu.temp_c));
+	}
+
+	function cpuTemperatureScaleLabel(): string {
+		return tempUnit.current === 'fahrenheit' ? '32-212 F scale' : '0-100 C scale';
 	}
 
 	function totalStorage(): { used: number; total: number; unknown: number } {
@@ -66,7 +74,11 @@
 			<div class="text-xs uppercase tracking-wide text-muted-foreground">CPU</div>
 			{#if stats && (stats.cpu.temp_c != null || stats.cpu.freq_mhz != null)}
 				<div class="mt-1 text-2xl font-bold">{formatTemp(stats.cpu.temp_c) ?? '-'}</div>
-				<div class="mt-2 text-xs text-muted-foreground">{stats.cpu.freq_mhz != null ? (stats.cpu.freq_mhz >= 1000 ? (stats.cpu.freq_mhz / 1000).toFixed(1) + ' GHz' : stats.cpu.freq_mhz + ' MHz') : ''}{stats.cpu.governor ? ` - ${stats.cpu.governor}` : ''}</div>
+				{#if stats.cpu.temp_c != null}<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-secondary" aria-hidden="true"><div class="h-full rounded-full bg-primary" style="width: {cpuTemperatureScale()}%"></div></div>{/if}
+				<div class="mt-1.5 flex items-center justify-between gap-2 text-xs text-muted-foreground">
+					<span class="min-w-0 truncate">{stats.cpu.freq_mhz != null ? (stats.cpu.freq_mhz >= 1000 ? (stats.cpu.freq_mhz / 1000).toFixed(1) + ' GHz' : stats.cpu.freq_mhz + ' MHz') : ''}{stats.cpu.governor ? ` - ${stats.cpu.governor}` : ''}</span>
+					{#if stats.cpu.temp_c != null}<span class="shrink-0 text-[0.6rem] uppercase">{cpuTemperatureScaleLabel()}</span>{/if}
+				</div>
 			{:else}
 				<div class="mt-1 text-2xl font-bold text-muted-foreground">Unavailable</div>
 				<div class="mt-2 text-xs text-muted-foreground">CPU temperature and frequency are unavailable.</div>
