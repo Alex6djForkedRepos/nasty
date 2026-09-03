@@ -1323,7 +1323,7 @@ pub(crate) async fn evaluate_active_alerts_inner(
         .into_iter()
         .filter_map(|profile| {
             let last_run = profile.last_run?;
-            (!last_run.success).then(|| alerts::BackupFailure {
+            (!last_run.success).then_some(alerts::BackupFailure {
                 profile_id: profile.id,
                 profile_name: profile.name,
                 timestamp: last_run.timestamp,
@@ -1623,9 +1623,14 @@ pub(crate) async fn evaluate_active_alerts_inner(
             &bcachefs_health,
             &kernel_alert,
             &certificates,
-            &backup_failures,
         )
         .await;
+    active.extend(
+        state
+            .alerts
+            .evaluate_backup_failures(&backup_failures)
+            .await,
+    );
     for metric in unavailable_disk_metrics {
         coverage.mark_metric(metric);
     }

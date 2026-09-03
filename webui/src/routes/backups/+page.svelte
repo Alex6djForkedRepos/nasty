@@ -808,6 +808,20 @@
 		return lines.find(line => line.trim())?.trim() ?? message;
 	}
 
+	function formatRunTimestamp(timestamp: string): string {
+		const date = new Date(timestamp);
+		if (Number.isNaN(date.getTime())) return timestamp;
+		return new Intl.DateTimeFormat(undefined, {
+			year: 'numeric',
+			month: '2-digit',
+			day: '2-digit',
+			hour: '2-digit',
+			minute: '2-digit',
+			second: '2-digit',
+			timeZoneName: 'short',
+		}).format(date);
+	}
+
 	function closeRunLogs() {
 		runLogRequest++;
 		viewRunLogProfile = null;
@@ -842,7 +856,7 @@
 			const latest = profiles.find(profile => profile.id === current.id) ?? current;
 			viewRunLogProfile = latest;
 			const recorded = latest.last_run
-				? `Latest recorded result (${latest.last_run.timestamp}):\n${latest.last_run.message}`
+				? `Latest recorded result (${formatRunTimestamp(latest.last_run.timestamp)}):\n${latest.last_run.message}`
 				: 'No completed run has been recorded yet.';
 			runLogOutput = journal.trim()
 				? `${journal.trimEnd()}\n\n${recorded}`
@@ -852,7 +866,7 @@
 			const latest = profiles.find(profile => profile.id === current.id) ?? current;
 			viewRunLogProfile = latest;
 			const recorded = latest.last_run
-				? `Latest recorded result (${latest.last_run.timestamp}):\n${latest.last_run.message}`
+				? `Latest recorded result (${formatRunTimestamp(latest.last_run.timestamp)}):\n${latest.last_run.message}`
 				: 'No completed run has been recorded yet.';
 			runLogOutput = `Unable to load the engine journal.\n\n${recorded}`;
 		} finally {
@@ -1167,7 +1181,7 @@
 								</div>
 								{#if profile.last_run}
 									<div class="mt-1 text-xs {profile.last_run.success ? 'text-green-400' : 'text-red-400'}">
-										Last: {profile.last_run.success ? 'Success' : 'Failed'} — {profile.last_run.timestamp.slice(0, 19).replace('T', ' ')} ({profile.last_run.duration_secs}s)
+										Last: {profile.last_run.success ? 'Success' : 'Failed'} — {formatRunTimestamp(profile.last_run.timestamp)} ({profile.last_run.duration_secs}s)
 									</div>
 									{#if !profile.last_run.success}
 										<div class="mt-1 max-w-3xl break-words text-xs text-red-300">{backupFailureSummary(profile.last_run.message)}</div>
@@ -1341,7 +1355,7 @@
 				{#if viewRunLogProfile && activeJobs[viewRunLogProfile.id]?.kind === 'run_backup'}
 					{viewRunLogProfile.name} — backup currently in progress
 				{:else if viewRunLogProfile?.last_run}
-					{viewRunLogProfile.name} — {viewRunLogProfile.last_run.timestamp.slice(0, 19).replace('T', ' ')} — {viewRunLogProfile.last_run.success ? 'Succeeded' : 'Failed'} in {viewRunLogProfile.last_run.duration_secs}s
+					{viewRunLogProfile.name} — {formatRunTimestamp(viewRunLogProfile.last_run.timestamp)} — {viewRunLogProfile.last_run.success ? 'Succeeded' : 'Failed'} in {viewRunLogProfile.last_run.duration_secs}s
 				{/if}
 			</Dialog.Description>
 		</Dialog.Header>

@@ -265,7 +265,6 @@ impl AlertService {
         bcachefs_health: &[BcachefsHealth],
         kernel_errors: &KernelErrorAlert,
         certificates: &[CertificateHealth],
-        backup_failures: &[BackupFailure],
     ) -> (Vec<ActiveAlert>, Vec<AlertMetric>) {
         let state = self.state.read().await;
         let disk_free = DiskFreeSpace {
@@ -289,7 +288,6 @@ impl AlertService {
             disk_free,
         );
         alerts.extend(evaluate_certificate_rules(&state.rules, certificates));
-        alerts.extend(evaluate_backup_rules(&state.rules, backup_failures));
         (alerts, unavailable)
     }
 
