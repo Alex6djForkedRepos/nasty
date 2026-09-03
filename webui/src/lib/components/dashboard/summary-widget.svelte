@@ -42,7 +42,7 @@
 	let storage = $derived(totalStorage());
 </script>
 
-<Card class="h-full">
+<Card class="h-full {density === 'compact' ? 'gap-0 py-0' : ''}">
 	<CardContent class={density === 'compact' ? 'px-4 py-3' : 'pt-4 pb-3'}>
 		{#if kind === 'cpu_load'}
 			<div class="text-xs uppercase tracking-wide text-muted-foreground">CPU load</div>

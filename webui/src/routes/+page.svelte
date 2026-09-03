@@ -846,7 +846,7 @@
 			<Button bind:ref={customizeButton} variant="outline" size="sm" onclick={() => void beginDashboardEditing()}><Settings2 /> Customize</Button>
 		{/if}
 	</div>
-	<div class="mt-3 overflow-x-auto border-b border-border">
+	<div class="mt-3 overflow-x-auto overflow-y-hidden border-b border-border">
 		<div class="flex min-w-max items-end" role="tablist" aria-label="Dashboard views">
 			{#each presetTabs as [id, preset]}
 				<button type="button" role="tab" aria-selected={dashboardSelection === id} aria-controls="dashboard-panel" tabindex={dashboardSelection === id ? 0 : -1} onclick={() => void switchDashboard(id)} onkeydown={handleDashboardTabKeydown} class="-mb-px whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors {dashboardSelection === id ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground'}">{preset.label}</button>
