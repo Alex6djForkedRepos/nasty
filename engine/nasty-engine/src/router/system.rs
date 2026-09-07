@@ -256,6 +256,9 @@ pub(super) async fn try_route(
             Err(e) => err(req, e),
         },
         "system.logs" => {
+            if let Some(response) = require_root_equivalent(req, session, "system_journal_read") {
+                return Some(response);
+            }
             let unit = str_param(req, "unit").unwrap_or("nasty-engine");
             let lines: u32 = req
                 .params

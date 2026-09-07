@@ -231,7 +231,10 @@ fn map_error_to_status(code: i64, message: &str) -> StatusCode {
         return StatusCode::NOT_FOUND;
     }
     let lower = message.to_ascii_lowercase();
-    if lower.contains("permission denied") || lower.contains("access denied") {
+    if lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("scoped credentials")
+    {
         return StatusCode::FORBIDDEN;
     }
     if lower.contains("not found") {
@@ -340,6 +343,10 @@ mod tests {
         // Case-insensitive.
         assert_eq!(
             map_error_to_status(-32603, "ACCESS DENIED"),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            map_error_to_status(-32603, "Scoped credentials cannot access this endpoint"),
             StatusCode::FORBIDDEN
         );
     }

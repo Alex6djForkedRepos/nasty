@@ -39,7 +39,7 @@ export interface NavItem {
 	icon: NavIcon;
 	keywords: string[];
 	commonRank?: number;
-	requires?: 'kvm';
+	requires?: 'kvm' | 'admin';
 }
 
 export interface NavGroup {
@@ -117,7 +117,7 @@ const NAVIGATION: NavEntry[] = [
 		children: [
 			item('services', '/services', 'Services', Server, ['service', 'protocol', 'nfs', 'smb', 'iscsi', 'smart', 'avahi', 'mdns', 'enable', 'disable', 'rest server', 'backup server', 'receiver', 'htpasswd', 'docker', 'container', 'runtime', 'ups', 'nut', 'battery', 'power', 'shutdown', 'uninterruptible', 'watchdog', 'load', 'memory', 'ping', 'reboot']),
 			item('hardware', '/hardware', 'Hardware', CircuitBoard, ['hardware', 'pci', 'iommu', 'group', 'passthrough', 'vfio', 'gpu', 'device', 'driver', 'lspci', 'tpm', 'tpm2', 'secure boot', 'secureboot', 'cpu', 'memory', 'ram', 'dmi', 'bios', 'firmware', 'motherboard', 'mainboard', 'usb', 'nic']),
-			item('logs', '/logs', 'Logs', ScrollText, ['log', 'journal', 'systemd', 'debug', 'error', 'follow', 'stream', 'filter', 'level', 'tail', 'kernel', 'dmesg'], { commonRank: 8 }),
+			item('logs', '/logs', 'Logs', ScrollText, ['log', 'journal', 'systemd', 'debug', 'error', 'follow', 'stream', 'filter', 'level', 'tail', 'kernel', 'dmesg'], { commonRank: 8, requires: 'admin' }),
 			item('update', '/update', 'Update', RefreshCw, ['update', 'upgrade', 'version', 'release', 'nixos', 'rebuild', 'generation', 'nasty', 'nixpkgs', 'bcachefs', 'flake', 'lock', 'rollback', 'pin']),
 			item('users', '/users', 'Access Control', ShieldCheck, ['user', 'password', 'role', 'admin', 'group', 'permission', 'token', 'api', 'access', 'auth', 'login', 'security key', 'webauthn', 'passkey', 'yubikey', 'touch id', 'windows hello', 'authenticator', 'fido', '2fa', 'mfa', 'sso', 'oidc', 'single sign-on', 'provider']),
 			item('settings', '/settings', 'Settings', Settings, ['setting', 'hostname', 'timezone', 'clock', 'motd', 'dashboard notice', 'directory', 'active directory', 'domain', 'ad', 'network', 'ip', 'dhcp', 'dns', 'bond', 'vlan', 'bridge', 'static', 'gateway', 'route', 'mtu', 'notification', 'email', 'smtp', 'telegram', 'webhook', 'tuning', 'nfs threads', 'metrics', 'prometheus', 'telemetry', 'log level', 'theme', 'dark', 'light', 'appearance', 'custom nix', 'custom.nix', 'nixos', 'package', 'systemd'])
@@ -133,7 +133,9 @@ export function isNavGroup(entry: NavEntry): entry is NavGroup {
 }
 
 function isVisible(item: NavItem, context: NavigationContext): boolean {
-	return item.requires !== 'kvm' || context.kvmAvailable;
+	if (item.requires === 'kvm') return context.kvmAvailable;
+	if (item.requires === 'admin') return context.role === 'admin';
+	return true;
 }
 
 export function resolveNavigation(context: NavigationContext): NavEntry[] {

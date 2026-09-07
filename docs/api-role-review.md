@@ -7,9 +7,9 @@ Date: 2026-09-07
 Static review of all 329 methods registered in
 `engine/nasty-engine/src/registry/methods.rs`:
 
-- 130 `Any`
-- 78 `Operator`
-- 121 `Admin`
+- 126 `Any`
+- 80 `Operator`
+- 123 `Admin`
 
 The registry declarations match the central dispatcher. The findings below are
 semantic authorization problems that the registry/dispatcher consistency tests
@@ -85,6 +85,9 @@ inspect data, and `apps.compose.get` returns the stack `.env` file.
 - `engine/nasty-apps/src/lib.rs:4744-4759`
 
 ### `system.logs` exposes journals to ReadOnly users
+
+Status: fixed by requiring an unscoped Admin session for historical journal
+reads, matching the existing live-stream authorization boundary.
 
 The RPC is `Any`, while the equivalent live stream requires root-equivalent
 access because journals can leak secrets, addresses, and audit details.
