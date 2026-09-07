@@ -1206,11 +1206,10 @@ export interface Settings {
 	tls_acme_enabled: boolean;
 	tls_challenge_type: 'tls-alpn' | 'http' | 'dns';
 	tls_dns_provider: string | null;
-	/** Blanked by the engine once sealed; send "<unchanged>" to keep the
-	 * stored value (#442 follow-up). */
+	/** API responses use "<unchanged>" when credentials exist; sending that
+	 * value back preserves the stored secret (#442 follow-up). */
 	tls_dns_credentials: string | null;
-	/** Opaque systemd-creds ciphertext — presence means credentials are
-	 * stored. Never sent back by the UI. */
+	/** Legacy response field. The engine no longer returns ciphertext. */
 	tls_dns_credentials_encrypted?: unknown;
 	tls_acme_staging: boolean;
 	tls_dns_resolver: string | null;
