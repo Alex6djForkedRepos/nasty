@@ -11,6 +11,56 @@ use super::*;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
+fn filesystem_param(method: &str) -> Option<&'static str> {
+    match method {
+        "fs.device.add"
+        | "fs.device.remove"
+        | "fs.device.evacuate"
+        | "fs.device.evacuate.cancel"
+        | "fs.device.set_state"
+        | "fs.device.set_label"
+        | "fs.device.online"
+        | "fs.device.offline" => Some("filesystem"),
+        "fs.get"
+        | "fs.destroy"
+        | "fs.forget"
+        | "fs.mount"
+        | "fs.unmount"
+        | "fs.unlock"
+        | "fs.lock"
+        | "fs.dependents"
+        | "fs.key.export"
+        | "fs.key.delete"
+        | "fs.tpm.status"
+        | "fs.tpm.bind"
+        | "fs.tpm.unbind"
+        | "fs.options.update"
+        | "fs.usage"
+        | "fs.scrub.start"
+        | "fs.scrub.status"
+        | "fs.scrub.cancel"
+        | "fs.fsck.start"
+        | "fs.fsck.status"
+        | "fs.reconcile.status"
+        | "fs.reconcile.enable"
+        | "fs.reconcile.disable"
+        | "fs.copygc.enable"
+        | "fs.copygc.disable" => Some("name"),
+        _ => None,
+    }
+}
+
+fn requires_root_equivalent(method: &str) -> bool {
+    matches!(
+        method,
+        "fs.create" | "device.wipe" | "device.set_type" | "device.set_io_scheduler"
+    )
+}
+
+fn filesystem_scope_denied(scope: Option<&str>, requested: Option<&str>) -> bool {
+    matches!((scope, requested), (Some(scope), Some(requested)) if requested != scope)
+}
+
 async fn require_block_share_recovery_access(
     req: &Request,
     state: &AppState,
@@ -39,6 +89,17 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if requires_root_equivalent(&req.method)
+        && let Some(response) = require_root_equivalent(req, session, "global_storage_mutation")
+    {
+        return Some(response);
+    }
+    if let Some(param) = filesystem_param(&req.method)
+        && filesystem_scope_denied(session.filesystem.as_deref(), str_param(req, param))
+    {
+        return Some(err(req, "access denied"));
+    }
+
     Some(match req.method.as_str() {
         "fs.list" => match state.filesystems.list().await {
             Ok(mut v) => {
@@ -575,5 +636,34 @@ pub(crate) async fn reconcile_block_shares_under_lock(state: &AppState) -> Resul
         Ok(())
     } else {
         Err(failures.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filesystem_param, filesystem_scope_denied, requires_root_equivalent};
+
+    #[test]
+    fn filesystem_operations_identify_and_enforce_their_scope_parameter() {
+        assert_eq!(filesystem_param("fs.destroy"), Some("name"));
+        assert_eq!(filesystem_param("fs.key.export"), Some("name"));
+        assert_eq!(filesystem_param("fs.device.remove"), Some("filesystem"));
+        assert_eq!(filesystem_param("device.wipe"), None);
+        assert!(!filesystem_scope_denied(Some("tank"), Some("tank")));
+        assert!(filesystem_scope_denied(Some("tank"), Some("other")));
+        assert!(!filesystem_scope_denied(None, Some("other")));
+    }
+
+    #[test]
+    fn global_storage_mutations_require_root_equivalent_access() {
+        for method in [
+            "fs.create",
+            "device.wipe",
+            "device.set_type",
+            "device.set_io_scheduler",
+        ] {
+            assert!(requires_root_equivalent(method), "{method}");
+        }
+        assert!(!requires_root_equivalent("fs.destroy"));
     }
 }

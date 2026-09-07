@@ -192,6 +192,10 @@ pub fn authorize_session(session: &Session, access: EndpointAccess) -> Result<()
     Ok(())
 }
 
+fn require_unscoped_admin(session: &Session) -> Result<(), AuthError> {
+    authorize_session(session, EndpointAccess::RootEquivalent).map_err(|_| AuthError::Forbidden)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ApiToken {
     pub id: String,
@@ -710,9 +714,7 @@ impl AuthService {
         expires_in_secs: Option<u64>,
         allowed_ips: Vec<String>,
     ) -> Result<ApiToken, AuthError> {
-        if session.role != Role::Admin {
-            return Err(AuthError::Forbidden);
-        }
+        require_unscoped_admin(session)?;
         if role == Role::User {
             return Err(AuthError::Forbidden);
         }
@@ -772,9 +774,7 @@ impl AuthService {
 
     /// List API tokens without exposing the token value
     pub async fn list_api_tokens(&self, session: &Session) -> Result<Vec<ApiTokenInfo>, AuthError> {
-        if session.role != Role::Admin {
-            return Err(AuthError::Forbidden);
-        }
+        require_unscoped_admin(session)?;
         let state = self.state.read().await;
         Ok(state
             .api_tokens
@@ -793,9 +793,7 @@ impl AuthService {
 
     /// Delete an API token by ID (admin only)
     pub async fn delete_api_token(&self, session: &Session, id: &str) -> Result<(), AuthError> {
-        if session.role != Role::Admin {
-            return Err(AuthError::Forbidden);
-        }
+        require_unscoped_admin(session)?;
 
         let mut current = self.state.write().await;
         let mut state = current.clone();
@@ -890,9 +888,7 @@ impl AuthService {
         file_principal: Option<String>,
         smb: &nasty_sharing::smb::SmbService,
     ) -> Result<(), AuthError> {
-        if session.role != Role::Admin {
-            return Err(AuthError::Forbidden);
-        }
+        require_unscoped_admin(session)?;
 
         if password.len() < 8 {
             return Err(AuthError::WeakPassword);
@@ -937,9 +933,7 @@ impl AuthService {
 
     /// Delete a user (admin only, cannot delete self)
     pub async fn delete_user(&self, session: &Session, username: &str) -> Result<(), AuthError> {
-        if session.role != Role::Admin {
-            return Err(AuthError::Forbidden);
-        }
+        require_unscoped_admin(session)?;
         if session.username == username {
             return Err(AuthError::Forbidden);
         }
@@ -1151,9 +1145,7 @@ impl AuthService {
         actor: &Session,
         target_username: &str,
     ) -> Result<usize, AuthError> {
-        if actor.role != Role::Admin {
-            return Err(AuthError::Forbidden);
-        }
+        require_unscoped_admin(actor)?;
         let mut current = self.state.write().await;
         let mut state = current.clone();
         let user = state
@@ -2494,6 +2486,42 @@ mod tests {
             .await
             .expect_err("standard-user tokens must be rejected");
         assert!(matches!(error, AuthError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn scoped_admin_cannot_create_tokens_or_users() {
+        let service = AuthService {
+            state: Arc::new(RwLock::new(initialized_state())),
+            rate_limit: Arc::new(RwLock::new(RateLimitState::default())),
+        };
+        let mut scoped_admin = session(Role::Admin);
+        scoped_admin.filesystem = Some("tank".into());
+
+        let token_error = service
+            .create_api_token(
+                &scoped_admin,
+                "escaped-admin",
+                Role::Admin,
+                None,
+                None,
+                Vec::new(),
+            )
+            .await
+            .expect_err("scoped admin must not mint an unscoped token");
+        assert!(matches!(token_error, AuthError::Forbidden));
+
+        let user_error = service
+            .create_user(
+                &scoped_admin,
+                "escaped-admin",
+                "password123",
+                Role::Admin,
+                None,
+                &nasty_sharing::smb::SmbService::new(),
+            )
+            .await
+            .expect_err("scoped admin must not create an unscoped login");
+        assert!(matches!(user_error, AuthError::Forbidden));
     }
 
     #[tokio::test]
