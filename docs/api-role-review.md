@@ -59,6 +59,9 @@ Global raw-device operations must require root-equivalent access.
 
 ### `system.settings.get` exposes secret-bearing settings
 
+Status: fixed by redacting plaintext credentials and encrypted blobs from
+settings API responses while preserving configured/unconfigured markers.
+
 The `Any` method returns the unsanitized settings structure, including OIDC and
 DNS credential fields.
 

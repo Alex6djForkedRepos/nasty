@@ -557,7 +557,10 @@ pub(super) async fn try_route(
             Ok(v) => ok(req, v),
             Err(e) => err(req, e),
         },
-        "system.settings.get" => ok(req, state.settings.get().await),
+        "system.settings.get" => ok(
+            req,
+            nasty_system::settings::redact_settings_secrets(state.settings.get().await),
+        ),
         "system.settings.update" => {
             match parse_params::<nasty_system::settings::SettingsUpdate>(req) {
                 Ok(p) => match p.files_domain.as_deref() {
@@ -571,14 +574,16 @@ pub(super) async fn try_route(
                         .await
                         {
                             Ok(()) => match state.settings.update(p).await {
-                                Ok(v) => ok(req, v),
+                                Ok(v) => {
+                                    ok(req, nasty_system::settings::redact_settings_secrets(v))
+                                }
                                 Err(e) => err(req, e),
                             },
                             Err(e) => err(req, e),
                         }
                     }
                     None => match state.settings.update(p).await {
-                        Ok(v) => ok(req, v),
+                        Ok(v) => ok(req, nasty_system::settings::redact_settings_secrets(v)),
                         Err(e) => err(req, e),
                     },
                 },

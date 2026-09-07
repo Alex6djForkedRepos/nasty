@@ -425,6 +425,19 @@ pub fn redact_oidc_secret(mut s: OidcSettings) -> OidcSettings {
     s
 }
 
+/// Replace settings secrets with presence markers for API responses.
+pub fn redact_settings_secrets(mut settings: Settings) -> Settings {
+    let dns_is_set = settings
+        .tls_dns_credentials
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || settings.tls_dns_credentials_encrypted.is_some();
+    settings.tls_dns_credentials = dns_is_set.then(|| DNS_CREDS_PLACEHOLDER.to_string());
+    settings.tls_dns_credentials_encrypted = None;
+    settings.oidc = redact_oidc_secret(settings.oidc);
+    settings
+}
+
 /// Encrypt the plaintext `client_secret` into `client_secret_encrypted`
 /// and blank the plaintext. Idempotent (already-encrypted or empty →
 /// no-op). systemd-creds failure is non-fatal: warn and keep plaintext.
@@ -2116,12 +2129,12 @@ async fn read_cert_info(cert_path: &str) -> CertInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        AcmeJournalState, DASHBOARD_MOTD_MAX_CHARS, EncryptedBlob, OidcSettings, Settings,
-        SettingsUpdate, apply_domain_updates, build_policy_set, caddy_acme_env,
-        certificate_endpoint_allowed, certificate_expires_in_days, certificate_state,
-        classify_acme_journal_event, merge_host_lists, normalize_dashboard_motd,
-        redact_oidc_secret, resolve_dns_credentials, to_nix_string, validate_files_domain,
-        wildcard_covers_host,
+        AcmeJournalState, DASHBOARD_MOTD_MAX_CHARS, DNS_CREDS_PLACEHOLDER, EncryptedBlob,
+        OidcSettings, Settings, SettingsUpdate, apply_domain_updates, build_policy_set,
+        caddy_acme_env, certificate_endpoint_allowed, certificate_expires_in_days,
+        certificate_state, classify_acme_journal_event, merge_host_lists, normalize_dashboard_motd,
+        redact_oidc_secret, redact_settings_secrets, resolve_dns_credentials, to_nix_string,
+        validate_files_domain, wildcard_covers_host,
     };
 
     fn fake_blob() -> EncryptedBlob {
@@ -2266,6 +2279,66 @@ mod tests {
         let r = redact_oidc_secret(OidcSettings::default());
         assert_eq!(r.client_secret.as_deref(), Some("<unset>"));
         assert!(r.client_secret_encrypted.is_none());
+    }
+
+    #[test]
+    fn redact_settings_removes_plaintext_and_encrypted_secrets() {
+        let settings = Settings {
+            hostname: Some("nas".into()),
+            tls_dns_credentials: Some("CF_API_TOKEN=secret".into()),
+            tls_dns_credentials_encrypted: Some(fake_blob()),
+            oidc: OidcSettings {
+                client_secret: Some("oidc-secret".into()),
+                client_secret_encrypted: Some(fake_blob()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let redacted = redact_settings_secrets(settings);
+
+        assert_eq!(redacted.hostname.as_deref(), Some("nas"));
+        assert_eq!(
+            redacted.tls_dns_credentials.as_deref(),
+            Some(DNS_CREDS_PLACEHOLDER)
+        );
+        assert!(redacted.tls_dns_credentials_encrypted.is_none());
+        assert_eq!(redacted.oidc.client_secret.as_deref(), Some("<set>"));
+        assert!(redacted.oidc.client_secret_encrypted.is_none());
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("CF_API_TOKEN=secret"));
+        assert!(!json.contains("oidc-secret"));
+        assert!(!json.contains("c2VhbGVkLWJsb2I="));
+    }
+
+    #[test]
+    fn redact_settings_marks_unset_dns_credentials_as_absent() {
+        let redacted = redact_settings_secrets(Settings::default());
+
+        assert!(redacted.tls_dns_credentials.is_none());
+        assert!(redacted.tls_dns_credentials_encrypted.is_none());
+        assert_eq!(redacted.oidc.client_secret.as_deref(), Some("<unset>"));
+    }
+
+    #[test]
+    fn redact_settings_marks_encrypted_only_dns_credentials_as_set() {
+        let settings = Settings {
+            tls_dns_credentials_encrypted: Some(fake_blob()),
+            ..Default::default()
+        };
+
+        let redacted = redact_settings_secrets(settings);
+
+        assert_eq!(
+            redacted.tls_dns_credentials.as_deref(),
+            Some(DNS_CREDS_PLACEHOLDER)
+        );
+        assert!(redacted.tls_dns_credentials_encrypted.is_none());
+        assert!(
+            !serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("c2VhbGVkLWJsb2I=")
+        );
     }
 
     #[test]
