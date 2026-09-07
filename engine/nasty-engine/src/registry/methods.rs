@@ -13,7 +13,7 @@ use crate::subvolume_dependents::SubvolumeDependents;
 use nasty_apps::{
     App, AppConfig, AppIngress, AppStats, AppdataRelocateStatus, AppsStatus, CaddyRouteSummary,
     CheckComposeRequest, CheckComposeResult, CheckDevicesRequest, CheckPortsRequest,
-    CheckVolumesRequest, ComposeStartupEntry, DeviceMissing, EnableAppsRequest,
+    CheckVolumesRequest, ComposeContent, ComposeStartupEntry, DeviceMissing, EnableAppsRequest,
     FixVolumePermsRequest, ImageInspectResult, InstallAppRequest, InstallComposeRequest,
     ManagedNetwork, NetworkSummary, PortConflict, PruneResult, SetComposeStartupRequest,
     SetIngressRequest, VolumeMismatch,
@@ -2908,7 +2908,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 Method {
                     name: "apps.config",
                     desc: "Return the deployed configuration of a named simple app (image, ports, env, volumes, resource limits, allow_unsafe), with env entries tagged where they match the image's own defaults so the WebUI Edit form can grey them out.",
-                    role: MethodRole::Any,
+                    role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "App name.")),
                     result: Some(gen_schema::<AppConfig>(generator)),
                 },
@@ -2954,7 +2954,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 Method {
                     name: "apps.inspect",
                     desc: "Return the raw Docker `inspect` JSON for a named simple app's container as an untyped object.",
-                    role: MethodRole::Any,
+                    role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "App name.")),
                     result: Some(
                         serde_json::json!({"type": "object", "description": "Raw Docker `inspect` payload — shape follows the Docker API."}),
@@ -3114,12 +3114,10 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "apps.compose.get",
-                    desc: "Return the raw docker-compose.yml file contents for a named compose-based app.",
-                    role: MethodRole::Any,
+                    desc: "Return the raw docker-compose.yml and operator-provided .env file contents for a named compose-based app.",
+                    role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Compose app name.")),
-                    result: Some(
-                        serde_json::json!({"type": "string", "description": "Raw docker-compose.yml body."}),
-                    ),
+                    result: Some(gen_schema::<ComposeContent>(generator)),
                 },
                 Method {
                     name: "apps.compose.logs",

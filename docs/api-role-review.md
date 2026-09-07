@@ -70,6 +70,10 @@ DNS credential fields.
 
 ### App read methods expose secrets to ReadOnly users
 
+Status: fixed by making simple-app configuration and inspect reads
+Operator-level with existing-app scope enforcement, and compose source reads
+unscoped Admin-only.
+
 `apps.config` returns environment values, `apps.inspect` returns raw Docker
 inspect data, and `apps.compose.get` returns the stack `.env` file.
 

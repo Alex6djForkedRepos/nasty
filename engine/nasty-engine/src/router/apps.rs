@@ -15,16 +15,17 @@ fn simple_requires_admin(req: &nasty_apps::InstallAppRequest) -> bool {
     req.allow_unsafe || req.network.as_deref() == Some("host")
 }
 
+fn app_requires_admin(app: &nasty_apps::App) -> bool {
+    app.kind == "compose" || app.unsafe_mode || app.network.as_deref() == Some("host")
+}
+
 async fn existing_app_requires_admin(state: &AppState, name: &str) -> Result<bool, String> {
     let app = state
         .apps
         .get(name)
         .await
         .map_err(|error| error.to_string())?;
-    if app.kind == "compose" || app.unsafe_mode || app.network.as_deref() == Some("host") {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(app_requires_admin(&app))
 }
 
 async fn existing_app_access_error(
@@ -154,10 +155,15 @@ pub(super) async fn try_route(
             Err(r) => r,
         },
         "apps.inspect" => match require_str(req, "name") {
-            Ok(name) => match state.apps.inspect(name).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
+                }
+                match state.apps.inspect(name).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.install" => match parse_params::<nasty_apps::InstallAppRequest>(req) {
@@ -272,10 +278,15 @@ pub(super) async fn try_route(
             Err(e) => invalid(req, e),
         },
         "apps.config" => match require_str(req, "name") {
-            Ok(name) => match state.apps.get_config(name).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+            Ok(name) => {
+                if let Some(response) = existing_app_access_error(req, state, session, name).await {
+                    return Some(response);
+                }
+                match state.apps.get_config(name).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
             Err(r) => r,
         },
         "apps.remove" => match require_str(req, "name") {
@@ -440,13 +451,18 @@ pub(super) async fn try_route(
             }
             Err(r) => r,
         },
-        "apps.compose.get" => match require_str(req, "name") {
-            Ok(name) => match state.apps.compose_get(name).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
-            Err(r) => r,
-        },
+        "apps.compose.get" => {
+            if let Some(response) = require_root_equivalent(req, session, "compose_source_read") {
+                return Some(response);
+            }
+            match require_str(req, "name") {
+                Ok(name) => match state.apps.compose_get(name).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                },
+                Err(r) => r,
+            }
+        }
         "apps.compose.logs" => {
             let name = match require_str(req, "name") {
                 Ok(n) => n,
@@ -707,6 +723,23 @@ mod tests {
         serde_json::from_value(value).expect("valid test request")
     }
 
+    fn existing_app(extra: serde_json::Value) -> nasty_apps::App {
+        let mut value = serde_json::json!({
+            "name": "safe-app",
+            "image": "example/app:latest",
+            "status": "running",
+            "created": "2026-01-01T00:00:00Z",
+            "kind": "simple"
+        });
+        value.as_object_mut().unwrap().extend(
+            extra
+                .as_object()
+                .expect("test app extension must be an object")
+                .clone(),
+        );
+        serde_json::from_value(value).expect("valid test app")
+    }
+
     #[test]
     fn simple_admin_gate_covers_unsafe_mounts_and_host_networking() {
         assert!(!simple_requires_admin(&simple_request(serde_json::json!(
@@ -716,6 +749,20 @@ mod tests {
             "allow_unsafe": true
         }))));
         assert!(simple_requires_admin(&simple_request(serde_json::json!({
+            "network": "host"
+        }))));
+    }
+
+    #[test]
+    fn existing_app_secret_reads_gate_privileged_apps_as_admin() {
+        assert!(!app_requires_admin(&existing_app(serde_json::json!({}))));
+        assert!(app_requires_admin(&existing_app(serde_json::json!({
+            "kind": "compose"
+        }))));
+        assert!(app_requires_admin(&existing_app(serde_json::json!({
+            "unsafe_mode": true
+        }))));
+        assert!(app_requires_admin(&existing_app(serde_json::json!({
             "network": "host"
         }))));
     }
