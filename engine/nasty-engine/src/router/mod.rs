@@ -137,6 +137,8 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "vm.clone"
                 | "apps.install"
                 | "apps.update"
+                | "apps.config"
+                | "apps.inspect"
                 | "apps.remove"
                 | "apps.stop"
                 | "apps.start"
@@ -249,6 +251,11 @@ fn is_read_only(method: &str) -> bool {
             // can hold sensitive settings. Its `.get` suffix would otherwise slip
             // it into the universally-allowed read set; keep it Admin-only.
             | "system.custom_config.get"
+            // These return container environment, raw Docker metadata, or
+            // compose source that can contain credentials.
+            | "apps.config"
+            | "apps.inspect"
+            | "apps.compose.get"
     ) {
         return false;
     }
@@ -329,7 +336,6 @@ fn is_read_only(method: &str) -> bool {
                 | "apps.logs"
                 | "apps.compose.logs"
                 | "apps.container.logs"
-                | "apps.inspect"
                 | "system.firewall.status"
                 | "vm.capabilities"
                 | "vm.images.import_info"
@@ -338,7 +344,6 @@ fn is_read_only(method: &str) -> bool {
                 | "firmware.check"
                 | "firmware.devices"
                 | "notifications.config.get"
-                | "apps.config"
                 | "apps.inspect_image"
                 | "apps.caddy.routes"
                 | "apps.ingress.check_conflict"
@@ -2203,6 +2208,16 @@ mod tests {
             assert!(!is_read_only(method));
             assert!(is_operator_allowed(method));
         }
+    }
+
+    #[test]
+    fn secret_bearing_app_reads_require_management_roles() {
+        for method in ["apps.config", "apps.inspect"] {
+            assert!(!is_read_only(method));
+            assert!(is_operator_allowed(method));
+        }
+        assert!(!is_read_only("apps.compose.get"));
+        assert!(!is_operator_allowed("apps.compose.get"));
     }
 
     /// The .list / .get suffix matches that existed before this
