@@ -49,6 +49,9 @@ pub(super) async fn try_route(
             }
         }
         "auth.create_user" => {
+            if let Some(response) = require_root_equivalent(req, session, "global_user_admin") {
+                return Some(response);
+            }
             #[derive(Deserialize)]
             struct P {
                 username: String,
@@ -75,19 +78,32 @@ pub(super) async fn try_route(
                 Err(e) => invalid(req, e),
             }
         }
-        "auth.delete_user" => match require_str(req, "username") {
-            Ok(username) => match state.auth.delete_user(session, username).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
-            Err(r) => r,
-        },
+        "auth.delete_user" => {
+            if let Some(response) = require_root_equivalent(req, session, "global_user_admin") {
+                return Some(response);
+            }
+            match require_str(req, "username") {
+                Ok(username) => match state.auth.delete_user(session, username).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                },
+                Err(r) => r,
+            }
+        }
         "auth.list_users" => ok(req, state.auth.list_users().await),
-        "auth.token.list" => match state.auth.list_api_tokens(session).await {
-            Ok(v) => ok(req, v),
-            Err(e) => err(req, e),
-        },
+        "auth.token.list" => {
+            if let Some(response) = require_root_equivalent(req, session, "global_token_admin") {
+                return Some(response);
+            }
+            match state.auth.list_api_tokens(session).await {
+                Ok(v) => ok(req, v),
+                Err(e) => err(req, e),
+            }
+        }
         "auth.token.create" => {
+            if let Some(response) = require_root_equivalent(req, session, "global_token_admin") {
+                return Some(response);
+            }
             #[derive(Deserialize)]
             struct P {
                 name: String,
@@ -116,20 +132,25 @@ pub(super) async fn try_route(
                 Err(e) => invalid(req, e),
             }
         }
-        "auth.token.delete" => match require_str(req, "id") {
-            Ok(id) => match state.auth.delete_api_token(session, id).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
-            Err(r) => r,
-        },
+        "auth.token.delete" => {
+            if let Some(response) = require_root_equivalent(req, session, "global_token_admin") {
+                return Some(response);
+            }
+            match require_str(req, "id") {
+                Ok(id) => match state.auth.delete_api_token(session, id).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                },
+                Err(r) => r,
+            }
+        }
         "auth.oidc.config_status" => {
             let oidc = state.settings.get().await.oidc;
             ok(req, nasty_system::settings::redact_oidc_secret(oidc))
         }
         "auth.oidc.update_config" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
+            if let Some(response) = require_root_equivalent(req, session, "global_oidc_admin") {
+                return Some(response);
             }
             match parse_params::<nasty_system::settings::OidcSettings>(req) {
                 Ok(new_settings) => {
@@ -161,8 +182,8 @@ pub(super) async fn try_route(
             }
         }
         "auth.oidc.test" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
+            if let Some(response) = require_root_equivalent(req, session, "global_oidc_admin") {
+                return Some(response);
             }
             let sample = req
                 .params
@@ -246,8 +267,8 @@ pub(super) async fn try_route(
         // here so a non-admin call doesn't even reach the state
         // mutation path. Audit log written by AuthService.
         "auth.webauthn.reset_for_user" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
+            if let Some(response) = require_root_equivalent(req, session, "global_webauthn_admin") {
+                return Some(response);
             }
             match require_str(req, "username") {
                 Ok(target) => match state.auth.reset_webauthn_credentials(session, target).await {
