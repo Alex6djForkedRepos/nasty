@@ -840,6 +840,13 @@
 			runLogPoll = null;
 		}
 		const current = profiles.find(profile => profile.id === viewRunLogProfile?.id) ?? viewRunLogProfile;
+		if (!isAdmin) {
+			viewRunLogProfile = current;
+			runLogOutput = current.last_run
+				? `Latest recorded result (${formatRunTimestamp(current.last_run.timestamp)}):\n${current.last_run.message}`
+				: 'No completed run has been recorded yet.';
+			return;
+		}
 		const wasRunning = activeJobs[current.id]?.kind === 'run_backup'
 			&& (activeJobs[current.id].state === 'pending' || activeJobs[current.id].state === 'running');
 		const request = ++runLogRequest;

@@ -13,7 +13,7 @@ import {
 
 describe('navigation model', () => {
 	test('preserves the full hierarchy and order', () => {
-		const entries = resolveNavigation({ kvmAvailable: true });
+		const entries = resolveNavigation({ kvmAvailable: true, role: 'admin' });
 		expect(entries.map((entry) => entry.label)).toEqual([
 			'Dashboard', 'Storage', 'Sharing', 'Protection', 'Compute', 'Terminal', 'System'
 		]);
@@ -32,29 +32,29 @@ describe('navigation model', () => {
 	});
 
 	test('uses unique stable IDs and routes', () => {
-		const items = flattenNavigation(resolveNavigation({ kvmAvailable: true }));
+		const items = flattenNavigation(resolveNavigation({ kvmAvailable: true, role: 'admin' }));
 		expect(new Set(items.map((entry) => entry.id)).size).toBe(items.length);
 		expect(new Set(items.map((entry) => entry.href)).size).toBe(items.length);
 	});
 
 	test('gates VMs on KVM without changing Apps', () => {
-		const withoutKvm = flattenNavigation(resolveNavigation({ kvmAvailable: false }));
+		const withoutKvm = flattenNavigation(resolveNavigation({ kvmAvailable: false, role: 'admin' }));
 		expect(withoutKvm.some((item) => item.href === '/vms')).toBe(false);
 		expect(withoutKvm.some((item) => item.href === '/apps')).toBe(true);
 
-		const withKvm = flattenNavigation(resolveNavigation({ kvmAvailable: true }));
+		const withKvm = flattenNavigation(resolveNavigation({ kvmAvailable: true, role: 'admin' }));
 		expect(withKvm.some((item) => item.href === '/vms')).toBe(true);
 	});
 
 	test('derives the existing Common menu order', () => {
-		const common = commonNavigation(resolveNavigation({ kvmAvailable: true }));
+		const common = commonNavigation(resolveNavigation({ kvmAvailable: true, role: 'admin' }));
 		expect(common.map((item) => item.href)).toEqual([
 			'/', '/filesystems', '/subvolumes', '/disks', '/files', '/apps', '/vms', '/backups', '/logs'
 		]);
 	});
 
 	test('matches active items and their owning group', () => {
-		const entries = resolveNavigation({ kvmAvailable: true });
+		const entries = resolveNavigation({ kvmAvailable: true, role: 'admin' });
 		expect(currentNavigationItem('/subvolumes/details', entries).href).toBe('/subvolumes');
 		expect(activeNavigationGroup('/subvolumes/details', entries)).toBe('storage');
 		expect(activeNavigationGroup('/sharing', entries)).toBeNull();
@@ -62,7 +62,7 @@ describe('navigation model', () => {
 	});
 
 	test('search uses item keywords and group labels', () => {
-		const entries = resolveNavigation({ kvmAvailable: true });
+		const entries = resolveNavigation({ kvmAvailable: true, role: 'admin' });
 		expect(searchNavigation(entries, 'copygc')).toEqual(new Set(['/operations']));
 		expect(searchNavigation(entries, 'storage')).toEqual(new Set([
 			'/filesystems', '/subvolumes', '/disks', '/operations', '/files'
@@ -70,13 +70,13 @@ describe('navigation model', () => {
 	});
 
 	test('finds Disks by I/O scheduler terminology', () => {
-		const entries = resolveNavigation({ kvmAvailable: true });
+		const entries = resolveNavigation({ kvmAvailable: true, role: 'admin' });
 		expect(searchNavigation(entries, 'scheduler')).toEqual(new Set(['/disks']));
 		expect(searchNavigation(entries, 'elevator')).toEqual(new Set(['/disks']));
 	});
 
 	test('search cannot expose capability-gated entries', () => {
-		const entries = resolveNavigation({ kvmAvailable: false });
+		const entries = resolveNavigation({ kvmAvailable: false, role: 'admin' });
 		expect(searchNavigation(entries, 'virtual machine')).toEqual(new Set());
 	});
 
@@ -88,5 +88,14 @@ describe('navigation model', () => {
 		expect(searchNavigation(entries, 'filesystem')).toEqual(new Set());
 		expect(searchNavigation(entries, 'access control')).toEqual(new Set());
 		expect(currentNavigationItem('/menu', entries)).toBe(LAUNCHER_NAV_ITEM);
+	});
+
+	test('shows system logs only to admins', () => {
+		for (const role of ['operator', 'readonly', 'user'] as const) {
+			const items = flattenNavigation(resolveNavigation({ kvmAvailable: true, role }));
+			expect(items.some((item) => item.href === '/logs')).toBe(false);
+		}
+		const adminItems = flattenNavigation(resolveNavigation({ kvmAvailable: true, role: 'admin' }));
+		expect(adminItems.some((item) => item.href === '/logs')).toBe(true);
 	});
 });

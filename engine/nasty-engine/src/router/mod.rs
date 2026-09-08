@@ -275,7 +275,6 @@ fn is_read_only(method: &str) -> bool {
                 | "system.stats"
                 | "system.disks"
                 | "system.network.get"
-                | "system.logs"
                 | "system.logs.units"
                 | "system.ssh.status"
                 | "system.alerts"
@@ -2218,6 +2217,14 @@ mod tests {
         }
         assert!(!is_read_only("apps.compose.get"));
         assert!(!is_operator_allowed("apps.compose.get"));
+    }
+
+    #[test]
+    fn system_journal_contents_are_admin_only_but_unit_metadata_is_readable() {
+        assert!(!is_read_only("system.logs"));
+        assert!(!is_operator_allowed("system.logs"));
+        assert!(is_read_only("system.logs.units"));
+        assert!(is_universally_allowed("system.logs.units"));
     }
 
     /// The .list / .get suffix matches that existed before this

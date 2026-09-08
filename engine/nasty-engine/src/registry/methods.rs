@@ -1448,8 +1448,8 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "system.logs",
-                    desc: "Return the tail of a systemd unit's journal.",
-                    role: MethodRole::Any,
+                    desc: "Return the tail of a systemd unit's journal. Requires an unscoped Admin session because journal entries can contain sensitive system data.",
+                    role: MethodRole::Admin,
                     params: MethodParams::AdHoc(serde_json::json!({
                         "type": "object",
                         "properties": {
