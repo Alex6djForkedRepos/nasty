@@ -2397,6 +2397,10 @@ mod tests {
             },
             Session {
                 owner: Some("automation".to_string()),
+                ..session(Role::Admin)
+            },
+            Session {
+                owner: Some("automation".to_string()),
                 ..session(Role::Operator)
             },
         ] {

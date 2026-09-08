@@ -10,11 +10,13 @@
 		FirmwareDevice,
 		FirmwareUpdateResult,
 		FirmwareConstraints,
+		AuthMe,
 		VersionInfo,
 		VersionInputInfo,
 		VersionTaggedReleaseStatus,
 		UpdateBuildDirConfig
 	} from '$lib/types';
+	import { hasRootEquivalentAccess } from '$lib/access';
 	import { Tag, Trash2, ArrowRightLeft, X, Check, ChevronDown, ChevronRight } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -116,6 +118,7 @@
 	let firmwareLoading = $state(false);
 	let firmwareLoaded = $state(false);
 	let firmwareUpdating: Record<string, boolean> = $state({});
+	let canFlashFirmware = $state(false);
 	// Apply-side blockers (today: Secure Boot enforcing — upstream
 	// lanzaboote#591 breaks fwupd's EFI-capsule shim). Engine owns
 	// the reason string; we render it verbatim in the banner and
@@ -663,6 +666,11 @@
 
 	async function loadFirmware() {
 		firmwareLoading = true;
+		canFlashFirmware = false;
+		try {
+			const identity = await client.call<AuthMe>('auth.me');
+			canFlashFirmware = hasRootEquivalentAccess(identity.role, identity.scoped);
+		} catch { /* Fail closed if session details are unavailable. */ }
 		try {
 			firmwareAvailable = await client.call<boolean>('firmware.available');
 			if (firmwareAvailable) {
@@ -681,6 +689,7 @@
 	}
 
 	async function updateFirmware(deviceId: string) {
+		if (!canFlashFirmware) return;
 		if (!await confirm(
 			'Apply firmware update?',
 			'This will flash new firmware to the device. Do not power off during the update. A reboot may be required.'
@@ -1306,11 +1315,13 @@
 											{#if dev.update_available}
 												<Button
 													size="xs"
-													onclick={() => updateFirmware(dev.device_id)}
-													disabled={firmwareUpdating[dev.device_id] || firmwareConstraints?.sb_blocks_apply}
-													title={firmwareConstraints?.sb_blocks_apply
-														? firmwareConstraints.sb_blocks_apply_reason
-														: undefined}
+												onclick={() => updateFirmware(dev.device_id)}
+												disabled={!canFlashFirmware || firmwareUpdating[dev.device_id] || firmwareConstraints?.sb_blocks_apply}
+													title={!canFlashFirmware
+														? 'Firmware flashing requires an unscoped Administrator session.'
+														: firmwareConstraints?.sb_blocks_apply
+															? firmwareConstraints.sb_blocks_apply_reason
+															: undefined}
 												>
 													{firmwareUpdating[dev.device_id] ? 'Updating...' : 'Update'}
 												</Button>

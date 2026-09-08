@@ -180,7 +180,6 @@ fn is_operator_allowed(method: &str) -> bool {
                 // `vm.create` etc.; without import they can't
                 // populate the disk to boot from.
                 | "vm.images.ensure"
-                | "firmware.update"
         )
 }
 
@@ -2225,6 +2224,13 @@ mod tests {
         assert!(!is_operator_allowed("system.logs"));
         assert!(is_read_only("system.logs.units"));
         assert!(is_universally_allowed("system.logs.units"));
+    }
+
+    #[test]
+    fn firmware_flash_is_admin_only() {
+        assert!(!is_read_only("firmware.update"));
+        assert!(!is_universally_allowed("firmware.update"));
+        assert!(!is_operator_allowed("firmware.update"));
     }
 
     /// The .list / .get suffix matches that existed before this

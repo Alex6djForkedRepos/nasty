@@ -798,10 +798,15 @@ pub(super) async fn try_route(
         "firmware.constraints" => ok(req, state.firmware.constraints().await),
         "firmware.devices" => ok(req, state.firmware.list_devices().await),
         "firmware.check" => ok(req, state.firmware.check_updates().await),
-        "firmware.update" => match require_str(req, "device_id") {
-            Ok(id) => ok(req, state.firmware.update_device(id).await),
-            Err(r) => r,
-        },
+        "firmware.update" => {
+            if let Some(response) = require_root_equivalent(req, session, "firmware_flash") {
+                return Some(response);
+            }
+            match require_str(req, "device_id") {
+                Ok(id) => ok(req, state.firmware.update_device(id).await),
+                Err(r) => r,
+            }
+        }
         "system.update.channel.set" => match require_str(req, "channel") {
             Ok(ch) => match ch.parse::<nasty_system::update::ReleaseChannel>() {
                 Ok(channel) => match state.updates.set_channel(channel).await {

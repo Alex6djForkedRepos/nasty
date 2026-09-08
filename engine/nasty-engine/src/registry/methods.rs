@@ -2136,8 +2136,8 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "firmware.update",
-                    desc: "Apply the available firmware update for the named device via fwupd. Refuses the call if Secure Boot constraints block the capsule-apply path.",
-                    role: MethodRole::Operator,
+                    desc: "Apply the available firmware update for the named device via fwupd. Requires an unscoped Admin session and refuses the call if Secure Boot constraints block the capsule-apply path.",
+                    role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "device_id",
                         "fwupd device identifier (from firmware.devices).",

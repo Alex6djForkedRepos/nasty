@@ -8,8 +8,8 @@ Static review of all 329 methods registered in
 `engine/nasty-engine/src/registry/methods.rs`:
 
 - 126 `Any`
-- 80 `Operator`
-- 123 `Admin`
+- 79 `Operator`
+- 124 `Admin`
 
 The registry declarations match the central dispatcher. The findings below are
 semantic authorization problems that the registry/dispatcher consistency tests
@@ -96,6 +96,8 @@ access because journals can leak secrets, addresses, and audit details.
 - `engine/nasty-engine/src/log_stream.rs:102-123`
 
 ### `firmware.update` is Operator-level
+
+Status: fixed by requiring an unscoped Admin session before invoking fwupd.
 
 The method performs a host firmware flash through `fwupdmgr update ... -y` and
 should require an unscoped Admin.
