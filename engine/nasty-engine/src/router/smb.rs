@@ -9,13 +9,33 @@ use serde::Deserialize;
 
 use super::*;
 use crate::AppState;
-use crate::auth::{Role, Session};
+use crate::auth::Session;
+
+fn is_smb_identity_mutation(method: &str) -> bool {
+    matches!(
+        method,
+        "smb.user.create"
+            | "smb.user.delete"
+            | "smb.user.set_password"
+            | "smb.group.create"
+            | "smb.group.delete"
+            | "smb.group.add_member"
+            | "smb.group.remove_member"
+    )
+}
 
 pub(super) async fn try_route(
     req: &Request,
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if is_smb_identity_mutation(&req.method)
+        && let Some(response) =
+            require_unscoped_mutation(req, session, "global_smb_identity_mutation")
+    {
+        return Some(response);
+    }
+
     Some(match req.method.as_str() {
         "smb.user.list" => match state.smb.list_users().await {
             Ok(v) => ok(req, v),
@@ -116,4 +136,56 @@ pub(super) async fn try_route(
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_smb_identity_mutation;
+    use crate::auth::{EndpointAccess, Role, Session, authorize_session};
+
+    fn session(role: Role, filesystem: Option<&str>, owner: Option<&str>) -> Session {
+        Session {
+            token: "token".into(),
+            username: "user".into(),
+            role,
+            file_principal: None,
+            filesystem: filesystem.map(str::to_string),
+            owner: owner.map(str::to_string),
+            created_at: 0,
+            must_change_password: false,
+            client_ip: None,
+        }
+    }
+
+    #[test]
+    fn all_smb_identity_mutations_are_scope_gated() {
+        for method in [
+            "smb.user.create",
+            "smb.user.delete",
+            "smb.user.set_password",
+            "smb.group.create",
+            "smb.group.delete",
+            "smb.group.add_member",
+            "smb.group.remove_member",
+        ] {
+            assert!(
+                is_smb_identity_mutation(method),
+                "missing gate for {method}"
+            );
+        }
+        assert!(!is_smb_identity_mutation("smb.user.list"));
+        assert!(!is_smb_identity_mutation("smb.group.list"));
+    }
+
+    #[test]
+    fn smb_identity_mutations_allow_only_unscoped_operators_and_admins() {
+        let access = EndpointAccess::UnscopedMutation;
+        assert!(authorize_session(&session(Role::Operator, None, None), access).is_ok());
+        assert!(authorize_session(&session(Role::Admin, None, None), access).is_ok());
+        assert!(authorize_session(&session(Role::Operator, Some("tank"), None), access).is_err());
+        assert!(authorize_session(&session(Role::Operator, None, Some("alice")), access).is_err());
+        assert!(authorize_session(&session(Role::Admin, Some("tank"), None), access).is_err());
+        assert!(authorize_session(&session(Role::Admin, None, Some("alice")), access).is_err());
+        assert!(authorize_session(&session(Role::ReadOnly, None, None), access).is_err());
+    }
 }

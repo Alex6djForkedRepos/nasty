@@ -16,6 +16,7 @@
 		validUsers: string[];
 		timeMachine: boolean;
 		maxSizeGib: number | null;
+		canMutateIdentities: boolean;
 	}
 	let {
 		name = $bindable(),
@@ -24,6 +25,7 @@
 		validUsers = $bindable(),
 		timeMachine = $bindable(),
 		maxSizeGib = $bindable(),
+		canMutateIdentities,
 	}: Props = $props();
 
 	const client = getClient();
@@ -46,6 +48,7 @@
 	let createGroupTried = $state(false);
 
 	async function createInlineGroup() {
+		if (!canMutateIdentities) return;
 		if (!inlineGroupName.trim()) { createGroupTried = true; return; }
 		createGroupTried = false;
 		await withToast(
@@ -59,6 +62,7 @@
 	}
 
 	async function createInlineUser() {
+		if (!canMutateIdentities) return;
 		if (!inlineUsername || !inlinePassword || !inlinePasswordConfirm) { createUserTried = true; return; }
 		if (inlinePassword !== inlinePasswordConfirm) { createUserTried = true; return; }
 		createUserTried = false;
@@ -217,7 +221,7 @@
 					</div>
 				</CardContent>
 			</Card>
-		{:else}
+		{:else if canMutateIdentities}
 			<div class="mt-2 flex gap-2">
 				<Button size="sm" onclick={() => showInlineUserCreate = true}>Create System User</Button>
 			</div>

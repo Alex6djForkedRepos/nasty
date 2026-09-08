@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { getClient } from '$lib/client';
+	import { hasUnscopedMutationAccess } from '$lib/access';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
@@ -15,6 +16,7 @@
 		WebauthnCredentialSummary,
 		WebauthnRegisterStart,
 		UserRole,
+		AuthMe,
 	} from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -150,6 +152,7 @@
 	// System users (protocol access)
 	interface SystemUser { username: string; uid: number; }
 	let systemUsers: SystemUser[] = $state([]);
+	let canMutateSmbIdentities = $state(false);
 	let showCreateSystemUser = $state(false);
 	let newSysUsername = $state('');
 	let newSysPassword = $state('');
@@ -249,7 +252,12 @@
 	const client = getClient();
 
 	onMount(async () => {
-		await refresh();
+		await Promise.all([
+			refresh(),
+			client.call<AuthMe>('auth.me').then((identity) => {
+				canMutateSmbIdentities = hasUnscopedMutationAccess(identity.role, identity.scoped);
+			}).catch(() => { canMutateSmbIdentities = false; }),
+		]);
 		loadOidc();
 		loading = false;
 	});
@@ -713,9 +721,12 @@
 <p class="mb-4 text-sm text-muted-foreground">
 	Linux users for protocol access (SMB). Create users here, then reference them in share "Valid Users" for authenticated access.
 </p>
+{#if !canMutateSmbIdentities}
+	<p class="mb-4 text-sm text-amber-500">An unscoped Operator or Admin session is required to change SMB identities.</p>
+{/if}
 
 <div class="mb-4">
-	<Button size="sm" onclick={() => showCreateSystemUser = !showCreateSystemUser}>
+	<Button size="sm" onclick={() => showCreateSystemUser = !showCreateSystemUser} disabled={!canMutateSmbIdentities}>
 		{showCreateSystemUser ? 'Cancel' : 'Create System User'}
 	</Button>
 </div>
@@ -759,7 +770,7 @@
 					</div>
 				</div>
 			{/if}
-			<Button onclick={createSystemUser} disabled={creatingSysUser || !newSysUsername || !newSysPassword || newSysPassword !== newSysPasswordConfirm}>
+			<Button onclick={createSystemUser} disabled={!canMutateSmbIdentities || creatingSysUser || !newSysUsername || !newSysPassword || newSysPassword !== newSysPasswordConfirm}>
 				{creatingSysUser ? 'Creating…' : 'Create'}
 			</Button>
 		</CardContent>
@@ -793,10 +804,10 @@
 						</td>
 						<td class="p-3" onclick={(e) => e.stopPropagation()}>
 							<div class="flex gap-2">
-								<Button variant="secondary" size="xs" onclick={() => { sysPwUser = user.username; sysPwNew = ''; sysPwConfirm = ''; }}>
+								<Button variant="secondary" size="xs" onclick={() => { sysPwUser = user.username; sysPwNew = ''; sysPwConfirm = ''; }} disabled={!canMutateSmbIdentities}>
 									Change Password
 								</Button>
-								<Button variant="destructive" size="xs" onclick={() => deleteSystemUser(user.username)}>Delete</Button>
+								<Button variant="destructive" size="xs" onclick={() => deleteSystemUser(user.username)} disabled={!canMutateSmbIdentities}>Delete</Button>
 							</div>
 						</td>
 					</tr>
@@ -810,6 +821,7 @@
 										<label class="flex items-center gap-1.5 text-sm cursor-pointer rounded border px-2 py-1 transition-colors {isMember ? 'border-blue-500/40 bg-blue-500/10' : 'border-border hover:bg-muted/30'}">
 											<input type="checkbox" class="rounded border-input"
 												checked={isMember}
+												disabled={!canMutateSmbIdentities}
 												onchange={async (e) => {
 													if (isMember) {
 														// Removing membership via a checkbox toggle is
@@ -865,7 +877,7 @@
 			{/if}
 		</div>
 		<Dialog.Footer>
-			<Button size="sm" onclick={changeSysPassword}>
+			<Button size="sm" onclick={changeSysPassword} disabled={!canMutateSmbIdentities}>
 				Change Password
 			</Button>
 			<Button variant="secondary" size="sm" onclick={() => sysPwUser = null}>Cancel</Button>
@@ -880,7 +892,7 @@
 </p>
 
 <div class="mb-4">
-	<Button size="sm" onclick={() => showCreateGroup = !showCreateGroup}>
+	<Button size="sm" onclick={() => showCreateGroup = !showCreateGroup} disabled={!canMutateSmbIdentities}>
 		{showCreateGroup ? 'Cancel' : 'Create Group'}
 	</Button>
 </div>
@@ -892,7 +904,7 @@
 				<Label for="group-name">Group Name {#if !newGroupName.trim() && newGroupTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</Label>
 				<Input id="group-name" bind:value={newGroupName} placeholder="e.g. engineering" class="mt-1 {requiredFieldCls(!newGroupName.trim(), newGroupTried)}" />
 			</div>
-			<Button size="sm" onclick={createGroup}>Create</Button>
+			<Button size="sm" onclick={createGroup} disabled={!canMutateSmbIdentities}>Create</Button>
 		</CardContent>
 	</Card>
 {/if}
@@ -924,7 +936,7 @@
 						{/if}
 					</td>
 					<td class="p-3" onclick={(e) => e.stopPropagation()}>
-						<Button variant="destructive" size="xs" onclick={() => deleteGroup(group.name)}>Delete</Button>
+						<Button variant="destructive" size="xs" onclick={() => deleteGroup(group.name)} disabled={!canMutateSmbIdentities}>Delete</Button>
 					</td>
 				</tr>
 				{#if expandedGroup === group.name}
@@ -936,7 +948,7 @@
 									{#each group.members as member}
 										<span class="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs">
 											{member}
-											<button class="ml-1 text-muted-foreground hover:text-destructive" onclick={() => removeMember(group.name, member)} title="Remove">&times;</button>
+											<button class="ml-1 text-muted-foreground hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50" onclick={() => removeMember(group.name, member)} title="Remove" disabled={!canMutateSmbIdentities}>&times;</button>
 										</span>
 									{/each}
 								</div>
@@ -951,11 +963,11 @@
 											<option value={user.username}>{user.username}</option>
 										{/each}
 									</select>
-									<Button size="xs" onclick={addMember} disabled={!addMemberUser}>Add</Button>
+									<Button size="xs" onclick={addMember} disabled={!canMutateSmbIdentities || !addMemberUser}>Add</Button>
 									<Button size="xs" variant="secondary" onclick={() => addMemberGroup = null}>Cancel</Button>
 								</div>
 							{:else}
-								<Button size="xs" variant="secondary" onclick={() => addMemberGroup = group.name}>Add Member</Button>
+								<Button size="xs" variant="secondary" onclick={() => addMemberGroup = group.name} disabled={!canMutateSmbIdentities}>Add Member</Button>
 							{/if}
 						</td>
 					</tr>
