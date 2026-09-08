@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { getClient } from '$lib/client';
+	import { hasRootEquivalentAccess } from '$lib/access';
 	import { formatBytes } from '$lib/format';
 	import { formatTemp } from '$lib/temperature.svelte';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { BlockDevice, DiskHealth, ProtocolStatus, SmartAttribute } from '$lib/types';
+	import type { AuthMe, BlockDevice, DiskHealth, ProtocolStatus, SmartAttribute } from '$lib/types';
 	import { ataAttributeMetadata } from '$lib/smart_attribute_metadata';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -23,7 +24,7 @@
 	let pollInterval: ReturnType<typeof setInterval> | null = null;
 	let schedulerValues = $state<Record<string, string>>({});
 	let schedulerPending = $state<Record<string, boolean>>({});
-	let isAdmin = $state(false);
+	let hasRootAccess = $state(false);
 
 	const client = getClient();
 
@@ -57,10 +58,10 @@
 
 	async function loadIdentity() {
 		try {
-			const identity = await client.call<{ role: string }>('auth.me');
-			isAdmin = identity.role === 'admin';
+			const identity = await client.call<AuthMe>('auth.me');
+			hasRootAccess = hasRootEquivalentAccess(identity.role, identity.scoped);
 		} catch {
-			isAdmin = false;
+			hasRootAccess = false;
 		}
 	}
 
@@ -379,9 +380,9 @@
 									class="w-full rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
 									value={schedulerValues[dev.path] ?? dev.io_scheduler.configured ?? ''}
 									onchange={(e) => setIoScheduler(dev, e.currentTarget.value)}
-									disabled={schedulerPending[dev.path] || !isAdmin}
+									disabled={schedulerPending[dev.path] || !hasRootAccess}
 									aria-label={`I/O scheduler for ${dev.path}`}
-									title={isAdmin ? 'Persist an I/O scheduler for this disk' : 'Administrator access is required to change the I/O scheduler'}
+									title={hasRootAccess ? 'Persist an I/O scheduler for this disk' : 'Administrator access is required to change the I/O scheduler'}
 								>
 									<option value="">Unmanaged (leave active unchanged)</option>
 									{#if dev.io_scheduler.configured && !dev.io_scheduler.available.includes(dev.io_scheduler.configured)}
@@ -428,7 +429,7 @@
 				<Badge variant={smartProtocol.enabled ? 'default' : 'secondary'}>
 					{smartProtocol.enabled ? 'Enabled' : 'Disabled'}
 				</Badge>
-				<Button variant="secondary" size="xs" onclick={toggleSmart}>
+				<Button variant="secondary" size="xs" onclick={toggleSmart} disabled={!hasRootAccess} title={hasRootAccess ? `${smartProtocol.enabled ? 'Disable' : 'Enable'} SMART monitoring` : 'Administrator access is required to manage SMART monitoring'}>
 					{smartProtocol.enabled ? 'Disable' : 'Enable'}
 				</Button>
 			{/if}
