@@ -9,7 +9,31 @@ use serde::Deserialize;
 
 use super::*;
 use crate::AppState;
-use crate::auth::{Role, Session};
+use crate::auth::{EndpointAccess, Session};
+
+fn protocol_mutation_access(protocol: nasty_system::protocol::Protocol) -> EndpointAccess {
+    if protocol.is_system_service() {
+        EndpointAccess::RootEquivalent
+    } else {
+        EndpointAccess::UnscopedMutation
+    }
+}
+
+fn require_protocol_mutation_access(
+    req: &Request,
+    session: &Session,
+    protocol: nasty_system::protocol::Protocol,
+) -> Option<Response> {
+    match protocol_mutation_access(protocol) {
+        EndpointAccess::RootEquivalent => {
+            require_root_equivalent(req, session, "system_service_protocol_mutation")
+        }
+        EndpointAccess::UnscopedMutation => {
+            require_unscoped_mutation(req, session, "global_share_protocol_mutation")
+        }
+        _ => unreachable!("protocol mutations use an explicit access tier"),
+    }
+}
 
 pub(super) async fn protocol_has_admin_only_sources(
     state: &AppState,
@@ -80,15 +104,7 @@ pub(super) async fn try_route(
         "service.protocol.enable" => match require_str(req, "name") {
             Ok(name) => {
                 if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
-                    if let Some(response) =
-                        require_unscoped_mutation(req, session, "global_protocol_enable")
-                    {
-                        return Some(response);
-                    }
-                    if proto == nasty_system::protocol::Protocol::Watchdog
-                        && let Some(response) =
-                            require_root_equivalent(req, session, "watchdog_reboot_policy")
-                    {
+                    if let Some(response) = require_protocol_mutation_access(req, session, proto) {
                         return Some(response);
                     }
                     if matches!(
@@ -215,26 +231,25 @@ pub(super) async fn try_route(
         },
         "service.protocol.disable" => match require_str(req, "name") {
             Ok(name) => {
-                if let Some(response) =
-                    require_unscoped_mutation(req, session, "global_protocol_disable")
-                {
-                    return Some(response);
-                }
-                match state.protocols.disable(name).await {
-                    Ok(v) => {
-                        if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
-                            match state.firewall.close(proto).await {
-                                Ok(()) => ok(req, v),
-                                Err(e) => err(
-                                    req,
-                                    format!("protocol disabled but firewall update failed: {e}"),
-                                ),
-                            }
-                        } else {
-                            ok(req, v)
-                        }
+                if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
+                    if let Some(response) = require_protocol_mutation_access(req, session, proto) {
+                        return Some(response);
                     }
-                    Err(e) => err(req, e),
+                    match state.protocols.disable(name).await {
+                        Ok(v) => match state.firewall.close(proto).await {
+                            Ok(()) => ok(req, v),
+                            Err(e) => err(
+                                req,
+                                format!("protocol disabled but firewall update failed: {e}"),
+                            ),
+                        },
+                        Err(e) => err(req, e),
+                    }
+                } else {
+                    match state.protocols.disable(name).await {
+                        Ok(v) => ok(req, v),
+                        Err(e) => err(req, e),
+                    }
                 }
             }
             Err(r) => r,
@@ -368,4 +383,62 @@ pub(super) async fn try_route(
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protocol_mutation_access;
+    use crate::auth::{EndpointAccess, Role, Session, authorize_session};
+    use nasty_system::protocol::Protocol;
+
+    fn session(role: Role, scoped: bool) -> Session {
+        Session {
+            token: "token".into(),
+            username: "user".into(),
+            role,
+            file_principal: None,
+            filesystem: scoped.then(|| "tank".into()),
+            owner: None,
+            created_at: 0,
+            must_change_password: false,
+            client_ip: None,
+        }
+    }
+
+    #[test]
+    fn share_protocol_mutations_allow_only_unscoped_operators_and_admins() {
+        for protocol in [
+            Protocol::Nfs,
+            Protocol::Smb,
+            Protocol::Iscsi,
+            Protocol::Nvmeof,
+        ] {
+            let access = protocol_mutation_access(protocol);
+            assert_eq!(access, EndpointAccess::UnscopedMutation);
+            assert!(authorize_session(&session(Role::Operator, false), access).is_ok());
+            assert!(authorize_session(&session(Role::Admin, false), access).is_ok());
+            assert!(authorize_session(&session(Role::Operator, true), access).is_err());
+            assert!(authorize_session(&session(Role::Admin, true), access).is_err());
+            assert!(authorize_session(&session(Role::ReadOnly, false), access).is_err());
+        }
+    }
+
+    #[test]
+    fn system_service_mutations_require_an_unscoped_admin() {
+        for protocol in [
+            Protocol::Nut,
+            Protocol::Ssh,
+            Protocol::Avahi,
+            Protocol::Smart,
+            Protocol::Watchdog,
+            Protocol::RestServer,
+        ] {
+            let access = protocol_mutation_access(protocol);
+            assert_eq!(access, EndpointAccess::RootEquivalent);
+            assert!(authorize_session(&session(Role::Admin, false), access).is_ok());
+            assert!(authorize_session(&session(Role::Admin, true), access).is_err());
+            assert!(authorize_session(&session(Role::Operator, false), access).is_err());
+            assert!(authorize_session(&session(Role::ReadOnly, false), access).is_err());
+        }
+    }
 }

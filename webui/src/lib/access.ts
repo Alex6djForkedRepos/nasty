@@ -14,6 +14,15 @@ export function hasRootEquivalentAccess(role: string | null | undefined, scoped:
 	return role === 'admin' && !scoped;
 }
 
+export function canMutateProtocol(
+	role: string | null | undefined,
+	scoped: boolean,
+	systemService: boolean
+): boolean {
+	if (scoped) return false;
+	return systemService ? role === 'admin' : role === 'admin' || role === 'operator';
+}
+
 export function canAccessAuthenticatedRoute(role: string, path: string): boolean {
 	const portalRoute = path === PORTAL_PATH || path.startsWith(`${PORTAL_PATH}/`);
 	return isStandardUser(role) ? portalRoute : !portalRoute;

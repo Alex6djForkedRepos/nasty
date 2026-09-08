@@ -2,9 +2,10 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
 	import { getClient } from '$lib/client';
+	import { canMutateProtocol } from '$lib/access';
 	import { withToast, error } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus, WatchdogConfig } from '$lib/types';
+	import type { AuthMe, ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus, WatchdogConfig } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
@@ -15,6 +16,7 @@
 	let selectedFs = $state('');
 	let dockerEnabling = $state(false);
 	let loading = $state(true);
+	let identity: AuthMe | null = $state(null);
 
 	// Per-service config panels
 	let configOpen = $state<string | null>(null);
@@ -397,7 +399,10 @@
 
 	onMount(async () => {
 		client.onEvent(handleEvent);
-		await refresh();
+		await Promise.all([
+			refresh(),
+			client.call<AuthMe>('auth.me').then((value) => { identity = value; }).catch(() => { identity = null; }),
+		]);
 		loading = false;
 		// Deep-link: /services?configure=<name> opens that service's config panel.
 		// Used by the SSH "Manage SSH" banner button (and any future banners).
@@ -460,6 +465,10 @@
 		await refresh();
 	}
 
+	function canToggle(proto: ProtocolStatus): boolean {
+		return identity !== null && canMutateProtocol(identity.role, identity.scoped, proto.system_service);
+	}
+
 	const sharingProtocols = $derived(protocols.filter(p => !p.system_service));
 	const systemServices = $derived(protocols.filter(p => p.system_service));
 </script>
@@ -484,6 +493,8 @@
 								size="xs"
 								class="w-[65px] justify-center"
 								onclick={() => toggle(proto)}
+								disabled={!canToggle(proto)}
+								title={canToggle(proto) ? `${proto.enabled ? 'Disable' : 'Enable'} ${proto.display_name}` : proto.system_service ? 'Administrator access is required to manage this system service' : 'Unscoped operator access is required to manage this protocol'}
 							>
 								{proto.enabled ? 'Disable' : 'Enable'}
 							</Button>

@@ -43,15 +43,15 @@ impl Protocol {
     ];
 
     pub fn is_system_service(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Protocol::Nut
-                | Protocol::Ssh
-                | Protocol::Avahi
-                | Protocol::Smart
-                | Protocol::Watchdog
-                | Protocol::RestServer
-        )
+            | Protocol::Ssh
+            | Protocol::Avahi
+            | Protocol::Smart
+            | Protocol::Watchdog
+            | Protocol::RestServer => true,
+            Protocol::Nfs | Protocol::Smb | Protocol::Iscsi | Protocol::Nvmeof => false,
+        }
     }
 
     pub fn name(&self) -> &'static str {

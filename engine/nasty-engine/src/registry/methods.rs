@@ -445,7 +445,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "service.protocol.enable",
-                    desc: "Enable a protocol or system service. Available names: `nfs`, `smb`, `iscsi`, `nvmeof`, `nut`, `ssh`, `avahi`, `smart`, `watchdog`, `rest-server`. Arming `watchdog` requires an unscoped Admin.",
+                    desc: "Enable a protocol or system service. Share protocols (`nfs`, `smb`, `iscsi`, `nvmeof`) require an unscoped Operator; system services (`nut`, `ssh`, `avahi`, `smart`, `watchdog`, `rest-server`) require an unscoped Admin.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "name",
@@ -455,7 +455,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "service.protocol.disable",
-                    desc: "Disable a protocol service.",
+                    desc: "Disable a protocol or system service. Share protocols require an unscoped Operator; system services require an unscoped Admin.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "name",

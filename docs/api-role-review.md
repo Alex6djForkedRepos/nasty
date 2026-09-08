@@ -107,12 +107,15 @@ should require an unscoped Admin.
 
 ### Generic protocol toggles control system safety services
 
+Status: fixed with payload-aware authorization for both enable and disable.
+
 Operator-level `service.protocol.enable` and `service.protocol.disable` also
 control SSH, NUT, watchdog, SMART, Avahi, and the backup REST server. System
-service payloads should require Admin; disabling watchdog currently lacks the
-enabling path's Admin check.
+service payloads now require an unscoped Admin, while share-protocol payloads
+remain available to unscoped Operators and Admins.
 
 - `engine/nasty-engine/src/registry/methods.rs:447-464`
+- `engine/nasty-engine/src/router/service.rs:14-38`
 - `engine/nasty-system/src/protocol.rs:16-54`
 
 ### Scoped Operator tokens can mutate global SMB identities

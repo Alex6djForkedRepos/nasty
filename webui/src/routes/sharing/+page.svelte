@@ -2,9 +2,10 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { getClient } from '$lib/client';
+	import { canMutateProtocol, hasRootEquivalentAccess } from '$lib/access';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { Subvolume, ProtocolStatus } from '$lib/types';
+	import type { AuthMe, Subvolume, ProtocolStatus } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { rdma, rdmaLoad, rdmaSet } from '$lib/sharing/rdma.svelte';
@@ -79,6 +80,7 @@
 
 	let shareSubvolumes: Subvolume[] = $state([]);
 	let isAdmin = $state(false);
+	let canMutateShareProtocols = $state(false);
 
 	// Inline subvolume creation within share wizard
 	let showInlineCreate = $state(false);
@@ -304,9 +306,13 @@
 	onMount(async () => {
 		client.onEvent(handleEvent);
 		await Promise.all([
-			client.call<{ role: string; scoped: boolean }>('auth.me').then(identity => {
-				isAdmin = identity.role === 'admin' && !identity.scoped;
-			}).catch(() => { isAdmin = false; }),
+			client.call<AuthMe>('auth.me').then(identity => {
+				isAdmin = hasRootEquivalentAccess(identity.role, identity.scoped);
+				canMutateShareProtocols = canMutateProtocol(identity.role, identity.scoped, false);
+			}).catch(() => {
+				isAdmin = false;
+				canMutateShareProtocols = false;
+			}),
 			nfsRefresh().then(() => { nfs.loading = false; }),
 			smbRefresh().then(() => { smb.loading = false; }),
 			iscsiRefresh().then(() => { iscsi.loading = false; }),
@@ -365,7 +371,7 @@
 				<div class="mb-4 flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5">
 					<AlertTriangle size={16} class="shrink-0 text-amber-500" />
 					<span class="flex-1 text-sm">{selectedProto.display_name} service is not enabled.</span>
-					<Button size="xs" onclick={async () => { await toggleProtocol(shareProtocol === 'nvmeof' ? 'nvmeof' : shareProtocol, false); await ({ nfs: nfsLoadProtocol, smb: smbLoadProtocol, iscsi: iscsiLoadProtocol, nvmeof: nvmeLoadProtocol })[shareProtocol](); }}>
+					<Button size="xs" onclick={async () => { await toggleProtocol(shareProtocol === 'nvmeof' ? 'nvmeof' : shareProtocol, false); await ({ nfs: nfsLoadProtocol, smb: smbLoadProtocol, iscsi: iscsiLoadProtocol, nvmeof: nvmeLoadProtocol })[shareProtocol](); }} disabled={!canMutateShareProtocols} title={canMutateShareProtocols ? `Enable ${selectedProto.display_name}` : 'Unscoped operator access is required to enable this protocol'}>
 						Enable
 					</Button>
 				</div>
