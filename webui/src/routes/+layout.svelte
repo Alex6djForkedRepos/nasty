@@ -3,7 +3,7 @@
 	import { page } from '$app/stores';
 	import { getClient, resetClient } from '$lib/client';
 	import { login as doLogin, logout as doLogout, loginWebauthn as doLoginWebauthn } from '$lib/auth';
-	import { error as showError, isBusy } from '$lib/toast.svelte';
+	import { error as showError, isBusy, withToast } from '$lib/toast.svelte';
 	import Toasts from '$lib/components/Toasts.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 	import ConfirmDangerousDialog from '$lib/components/ConfirmDangerousDialog.svelte';
@@ -14,7 +14,7 @@
 	import LauncherSidebarNav from '$lib/components/LauncherSidebarNav.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type { AuthResult } from '$lib/rpc';
-	import type { BackupProfile, BootStatus, BootPhase, SecureBootReadinessReport, SystemStatus, UpdateInfo } from '$lib/types';
+	import type { BackupProfile, BootStatus, BootPhase, SecureBootReadinessReport, SystemStatus, UpdateInfo, UpdateStatus, VersionInfo } from '$lib/types';
 	import favicon from '$lib/assets/favicon.svg';
 	import logoLight from '$lib/assets/nasty.svg';
 	import logoDark from '$lib/assets/nasty-white.svg';
@@ -67,6 +67,7 @@
 	import { RELEASE_UPDATE_CHANGED_EVENT, publishReleaseUpdate, releaseUpdateDisplay, requestReleaseUpdateCheck, setReleaseUpdateSnapshot, shouldCheckReleaseUpdate, type ReleaseUpdateChangedDetail, type ReleaseUpdateRequestState } from '$lib/release-update';
 	import { isManagementRole, isStandardUser, redirectForRole } from '$lib/access';
 	import { CORE_RECOVERY_PATHS, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
+	import { buildBcachefsSyncInputs } from '$lib/bcachefs-update';
 
 	let { children } = $props();
 	let connected = $state(false);
@@ -327,6 +328,94 @@
 		const rec = sysInfo?.bcachefs_recommended_ref;
 		return !!rec && rec !== sysInfo?.bcachefs_pinned_ref;
 	});
+	const BCACHEFS_CHIP_SWITCH_KEY = 'nasty:bcachefs-chip-switch';
+	let bcachefsSwitching = $state(false);
+	let bcachefsSwitchPoll: ReturnType<typeof setInterval> | null = null;
+
+	function writeBcachefsSwitchMarker(active: boolean) {
+		if (typeof window === 'undefined') return;
+		if (active) sessionStorage.setItem(BCACHEFS_CHIP_SWITCH_KEY, '1');
+		else sessionStorage.removeItem(BCACHEFS_CHIP_SWITCH_KEY);
+	}
+
+	function hasBcachefsSwitchMarker(): boolean {
+		return typeof window !== 'undefined' && sessionStorage.getItem(BCACHEFS_CHIP_SWITCH_KEY) === '1';
+	}
+
+	function stopBcachefsSwitchPolling() {
+		if (bcachefsSwitchPoll) {
+			clearInterval(bcachefsSwitchPoll);
+			bcachefsSwitchPoll = null;
+		}
+		getClient().setAggressiveReconnect(false);
+	}
+
+	function finishBcachefsSwitch(status: UpdateStatus) {
+		if (!bcachefsSwitching && !hasBcachefsSwitchMarker()) return;
+		stopBcachefsSwitchPolling();
+		writeBcachefsSwitchMarker(false);
+		bcachefsSwitching = false;
+		sysInfoRefresh.triggerReconcile();
+		if (status.state === 'success') {
+			if (status.webui_changed) refreshState.set();
+			if (status.reboot_required) rebootState.set();
+		} else if (status.state === 'failed') {
+			showError('bcachefs switch failed. Open Update for details.');
+		}
+	}
+
+	function startBcachefsSwitchPolling() {
+		bcachefsSwitching = true;
+		const client = getClient();
+		client.setAggressiveReconnect(true);
+		if (bcachefsSwitchPoll) return;
+		bcachefsSwitchPoll = setInterval(async () => {
+			try {
+				const status = await client.call<UpdateStatus>('system.update.status');
+				if (status.state !== 'running') finishBcachefsSwitch(status);
+			} catch {
+				// Activation may briefly restart the engine; reconnect resumes polling.
+			}
+		}, 3000);
+	}
+
+	async function reconcileBcachefsSwitch() {
+		try {
+			const status = await getClient().call<UpdateStatus>('system.update.status', undefined, 300000);
+			if (status.state === 'running') startBcachefsSwitchPolling();
+			else finishBcachefsSwitch(status);
+		} catch {
+			startBcachefsSwitchPolling();
+		}
+	}
+
+	async function switchBcachefsFromChip() {
+		const recommendedRef = sysInfo?.bcachefs_recommended_ref;
+		if (authInfo?.role !== 'admin' || !recommendedRef || bcachefsSwitching) return;
+		if (!await confirm(
+			`Switch bcachefs to ${recommendedRef}?`,
+			`This re-pins bcachefs-tools to ${recommendedRef} — the version bundled with this NASty release — and rebuilds immediately. You may need to reboot afterward to load the new kernel module.`,
+			{ confirmLabel: 'Switch', cancelLabel: 'Cancel' }
+		)) return;
+
+		const version = await withToast(() => getClient().call<VersionInfo>('system.version.get'));
+		if (!version) return;
+		const inputs = buildBcachefsSyncInputs(version.inputs, recommendedRef);
+		if (!inputs) {
+			showError('The bcachefs-tools input is missing from the system version configuration.');
+			return;
+		}
+
+		bcachefsSwitching = true;
+		writeBcachefsSwitchMarker(true);
+		getClient().setAggressiveReconnect(true);
+		const result = await withToast(
+			() => getClient().call('system.version.switch', { inputs }, 120000),
+			'bcachefs switch started'
+		);
+		if (result !== undefined) startBcachefsSwitchPolling();
+		else await reconcileBcachefsSwitch();
+	}
 	let clock24h = $state(true);
 
 	// Network rollback countdown — ticks once per second while a rollback is
@@ -558,6 +647,7 @@
 		// — without this trigger it shows the pre-reboot version until the
 		// user hits cmd+R.
 		sysInfoRefresh.trigger();
+		if (bcachefsSwitching) void reconcileBcachefsSwitch();
 		triggerReleaseUpdateRefresh();
 	};
 	const onDisconnect = () => {
@@ -594,6 +684,7 @@
 		const backupPoll = setInterval(checkConfigBackup, 30_000);
 		return () => {
 			releaseUpdatePolling = false;
+			stopBcachefsSwitchPolling();
 			if (reconnectingTimer) clearTimeout(reconnectingTimer);
 			if (releaseUpdatePoll) clearTimeout(releaseUpdatePoll);
 			lifecycleClient?.offReconnect(onReconnect);
@@ -654,6 +745,10 @@
 			if (destination) await goto(destination, { replaceState: true });
 			connected = true;
 			showLogin = false;
+			if (authInfo.role === 'admin' && hasBcachefsSwitchMarker()) {
+				bcachefsSwitching = true;
+				void reconcileBcachefsSwitch();
+			}
 			if (isManagementRole(authInfo.role)) {
 				checkSshStatus();
 				checkConfigBackup();
@@ -1245,24 +1340,37 @@
 					     case directly — previously the offer was hidden unless a
 					     debug flag or pending reboot happened to be set too. -->
 					{#if sysInfo && (bcachefsUpdateAvail || sysInfo.bcachefs_is_custom || sysInfo.bcachefs_debug_checks)}
-						<a
-							href="/update#bcachefs"
-							class={bcachefsUpdateAvail
-								? 'flex items-center gap-2 rounded-md border-2 border-blue-500/70 px-3 py-1.5 text-sm text-blue-400 no-underline transition-all hover:bg-blue-500/10 hover:border-blue-400 hover:shadow-[0_0_16px_rgba(96,165,250,0.5)]'
-								: 'flex items-center gap-2 rounded-md border-2 border-white/15 px-3 py-1.5 text-sm text-muted-foreground/80 no-underline transition-all hover:bg-white/5 hover:border-white/30'}
-							title={bcachefsUpdateAvail
-								? `bcachefs update available — NASty ships ${sysInfo.bcachefs_recommended_ref} (you're pinned at ${sysInfo.bcachefs_pinned_ref ?? '—'}). Click to switch.`
-								: 'bcachefs status — click for details'}
-						>
-							<span>bcachefs</span>
-							{#if bcachefsUpdateAvail}
-								<span class="font-mono text-xs">→ {sysInfo.bcachefs_recommended_ref}</span>
-							{/if}
-							<span class="flex items-center gap-1.5">
-								<span title="Reboot pending — running module differs from the pinned version"><Settings size={14} class={sysInfo.bcachefs_is_custom ? 'text-amber-400' : 'text-muted-foreground/30'} /></span>
-								<span title="Debug checks enabled in the running module"><Bug size={14} class={sysInfo.bcachefs_debug_checks ? 'text-blue-400' : 'text-muted-foreground/30'} /></span>
-							</span>
-						</a>
+						{#if bcachefsUpdateAvail}
+							<button
+								onclick={switchBcachefsFromChip}
+								disabled={authInfo?.role !== 'admin' || bcachefsSwitching}
+								class="flex items-center gap-2 rounded-md border-2 border-blue-500/70 px-3 py-1.5 text-sm text-blue-400 transition-all hover:bg-blue-500/10 hover:border-blue-400 hover:shadow-[0_0_16px_rgba(96,165,250,0.5)] disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent disabled:hover:shadow-none"
+								title={bcachefsSwitching
+									? 'bcachefs switch in progress'
+									: authInfo?.role === 'admin'
+										? `bcachefs update available — NASty ships ${sysInfo.bcachefs_recommended_ref} (you're pinned at ${sysInfo.bcachefs_pinned_ref ?? '—'}). Click to switch.`
+										: 'Administrator access is required to switch bcachefs'}
+							>
+								<span>bcachefs</span>
+								<span class="font-mono text-xs">{bcachefsSwitching ? 'Switching...' : `→ ${sysInfo.bcachefs_recommended_ref}`}</span>
+								<span class="flex items-center gap-1.5">
+									<span title="Reboot pending — running module differs from the pinned version"><Settings size={14} class={sysInfo.bcachefs_is_custom ? 'text-amber-400' : 'text-muted-foreground/30'} /></span>
+									<span title="Debug checks enabled in the running module"><Bug size={14} class={sysInfo.bcachefs_debug_checks ? 'text-blue-400' : 'text-muted-foreground/30'} /></span>
+								</span>
+							</button>
+						{:else}
+							<a
+								href="/update"
+								class="flex items-center gap-2 rounded-md border-2 border-white/15 px-3 py-1.5 text-sm text-muted-foreground/80 no-underline transition-all hover:bg-white/5 hover:border-white/30"
+								title="bcachefs status — click for details"
+							>
+								<span>bcachefs</span>
+								<span class="flex items-center gap-1.5">
+									<span title="Reboot pending — running module differs from the pinned version"><Settings size={14} class={sysInfo.bcachefs_is_custom ? 'text-amber-400' : 'text-muted-foreground/30'} /></span>
+									<span title="Debug checks enabled in the running module"><Bug size={14} class={sysInfo.bcachefs_debug_checks ? 'text-blue-400' : 'text-muted-foreground/30'} /></span>
+								</span>
+							</a>
+						{/if}
 					{/if}
 					{#if rollbackState.pending}
 						<!-- Pending network rollback. Sticky on every page so the

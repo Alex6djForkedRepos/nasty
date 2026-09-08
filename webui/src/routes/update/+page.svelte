@@ -25,6 +25,7 @@
 	import { refreshState } from '$lib/refresh.svelte';
 	import { rebootState } from '$lib/reboot.svelte';
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
+	import { buildBcachefsSyncInputs, type VersionSwitchInput } from '$lib/bcachefs-update';
 	import {
 		reachedUpdatePhase,
 		shouldShowUpdateStatus,
@@ -393,7 +394,11 @@
 		await doVersionSwitch();
 	}
 
-	async function doVersionSwitch() {
+	async function doVersionSwitch(inputs: VersionSwitchInput[] = versionRows.map((row) => ({
+		name: row.name,
+		url: row.url.trim(),
+		update: row.update
+	}))) {
 		startingSwitch = true;
 		writeVersionPageAction('version-switch');
 		taggedReleaseBanner = { kind: 'switching' };
@@ -402,11 +407,7 @@
 		clearReleaseUpdateCheck();
 		const result = await withToast(
 			() => client.call('system.version.switch', {
-				inputs: versionRows.map((row) => ({
-					name: row.name,
-					url: row.url.trim(),
-					update: row.update
-				}))
+				inputs
 			}, 120000),
 			'Version switch started'
 		);
@@ -433,8 +434,9 @@
 	);
 
 	async function syncBcachefsToBundled() {
-		const row = versionRows.find((r) => r.name === 'bcachefs-tools');
-		if (!recommendedBcachefs || !row) return;
+		if (!recommendedBcachefs) return;
+		const inputs = buildBcachefsSyncInputs(versionRows, recommendedBcachefs);
+		if (!inputs) return;
 		if (
 			!(await confirm(
 				`Switch bcachefs to ${recommendedBcachefs}?`,
@@ -444,9 +446,7 @@
 		)
 			return;
 		syncingBcachefs = true;
-		row.url = `github:koverstreet/bcachefs-tools/${recommendedBcachefs}`;
-		row.update = true;
-		await doVersionSwitch();
+		await doVersionSwitch(inputs);
 		syncingBcachefs = false;
 	}
 
