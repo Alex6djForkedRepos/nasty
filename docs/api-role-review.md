@@ -120,11 +120,15 @@ remain available to unscoped Operators and Admins.
 
 ### Scoped Operator tokens can mutate global SMB identities
 
+Status: fixed by requiring an unscoped Operator or Admin session for every SMB
+user and group mutation.
+
 The Operator allowlist permits user deletion, password reset, and group
-membership changes, but the handlers do not reject owner-scoped API tokens.
+membership changes. These handlers now reject filesystem- and owner-scoped API
+tokens before processing the mutation.
 
 - `engine/nasty-engine/src/router/mod.rs:100-110`
-- `engine/nasty-engine/src/router/smb.rs:20-116`
+- `engine/nasty-engine/src/router/smb.rs:14-37`
 
 ### `apps.update` does not authorize the existing app
 

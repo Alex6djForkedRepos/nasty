@@ -2,7 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { getClient } from '$lib/client';
-	import { canMutateProtocol, hasRootEquivalentAccess } from '$lib/access';
+	import { canMutateProtocol, hasRootEquivalentAccess, hasUnscopedMutationAccess } from '$lib/access';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type { AuthMe, Subvolume, ProtocolStatus } from '$lib/types';
@@ -81,6 +81,7 @@
 	let shareSubvolumes: Subvolume[] = $state([]);
 	let isAdmin = $state(false);
 	let canMutateShareProtocols = $state(false);
+	let canMutateSmbIdentities = $state(false);
 
 	// Inline subvolume creation within share wizard
 	let showInlineCreate = $state(false);
@@ -309,9 +310,11 @@
 			client.call<AuthMe>('auth.me').then(identity => {
 				isAdmin = hasRootEquivalentAccess(identity.role, identity.scoped);
 				canMutateShareProtocols = canMutateProtocol(identity.role, identity.scoped, false);
+				canMutateSmbIdentities = hasUnscopedMutationAccess(identity.role, identity.scoped);
 			}).catch(() => {
 				isAdmin = false;
 				canMutateShareProtocols = false;
+				canMutateSmbIdentities = false;
 			}),
 			nfsRefresh().then(() => { nfs.loading = false; }),
 			smbRefresh().then(() => { smb.loading = false; }),
@@ -462,6 +465,7 @@
 					bind:validUsers={shareSmbValidUsers}
 					bind:timeMachine={shareSmbTimeMachine}
 					bind:maxSizeGib={shareSmbTmMaxSize}
+					canMutateIdentities={canMutateSmbIdentities}
 				/>
 			{:else if shareProtocol === 'iscsi'}
 				<IscsiWizardForm bind:name={shareIscsiName} />

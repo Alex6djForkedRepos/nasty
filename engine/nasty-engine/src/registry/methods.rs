@@ -2325,21 +2325,21 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "smb.user.create",
-                    desc: "Create a Linux system user (no shell, no home, UID auto-assigned from 3000+) and set their Samba password. Requires the SMB protocol to be enabled.",
+                    desc: "Create a Linux system user (no shell, no home, UID auto-assigned from 3000+) and set their Samba password. Requires the SMB protocol and an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::Schema(gen_schema::<CreateSmbUserRequest>(generator)),
                     result: Some(gen_schema::<SmbUser>(generator)),
                 },
                 Method {
                     name: "smb.user.delete",
-                    desc: "Remove the user's Samba password entry and delete the Linux system account. Requires the SMB protocol to be enabled.",
+                    desc: "Remove the user's Samba password entry and delete the Linux system account. Requires the SMB protocol and an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one("username", "SMB username to delete.")),
                     result: None,
                 },
                 Method {
                     name: "smb.user.set_password",
-                    desc: "Change an existing SMB user's Samba password. Requires the SMB protocol to be enabled.",
+                    desc: "Change an existing SMB user's Samba password. Requires the SMB protocol and an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_two(
                         "username",
@@ -2364,21 +2364,21 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "smb.group.create",
-                    desc: "Create a Linux system group (GID auto-assigned from the SMB range, 3000+) used for SMB access control.",
+                    desc: "Create a Linux system group (GID auto-assigned from the SMB range, 3000+) used for SMB access control. Requires an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Group name to create.")),
                     result: Some(gen_schema::<SmbGroup>(generator)),
                 },
                 Method {
                     name: "smb.group.delete",
-                    desc: "Delete the SMB-managed Linux group via `groupdel`.",
+                    desc: "Delete the SMB-managed Linux group via `groupdel`. Requires an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Group name to delete.")),
                     result: None,
                 },
                 Method {
                     name: "smb.group.add_member",
-                    desc: "Add an existing user to an existing SMB group via `usermod -aG`.",
+                    desc: "Add an existing user to an existing SMB group via `usermod -aG`. Requires an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_two(
                         "group",
@@ -2390,7 +2390,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "smb.group.remove_member",
-                    desc: "Remove a user from an SMB group via `gpasswd -d`.",
+                    desc: "Remove a user from an SMB group via `gpasswd -d`. Requires an unscoped Operator or Admin session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_two(
                         "group",

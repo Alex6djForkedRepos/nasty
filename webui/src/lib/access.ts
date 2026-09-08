@@ -14,13 +14,18 @@ export function hasRootEquivalentAccess(role: string | null | undefined, scoped:
 	return role === 'admin' && !scoped;
 }
 
+export function hasUnscopedMutationAccess(role: string | null | undefined, scoped: boolean): boolean {
+	return !scoped && (role === 'admin' || role === 'operator');
+}
+
 export function canMutateProtocol(
 	role: string | null | undefined,
 	scoped: boolean,
 	systemService: boolean
 ): boolean {
-	if (scoped) return false;
-	return systemService ? role === 'admin' : role === 'admin' || role === 'operator';
+	return systemService
+		? hasRootEquivalentAccess(role, scoped)
+		: hasUnscopedMutationAccess(role, scoped);
 }
 
 export function canAccessAuthenticatedRoute(role: string, path: string): boolean {

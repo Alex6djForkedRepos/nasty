@@ -3,6 +3,7 @@ import {
 	canAccessAuthenticatedRoute,
 	canMutateProtocol,
 	hasRootEquivalentAccess,
+	hasUnscopedMutationAccess,
 	redirectForRole,
 } from './access';
 
@@ -30,6 +31,16 @@ describe('authenticated route policy', () => {
 		for (const role of ['operator', 'readonly', 'user'] as const) {
 			expect(hasRootEquivalentAccess(role, false)).toBe(false);
 			expect(hasRootEquivalentAccess(role, true)).toBe(false);
+		}
+	});
+
+	test('global mutations allow only unscoped operators and admins', () => {
+		for (const role of ['admin', 'operator'] as const) {
+			expect(hasUnscopedMutationAccess(role, false)).toBe(true);
+			expect(hasUnscopedMutationAccess(role, true)).toBe(false);
+		}
+		for (const role of ['readonly', 'user'] as const) {
+			expect(hasUnscopedMutationAccess(role, false)).toBe(false);
 		}
 	});
 
