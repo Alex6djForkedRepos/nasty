@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { canAccessAuthenticatedRoute, redirectForRole } from './access';
+import { canAccessAuthenticatedRoute, hasRootEquivalentAccess, redirectForRole } from './access';
 
 describe('authenticated route policy', () => {
 	test('standard users can access only the portal route', () => {
@@ -16,6 +16,15 @@ describe('authenticated route policy', () => {
 			expect(canAccessAuthenticatedRoute(role, '/files')).toBe(true);
 			expect(redirectForRole(role, '/files')).toBeNull();
 			expect(redirectForRole(role, '/portal')).toBe('/');
+		}
+	});
+
+	test('root-equivalent access requires an unscoped admin', () => {
+		expect(hasRootEquivalentAccess('admin', false)).toBe(true);
+		expect(hasRootEquivalentAccess('admin', true)).toBe(false);
+		for (const role of ['operator', 'readonly', 'user'] as const) {
+			expect(hasRootEquivalentAccess(role, false)).toBe(false);
+			expect(hasRootEquivalentAccess(role, true)).toBe(false);
 		}
 	});
 });

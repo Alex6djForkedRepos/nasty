@@ -10,6 +10,10 @@ export function isManagementRole(role: string | null | undefined): role is Exclu
 	return role === 'admin' || role === 'operator' || role === 'readonly';
 }
 
+export function hasRootEquivalentAccess(role: string | null | undefined, scoped: boolean): boolean {
+	return role === 'admin' && !scoped;
+}
+
 export function canAccessAuthenticatedRoute(role: string, path: string): boolean {
 	const portalRoute = path === PORTAL_PATH || path.startsWith(`${PORTAL_PATH}/`);
 	return isStandardUser(role) ? portalRoute : !portalRoute;
