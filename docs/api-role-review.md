@@ -132,6 +132,9 @@ tokens before processing the mutation.
 
 ### `apps.update` does not authorize the existing app
 
+Status: fixed by authorizing the installed app and its existing volume paths
+before validating or applying the replacement configuration.
+
 The handler validates only replacement paths. A scoped Operator can replace an
 app it does not own, and the backend removes the existing container before
 reinstalling it.
