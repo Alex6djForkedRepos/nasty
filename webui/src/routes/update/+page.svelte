@@ -800,10 +800,10 @@
 																{#if taggedReleaseBanner.current_is_latest_standard_url}
 																	{taggedReleaseBanner.latest_tag} <span class="text-xs text-muted-foreground">(up to date)</span>
 																{:else}
-																	<span class="text-emerald-400">{taggedReleaseBanner.latest_tag}</span> <span class="text-xs text-muted-foreground">(new)</span>
+																	<span class="text-amber-400">{taggedReleaseBanner.latest_tag}</span> <span class="text-xs text-muted-foreground">(new)</span>
 																{/if}
 															{:else if isDevBuild && checkInfo?.update_available === true}
-																<span class="text-blue-400">{checkInfo.latest_version}</span>
+																<span class="text-amber-400">{checkInfo.latest_version}</span>
 															{:else if isDevBuild && checkInfo?.update_available === false}
 																<span class="text-muted-foreground">{trackingRef(input.url)} <span class="text-xs">(up to date)</span></span>
 															{:else}
@@ -830,7 +830,7 @@
 											{checking ? 'Checking...' : 'Check for Updates'}
 										</Button>
 										{#if checkInfo?.update_available}
-											<Button size="sm" onclick={upgradeDevBuild} disabled={startingDevUpgrade || status?.state === 'running'}>
+											<Button size="sm" class="border-amber-500/70 hover:border-amber-400 hover:shadow-[0_0_12px_rgba(251,191,36,0.4)]" onclick={upgradeDevBuild} disabled={startingDevUpgrade || status?.state === 'running'}>
 												{startingDevUpgrade ? 'Starting...' : 'Upgrade'}
 											</Button>
 										{/if}
@@ -841,7 +841,7 @@
 											</Button>
 										{/if}
 									{:else if taggedReleaseBanner.kind === 'ready' && !taggedReleaseBanner.current_is_latest_standard_url}
-										<Button size="sm" onclick={upgradeTaggedRelease} disabled={startingUpgrade || status?.state === 'running'}>
+										<Button size="sm" class="border-amber-500/70 hover:border-amber-400 hover:shadow-[0_0_12px_rgba(251,191,36,0.4)]" onclick={upgradeTaggedRelease} disabled={startingUpgrade || status?.state === 'running'}>
 											{startingUpgrade ? 'Starting...' : 'Upgrade'}
 										</Button>
 									{/if}
