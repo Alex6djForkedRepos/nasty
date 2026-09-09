@@ -22,6 +22,21 @@ describe('operation details', () => {
 		}), 1_000 + 3 * 86400)).toBe('Last run 3d ago · clean · took 2h 1m');
 	});
 
+	test('distinguishes corrected and uncorrected scrub outcomes', () => {
+		expect(operationDetail(scrub({
+			last_run_at: 1_000,
+			last_outcome: 'corrected',
+		}), 1_060)).toBe('Last run 1m ago · corrected errors');
+		expect(operationDetail(scrub({
+			last_run_at: 1_000,
+			last_outcome: 'uncorrected',
+		}), 1_060)).toBe('Last run 1m ago · found uncorrected errors');
+		expect(operationDetail(scrub({
+			last_run_at: 1_000,
+			last_outcome: 'failed_uncorrected',
+		}), 1_060)).toBe('Last run 1m ago · failed with uncorrected errors');
+	});
+
 	test('preserves live and non-scrub details', () => {
 		expect(operationDetail(scrub({ state: 'running', detail: '42%' }), 2_000)).toBe('42%');
 		expect(operationDetail({

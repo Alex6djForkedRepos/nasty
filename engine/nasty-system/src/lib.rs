@@ -181,6 +181,9 @@ pub struct Operation {
     /// Device path for an evacuation; `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Active scrub run ID used to bind cancellation to the displayed run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// "running" (scrub/evacuate in flight) | "active" (background job
     /// working) | "idle" (enabled, not currently working) | "paused"
     /// (disabled).

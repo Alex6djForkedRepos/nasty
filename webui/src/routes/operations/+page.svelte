@@ -87,7 +87,11 @@
 							? 'fs.copygc.enable'
 							: 'fs.copygc.disable';
 		const params =
-			op.kind === 'evacuate' ? { filesystem: op.fs, device: op.target } : { name: op.fs };
+			op.kind === 'evacuate'
+				? { filesystem: op.fs, device: op.target }
+				: op.kind === 'scrub' && op.control === 'cancel'
+					? { name: op.fs, run_id: op.run_id }
+					: { name: op.fs };
 
 		const verb =
 			op.control === 'start'

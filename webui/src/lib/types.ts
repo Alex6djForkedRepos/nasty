@@ -97,11 +97,12 @@ export interface Operation {
 	kind: string; // "scrub" | "evacuate" | "reconcile" | "copygc"
 	fs: string;
 	target?: string | null;
+	run_id?: string | null;
 	state: string; // "running" | "active" | "idle" | "paused"
 	progress_percent?: number | null;
 	last_run_at?: number | null;
 	last_duration_secs?: number | null;
-	last_outcome?: 'ok' | 'errors' | 'failed' | 'cancelled' | null;
+	last_outcome?: 'ok' | 'errors' | 'corrected' | 'uncorrected' | 'failed_corrected' | 'failed_uncorrected' | 'failed' | 'cancelled' | null;
 	detail: string;
 	control: string; // "start" | "cancel" | "pause" | "resume" | "none"
 }
@@ -520,6 +521,7 @@ export interface FsDeviceUsage {
 }
 
 export type ScrubOutcome = 'ok' | 'errors' | 'failed' | 'cancelled';
+export type ScrubErrorKind = 'corrected' | 'uncorrected';
 
 export interface ScrubStatus {
 	running: boolean;
@@ -538,6 +540,16 @@ export interface ScrubStatus {
 	 * (trailing 8 KiB), or a one-line note for engine-restart-during-
 	 * scrub. */
 	last_output?: string | null;
+	/** Stable ID and runtime details for the active or most recent attempt. */
+	run_id?: string | null;
+	last_exit_code?: number | null;
+	last_corrected_bytes?: number | null;
+	last_uncorrected_bytes?: number | null;
+	last_error_kind?: ScrubErrorKind | null;
+	bcachefs_tools_version?: string | null;
+	kernel_version?: string | null;
+	bcachefs_module_version?: string | null;
+	cancel_requested?: boolean;
 	/** Backward-compat one-line summary the legacy Diagnostics tab
 	 * displays verbatim. New surfaces should prefer the typed fields. */
 	raw: string;

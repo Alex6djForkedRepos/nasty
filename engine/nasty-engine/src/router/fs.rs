@@ -514,13 +514,19 @@ pub(super) async fn try_route(
             },
             Err(r) => r,
         },
-        "fs.scrub.cancel" => match require_str(req, "name") {
-            Ok(name) => match state.filesystems.scrub_cancel(name).await {
-                Ok(()) => ok(req, "ok"),
-                Err(e) => err(req, e),
-            },
-            Err(r) => r,
-        },
+        "fs.scrub.cancel" => {
+            match parse_params::<nasty_storage::filesystem::ScrubCancelRequest>(req) {
+                Ok(p) => match state
+                    .filesystems
+                    .scrub_cancel(&p.name, p.run_id.as_deref())
+                    .await
+                {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                },
+                Err(e) => invalid(req, e),
+            }
+        }
         "fs.device.evacuate.cancel" => {
             match parse_params::<nasty_storage::filesystem::DeviceActionRequest>(req) {
                 Ok(p) => match state

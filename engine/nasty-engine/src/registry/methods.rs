@@ -40,8 +40,8 @@ use nasty_storage::disk_type::DiskTypeUpdate;
 use nasty_storage::filesystem::{
     BlockDevice, CreateFilesystemRequest, DestroyFilesystemRequest, DeviceActionRequest,
     DeviceAddRequest, DeviceSetLabelRequest, DeviceSetStateRequest, Filesystem,
-    ForgetUnavailableRequest, FsUsage, FsckStatus, ReconcileStatus, ScrubStatus, TpmBindStatus,
-    UnavailableFilesystem, UpdateFilesystemOptionsRequest,
+    ForgetUnavailableRequest, FsUsage, FsckStatus, ReconcileStatus, ScrubCancelRequest,
+    ScrubStatus, TpmBindStatus, UnavailableFilesystem, UpdateFilesystemOptionsRequest,
 };
 use nasty_storage::io_scheduler::{IoSchedulerResult, IoSchedulerUpdate};
 use nasty_storage::subvolume::{
@@ -637,7 +637,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     name: "fs.scrub.cancel",
                     desc: "Cancel a running scrub by terminating its bcachefs process (#553).",
                     role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
+                    params: MethodParams::Schema(gen_schema::<ScrubCancelRequest>(generator)),
                     result: None,
                 },
                 Method {
