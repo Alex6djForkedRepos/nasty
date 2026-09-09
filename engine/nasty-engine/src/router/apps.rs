@@ -209,6 +209,11 @@ pub(super) async fn try_route(
         },
         "apps.update" => match parse_params::<nasty_apps::InstallAppRequest>(req) {
             Ok(p) => {
+                if let Some(response) =
+                    existing_app_access_error(req, state, session, &p.name).await
+                {
+                    return Some(response);
+                }
                 if simple_requires_admin(&p)
                     && let Some(response) =
                         require_root_equivalent(req, session, "unsafe_app_payload")
@@ -754,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_app_secret_reads_gate_privileged_apps_as_admin() {
+    fn existing_app_access_gates_privileged_apps_as_admin() {
         assert!(!app_requires_admin(&existing_app(serde_json::json!({}))));
         assert!(app_requires_admin(&existing_app(serde_json::json!({
             "kind": "compose"
