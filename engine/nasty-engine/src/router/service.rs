@@ -19,6 +19,15 @@ fn protocol_mutation_access(protocol: nasty_system::protocol::Protocol) -> Endpo
     }
 }
 
+fn rest_server_requires_root_equivalent(method: &str) -> bool {
+    matches!(
+        method,
+        "service.rest_server.configure"
+            | "service.rest_server.credentials"
+            | "service.rest_server.rotate_credentials"
+    )
+}
+
 fn require_protocol_mutation_access(
     req: &Request,
     session: &Session,
@@ -84,6 +93,12 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if rest_server_requires_root_equivalent(&req.method)
+        && let Some(response) =
+            require_root_equivalent(req, session, "global_rest_server_management")
+    {
+        return Some(response);
+    }
     let block_protocol_mutation = matches!(
         req.method.as_str(),
         "service.protocol.enable" | "service.protocol.disable"
@@ -387,7 +402,7 @@ pub(super) async fn try_route(
 
 #[cfg(test)]
 mod tests {
-    use super::protocol_mutation_access;
+    use super::{protocol_mutation_access, rest_server_requires_root_equivalent};
     use crate::auth::{EndpointAccess, Role, Session, authorize_session};
     use nasty_system::protocol::Protocol;
 
@@ -440,5 +455,25 @@ mod tests {
             assert!(authorize_session(&session(Role::Operator, false), access).is_err());
             assert!(authorize_session(&session(Role::ReadOnly, false), access).is_err());
         }
+    }
+
+    #[test]
+    fn rest_server_secrets_and_mutations_require_root_equivalent_access() {
+        for method in [
+            "service.rest_server.configure",
+            "service.rest_server.credentials",
+            "service.rest_server.rotate_credentials",
+        ] {
+            assert!(rest_server_requires_root_equivalent(method), "{method}");
+        }
+        assert!(!rest_server_requires_root_equivalent(
+            "service.rest_server.config"
+        ));
+
+        let access = EndpointAccess::RootEquivalent;
+        assert!(authorize_session(&session(Role::Admin, false), access).is_ok());
+        assert!(authorize_session(&session(Role::Admin, true), access).is_err());
+        assert!(authorize_session(&session(Role::Operator, false), access).is_err());
+        assert!(authorize_session(&session(Role::ReadOnly, false), access).is_err());
     }
 }
