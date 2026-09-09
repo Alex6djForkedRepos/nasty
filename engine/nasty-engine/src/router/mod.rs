@@ -1496,7 +1496,13 @@ pub(crate) async fn evaluate_active_alerts_inner(
             }
 
             let scrub_errors = match scrub_result {
-                Ok(s) => s.raw.to_lowercase().contains("error"),
+                Ok(s) => {
+                    s.last_error_kind.is_some()
+                        || matches!(
+                            s.last_outcome,
+                            Some(nasty_storage::filesystem::ScrubOutcome::Errors)
+                        )
+                }
                 Err(_) => false,
             };
 

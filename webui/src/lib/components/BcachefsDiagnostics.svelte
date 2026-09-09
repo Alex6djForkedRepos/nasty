@@ -2,6 +2,7 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { getClient } from '$lib/client';
 	import { error as showError } from '$lib/toast.svelte';
+	import { formatBytes } from '$lib/format';
 	import type { Filesystem, ScrubStatus } from '$lib/types';
 	import { RefreshCw, SquareArrowOutUpRight } from '@lucide/svelte';
 
@@ -178,10 +179,11 @@
 		try {
 			const result = await getClient().call<ScrubStatus>('fs.scrub.status', { name: selectedFs });
 			scrubFull = result;
-			// Prefer the rich last_output (engine-captured transcript)
-			// when present; fall back to the legacy `raw` one-liner for
-			// fresh / never-scrubbed FSes.
-			scrubOutput = result.last_output || result.raw || 'No scrub data available.';
+			// Never show the previous attempt's transcript under the active
+			// attempt's run ID and versions.
+			scrubOutput = result.running
+				? result.raw
+				: result.last_output || result.raw || 'No scrub data available.';
 			scrubRunning = result.running ?? false;
 			if (scrubRunning) startScrubPolling();
 			else stopScrubPolling();
@@ -577,7 +579,7 @@
 							<div class="flex items-center gap-2">
 								<span class="inline-block h-2 w-2 rounded-full bg-yellow-500 animate-pulse"></span>
 								<span class="text-sm font-medium text-yellow-500">
-									Scrub in progress{#if scrubFull?.started_at} · started {formatScrubAgo(scrubFull.started_at)}{/if}
+									{scrubFull?.cancel_requested ? 'Cancelling scrub' : 'Scrub in progress'}{#if scrubFull?.started_at} · started {formatScrubAgo(scrubFull.started_at)}{/if}
 								</span>
 							</div>
 							{#if scrubFull?.progress_percent != null}
@@ -596,14 +598,36 @@
 						</div>
 					{:else if scrubFull?.last_run_at}
 						{@const outcome = scrubFull.last_outcome ?? 'ok'}
-						{@const cls = outcome === 'ok' ? 'text-green-500' : outcome === 'errors' ? 'text-amber-500' : 'text-red-500'}
-						{@const label = outcome === 'ok' ? 'completed successfully' : outcome === 'errors' ? 'completed with errors' : 'failed'}
+						{@const errorKind = scrubFull.last_error_kind}
+						{@const cls = outcome === 'ok' ? 'text-green-500' : outcome === 'errors' && errorKind !== 'uncorrected' ? 'text-amber-500' : outcome === 'cancelled' ? 'text-muted-foreground' : 'text-red-500'}
+						{@const label = outcome === 'ok' ? 'completed successfully' : outcome === 'errors' && errorKind === 'corrected' ? 'completed with corrected errors' : outcome === 'errors' && errorKind === 'uncorrected' ? 'completed with uncorrected errors' : outcome === 'errors' ? 'completed with errors' : outcome === 'failed' && errorKind === 'corrected' ? 'failed with corrected errors' : outcome === 'failed' && errorKind === 'uncorrected' ? 'failed with uncorrected errors' : outcome === 'cancelled' ? 'cancelled' : 'failed'}
 						<div class="mb-3 flex items-center gap-2 text-sm">
-							<span class="inline-block h-2 w-2 rounded-full {outcome === 'ok' ? 'bg-green-500' : outcome === 'errors' ? 'bg-amber-500' : 'bg-red-500'}"></span>
+							<span class="inline-block h-2 w-2 rounded-full {outcome === 'ok' ? 'bg-green-500' : outcome === 'errors' && errorKind !== 'uncorrected' ? 'bg-amber-500' : outcome === 'cancelled' ? 'bg-muted-foreground' : 'bg-red-500'}"></span>
 							<span class="font-medium {cls}">Last scrub {label}</span>
 							<span class="text-muted-foreground">
 								· {formatScrubAgo(scrubFull.last_run_at)}{#if scrubFull.last_duration_secs} · took {formatScrubDuration(scrubFull.last_duration_secs)}{/if}
 							</span>
+						</div>
+					{/if}
+					{#if !scrubRunning && (scrubFull?.last_corrected_bytes != null || scrubFull?.last_uncorrected_bytes != null)}
+						<div class="mb-3 grid gap-2 sm:grid-cols-2">
+							<div class="rounded-md border border-amber-500/25 bg-amber-500/5 px-3 py-2" title="Sum of bcachefs's rounded per-device values">
+								<div class="text-xs text-muted-foreground">Corrected</div>
+								<div class="font-mono text-sm {scrubFull.last_corrected_bytes ? 'text-amber-500' : 'text-muted-foreground'}">{formatBytes(scrubFull.last_corrected_bytes ?? 0)}</div>
+							</div>
+							<div class="rounded-md border border-red-500/25 bg-red-500/5 px-3 py-2" title="Sum of bcachefs's rounded per-device values">
+								<div class="text-xs text-muted-foreground">Uncorrected</div>
+								<div class="font-mono text-sm {scrubFull.last_uncorrected_bytes ? 'text-red-500' : 'text-muted-foreground'}">{formatBytes(scrubFull.last_uncorrected_bytes ?? 0)}</div>
+							</div>
+						</div>
+					{/if}
+					{#if scrubFull?.run_id}
+						<div class="mb-3 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
+							<div>Run <span class="break-all font-mono text-foreground">{scrubFull.run_id}</span></div>
+							<div>Exit <span class="font-mono text-foreground">{scrubRunning ? 'running' : scrubFull.last_exit_code ?? 'unavailable'}</span></div>
+							<div>bcachefs tools <span class="font-mono text-foreground">{scrubFull.bcachefs_tools_version ?? 'unknown'}</span></div>
+							<div>Module <span class="font-mono text-foreground">{scrubFull.bcachefs_module_version ?? 'unknown'}</span></div>
+							<div class="sm:col-span-2">Kernel <span class="font-mono text-foreground">{scrubFull.kernel_version ?? 'unknown'}</span></div>
 						</div>
 					{/if}
 					<pre class="text-xs font-mono overflow-x-auto whitespace-pre leading-relaxed">{scrubOutput}</pre>

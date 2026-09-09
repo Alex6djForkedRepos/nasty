@@ -1120,6 +1120,7 @@ async fn build_operations(state: &AppState) -> Vec<nasty_system::Operation> {
                     kind: "evacuate".into(),
                     fs: fs.name.clone(),
                     target: Some(dev.path.clone()),
+                    run_id: None,
                     state: "running".into(),
                     progress_percent: None,
                     last_run_at: None,
@@ -1137,41 +1138,49 @@ async fn build_operations(state: &AppState) -> Vec<nasty_system::Operation> {
         // live "scanned" figure on top.
         if let Ok(scrub) = state.filesystems.scrub_status(&fs.name).await {
             if scrub.running {
-                let mut detail = match scrub.progress_percent {
-                    Some(p) => format!("{p:.0}%"),
-                    None => "Scanning".to_string(),
+                let mut detail = match (scrub.cancel_requested, scrub.progress_percent) {
+                    (true, _) => "Cancelling".to_string(),
+                    (false, Some(p)) => format!("{p:.0}%"),
+                    (false, None) => "Scanning".to_string(),
                 };
-                if let Some((seen, _)) = moved("scrub").filter(|&(s, _)| s > 0) {
+                if !scrub.cancel_requested
+                    && let Some((seen, _)) = moved("scrub").filter(|&(s, _)| s > 0)
+                {
                     detail += &format!(" — {} scanned", human_bytes(seen));
                 }
                 ops.push(nasty_system::Operation {
                     kind: "scrub".into(),
                     fs: fs.name.clone(),
                     target: None,
+                    run_id: Some(
+                        scrub
+                            .run_id
+                            .clone()
+                            .unwrap_or_else(|| format!("legacy:{}", fs.name)),
+                    ),
                     state: "running".into(),
                     progress_percent: scrub.progress_percent,
                     last_run_at: scrub.last_run_at,
                     last_duration_secs: scrub.last_duration_secs,
-                    last_outcome: scrub
-                        .last_outcome
-                        .map(scrub_outcome_name)
-                        .map(str::to_string),
+                    last_outcome: scrub_outcome_name(&scrub).map(str::to_string),
                     detail,
-                    control: "cancel".into(),
+                    control: if scrub.cancel_requested {
+                        "none".into()
+                    } else {
+                        "cancel".into()
+                    },
                 });
             } else {
                 ops.push(nasty_system::Operation {
                     kind: "scrub".into(),
                     fs: fs.name.clone(),
                     target: None,
+                    run_id: None,
                     state: "idle".into(),
                     progress_percent: None,
                     last_run_at: scrub.last_run_at,
                     last_duration_secs: scrub.last_duration_secs,
-                    last_outcome: scrub
-                        .last_outcome
-                        .map(scrub_outcome_name)
-                        .map(str::to_string),
+                    last_outcome: scrub_outcome_name(&scrub).map(str::to_string),
                     detail: scrub_idle_detail(&scrub),
                     control: "start".into(),
                 });
@@ -1196,6 +1205,7 @@ async fn build_operations(state: &AppState) -> Vec<nasty_system::Operation> {
                 kind: "reconcile".into(),
                 fs: fs.name.clone(),
                 target: None,
+                run_id: None,
                 state: st.into(),
                 progress_percent: None,
                 last_run_at: None,
@@ -1223,6 +1233,7 @@ async fn build_operations(state: &AppState) -> Vec<nasty_system::Operation> {
                 kind: "copygc".into(),
                 fs: fs.name.clone(),
                 target: None,
+                run_id: None,
                 state: st.into(),
                 progress_percent: None,
                 last_run_at: None,
@@ -1244,24 +1255,43 @@ async fn build_operations(state: &AppState) -> Vec<nasty_system::Operation> {
 /// the row's label column, so this is a bare phrase with no "Scrub <fs> —"
 /// prefix.
 fn scrub_idle_detail(s: &nasty_storage::filesystem::ScrubStatus) -> String {
-    use nasty_storage::filesystem::ScrubOutcome;
-    match (s.last_run_at, s.last_outcome) {
-        (None, _) => "Never run".into(),
-        (Some(_), Some(ScrubOutcome::Ok)) => "Last run clean".into(),
-        (Some(_), Some(ScrubOutcome::Errors)) => "Last run found errors".into(),
-        (Some(_), Some(ScrubOutcome::Failed)) => "Last run failed".into(),
-        (Some(_), Some(ScrubOutcome::Cancelled)) => "Last run cancelled".into(),
-        (Some(_), None) => "Idle".into(),
+    use nasty_storage::filesystem::{ScrubErrorKind, ScrubOutcome};
+    match (s.last_run_at, s.last_outcome, s.last_error_kind) {
+        (None, _, _) => "Never run".into(),
+        (Some(_), Some(ScrubOutcome::Ok), _) => "Last run clean".into(),
+        (Some(_), Some(ScrubOutcome::Errors), Some(ScrubErrorKind::Corrected)) => {
+            "Last run corrected errors".into()
+        }
+        (Some(_), Some(ScrubOutcome::Errors), Some(ScrubErrorKind::Uncorrected)) => {
+            "Last run found uncorrected errors".into()
+        }
+        (Some(_), Some(ScrubOutcome::Errors), None) => "Last run found errors".into(),
+        (Some(_), Some(ScrubOutcome::Failed), Some(ScrubErrorKind::Corrected)) => {
+            "Last run failed with corrected errors".into()
+        }
+        (Some(_), Some(ScrubOutcome::Failed), Some(ScrubErrorKind::Uncorrected)) => {
+            "Last run failed with uncorrected errors".into()
+        }
+        (Some(_), Some(ScrubOutcome::Failed), None) => "Last run failed".into(),
+        (Some(_), Some(ScrubOutcome::Cancelled), _) => "Last run cancelled".into(),
+        (Some(_), None, _) => "Idle".into(),
     }
 }
 
-fn scrub_outcome_name(outcome: nasty_storage::filesystem::ScrubOutcome) -> &'static str {
-    use nasty_storage::filesystem::ScrubOutcome;
-    match outcome {
-        ScrubOutcome::Ok => "ok",
-        ScrubOutcome::Errors => "errors",
-        ScrubOutcome::Failed => "failed",
-        ScrubOutcome::Cancelled => "cancelled",
+fn scrub_outcome_name(status: &nasty_storage::filesystem::ScrubStatus) -> Option<&'static str> {
+    use nasty_storage::filesystem::{ScrubErrorKind, ScrubOutcome};
+    match (status.last_outcome, status.last_error_kind) {
+        (Some(ScrubOutcome::Errors), Some(ScrubErrorKind::Corrected)) => Some("corrected"),
+        (Some(ScrubOutcome::Errors), Some(ScrubErrorKind::Uncorrected)) => Some("uncorrected"),
+        (Some(ScrubOutcome::Ok), _) => Some("ok"),
+        (Some(ScrubOutcome::Errors), None) => Some("errors"),
+        (Some(ScrubOutcome::Failed), Some(ScrubErrorKind::Corrected)) => Some("failed_corrected"),
+        (Some(ScrubOutcome::Failed), Some(ScrubErrorKind::Uncorrected)) => {
+            Some("failed_uncorrected")
+        }
+        (Some(ScrubOutcome::Failed), None) => Some("failed"),
+        (Some(ScrubOutcome::Cancelled), _) => Some("cancelled"),
+        (None, _) => None,
     }
 }
 
@@ -1273,6 +1303,7 @@ fn evacuate_idle_row() -> nasty_system::Operation {
         kind: "evacuate".into(),
         fs: String::new(),
         target: None,
+        run_id: None,
         state: "idle".into(),
         progress_percent: None,
         last_run_at: None,
@@ -1366,8 +1397,8 @@ mod tests {
 
 #[cfg(test)]
 mod operations_tests {
-    use super::{evacuate_idle_row, scrub_idle_detail};
-    use nasty_storage::filesystem::{ScrubOutcome, ScrubStatus};
+    use super::{evacuate_idle_row, scrub_idle_detail, scrub_outcome_name};
+    use nasty_storage::filesystem::{ScrubErrorKind, ScrubOutcome, ScrubStatus};
 
     fn status(last_run_at: Option<i64>, last_outcome: Option<ScrubOutcome>) -> ScrubStatus {
         ScrubStatus {
@@ -1378,6 +1409,15 @@ mod operations_tests {
             last_duration_secs: None,
             last_outcome,
             last_output: None,
+            run_id: None,
+            last_exit_code: None,
+            last_corrected_bytes: None,
+            last_uncorrected_bytes: None,
+            last_error_kind: None,
+            bcachefs_tools_version: None,
+            kernel_version: None,
+            bcachefs_module_version: None,
+            cancel_requested: false,
             raw: String::new(),
         }
     }
@@ -1399,6 +1439,23 @@ mod operations_tests {
             scrub_idle_detail(&status(Some(1_700_000_000), Some(ScrubOutcome::Errors))),
             "Last run found errors"
         );
+        let mut corrected = status(Some(1_700_000_000), Some(ScrubOutcome::Errors));
+        corrected.last_error_kind = Some(ScrubErrorKind::Corrected);
+        assert_eq!(scrub_idle_detail(&corrected), "Last run corrected errors");
+        assert_eq!(scrub_outcome_name(&corrected), Some("corrected"));
+        let mut uncorrected = status(Some(1_700_000_000), Some(ScrubOutcome::Errors));
+        uncorrected.last_error_kind = Some(ScrubErrorKind::Uncorrected);
+        assert_eq!(
+            scrub_idle_detail(&uncorrected),
+            "Last run found uncorrected errors"
+        );
+        assert_eq!(scrub_outcome_name(&uncorrected), Some("uncorrected"));
+        uncorrected.last_outcome = Some(ScrubOutcome::Failed);
+        assert_eq!(
+            scrub_idle_detail(&uncorrected),
+            "Last run failed with uncorrected errors"
+        );
+        assert_eq!(scrub_outcome_name(&uncorrected), Some("failed_uncorrected"));
         assert_eq!(
             scrub_idle_detail(&status(Some(1_700_000_000), Some(ScrubOutcome::Failed))),
             "Last run failed"

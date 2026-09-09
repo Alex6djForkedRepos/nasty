@@ -624,24 +624,30 @@ pub struct DeviceUsage {
     pub total_bytes: u64,
 }
 
-/// Outcome of the most recent completed scrub. Classified from the
-/// child process's exit status + a scan of its combined output for
-/// `error`-shaped lines (bcachefs reports counter increments inline
-/// during the scan). `Failed` is used for non-zero exits *and* for
-/// the engine-restart-during-scrub case where we lost track of the
-/// running child.
+/// Outcome of the most recent scrub attempt. Detailed corrected versus
+/// uncorrected status lives in [`ScrubErrorKind`] so these established
+/// serialized values remain readable after a NixOS generation rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScrubOutcome {
-    /// Exited 0 and no error markers in output.
+    /// Completed with no reported errors.
     Ok,
-    /// Exited 0 but the scrub reported one or more errors.
+    /// Completed with corrected, uncorrected, or legacy unstructured errors.
     Errors,
-    /// Non-zero exit, spawn failure, or the engine restarted mid-scrub.
+    /// Interrupted, signalled, returned an unknown status, failed to
+    /// spawn/wait, or the engine restarted mid-scrub.
     Failed,
     /// The operator cancelled the scrub (process terminated via
     /// `scrub_cancel`); not an error condition (#553).
     Cancelled,
+}
+
+/// Error detail decoded from bcachefs-tools exit bits and final counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrubErrorKind {
+    Corrected,
+    Uncorrected,
 }
 
 /// Scrub operation status — both live state ("am I running, since when")
@@ -678,10 +684,69 @@ pub struct ScrubStatus {
     /// long-running scrub doesn't bloat the state file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output: Option<String>,
+    /// Stable ID for the active attempt, retained after it completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Exact child exit code for the most recently finished attempt.
+    /// `None` when no code was available (spawn failure, signal,
+    /// engine interruption).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    /// Approximate aggregate bytes repaired during the most recently
+    /// finished attempt, parsed from bcachefs's rounded per-device values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_corrected_bytes: Option<u64>,
+    /// Approximate aggregate bytes still unreadable after the most
+    /// recently finished attempt's recovery work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_uncorrected_bytes: Option<u64>,
+    /// Whether reported read errors were repaired. May accompany a
+    /// `Failed` outcome when the scrub also reported interruption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_kind: Option<ScrubErrorKind>,
+    /// Output of `bcachefs version` captured when the attempt started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bcachefs_tools_version: Option<String>,
+    /// Running kernel release captured when the attempt started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_version: Option<String>,
+    /// Loaded bcachefs module version captured when the attempt started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bcachefs_module_version: Option<String>,
+    /// A cancellation signal was accepted for this active run. Persisted so
+    /// an additional engine restart still records the eventual stop correctly.
+    #[serde(default)]
+    pub cancel_requested: bool,
     /// Human-readable summary string — kept for backward compatibility
     /// with the existing Diagnostics tab renderer (which reads `raw`).
     /// New WebUI surfaces should prefer the typed fields above.
     pub raw: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScrubCancelRequest {
+    pub name: String,
+    /// Run observed by the caller. Legacy callers may omit it, but current
+    /// clients send it so a delayed confirmation cannot cancel a replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScrubRunMetadata {
+    run_id: String,
+    bcachefs_tools_version: Option<String>,
+    kernel_version: Option<String>,
+    bcachefs_module_version: Option<String>,
+}
+
+#[derive(Debug)]
+struct ScrubProcessResult {
+    outcome: ScrubOutcome,
+    error_kind: Option<ScrubErrorKind>,
+    output: String,
+    exit_code: Option<i32>,
+    counts: Option<ScrubErrorBytes>,
 }
 
 /// Reconcile (background work) status.
@@ -813,6 +878,19 @@ type ScrubStateMap = Arc<Mutex<HashMap<String, ScrubStatus>>>;
 type MountStateMap = Arc<Mutex<HashMap<String, MountFailure>>>;
 type FsckStateMap = Arc<Mutex<HashMap<String, FsckStatus>>>;
 type LocalOperationSet = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+type ScrubControls = Arc<Mutex<ScrubControlState>>;
+type ScrubPersistLock = Arc<Mutex<()>>;
+
+#[derive(Default)]
+struct ScrubControlState {
+    cancellations: HashMap<String, String>,
+    local_runs: HashMap<String, LocalScrubRun>,
+}
+
+struct LocalScrubRun {
+    run_id: String,
+    spawn_attempted: bool,
+}
 
 struct LocalOperationReservation {
     operations: LocalOperationSet,
@@ -859,6 +937,65 @@ fn should_record_interrupted_operation(
     child_alive: bool,
 ) -> bool {
     !owned_here && !child_alive && current_running && current_started_at == observed_started_at
+}
+
+fn scrub_process_pattern(mount: &str) -> String {
+    let mut escaped = String::with_capacity(mount.len());
+    for ch in mount.chars() {
+        if matches!(
+            ch,
+            '.' | '[' | ']' | '\\' | '*' | '^' | '$' | '(' | ')' | '+' | '?' | '{' | '}' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    format!(r"(^|.*/)bcachefs scrub {escaped}$")
+}
+
+async fn scrub_process_is_alive(mount: &str) -> bool {
+    let pattern = scrub_process_pattern(mount);
+    cmd::run_ok("pgrep", &["-f", &pattern]).await.is_ok()
+}
+
+fn scrub_status_run_id(status: &ScrubStatus, name: &str) -> String {
+    status
+        .run_id
+        .clone()
+        .unwrap_or_else(|| format!("legacy:{name}"))
+}
+
+fn scrub_cancel_requested(controls: &ScrubControlState, name: &str, status: &ScrubStatus) -> bool {
+    controls
+        .cancellations
+        .get(name)
+        .is_some_and(|run_id| run_id == &scrub_status_run_id(status, name))
+}
+
+fn scrub_cancel_targets_run(expected_run_id: Option<&str>, current_run_id: &str) -> bool {
+    expected_run_id.is_none_or(|expected| expected == current_run_id)
+}
+
+async fn rollback_scrub_cancel_state(
+    controls: &mut ScrubControlState,
+    state: &mut HashMap<String, ScrubStatus>,
+    name: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    controls.cancellations.remove(name);
+    if let Some(entry) = state.get_mut(name) {
+        entry.cancel_requested = false;
+    }
+    if let Err(error) = write_scrub_state_snapshot(state).await {
+        controls
+            .cancellations
+            .insert(name.to_string(), run_id.to_string());
+        if let Some(entry) = state.get_mut(name) {
+            entry.cancel_requested = true;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn loop_devices_backed_by(output: &str, mount_point: &str) -> Vec<String> {
@@ -2000,6 +2137,9 @@ pub struct FilesystemService {
     /// held only briefly for read/write — the actual `bcachefs scrub`
     /// child runs detached.
     scrub_state: ScrubStateMap,
+    /// Serializes atomic scrub-state snapshots so an older write cannot land
+    /// after a newer completion or cancellation update.
+    scrub_persist: ScrubPersistLock,
     /// Per-filesystem record of the most recent *failed* mount attempt,
     /// loaded from `MOUNT_STATE_PATH` on construction. Written by
     /// `mount_with_opts` on failure and cleared on success; read by
@@ -2015,11 +2155,10 @@ pub struct FilesystemService {
     /// an engine restart orphans the child anyway, and the state-based
     /// check in `device_evacuate` covers re-submission after that.
     evacuating: Arc<Mutex<std::collections::HashSet<String>>>,
-    /// Filesystem names whose running scrub has a pending cancel request.
-    /// Set by `scrub_cancel` before it signals the process; the scrub's
-    /// completion path consumes it to record a `Cancelled` outcome rather
-    /// than a misleading `Failed` (#553).
-    scrub_cancels: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Run-scoped cancellation requests and whether this process has attempted
+    /// each child spawn. Keeping both under one lock closes the cancel-before-
+    /// spawn window while preserving a child result that already completed.
+    scrub_controls: ScrubControls,
     /// Scrubs with completion tasks owned by this engine process. A child
     /// exits before its task drains output and records the result, so status
     /// polling must not mistake that normal window for an engine restart.
@@ -2082,10 +2221,11 @@ impl FilesystemService {
             list_cache: Arc::new(Mutex::new(None)),
             block_mutations: Arc::new(Mutex::new(())),
             scrub_state: Arc::new(Mutex::new(scrub)),
+            scrub_persist: Arc::new(Mutex::new(())),
             mount_state: Arc::new(Mutex::new(mount)),
             fsck_state: Arc::new(Mutex::new(fsck)),
             evacuating: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            scrub_cancels: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            scrub_controls: Arc::new(Mutex::new(ScrubControlState::default())),
             local_scrubs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             local_fscks: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
@@ -2843,7 +2983,7 @@ impl FilesystemService {
             persist_mount_state(&self.mount_state).await;
         }
         if self.scrub_state.lock().await.remove(&req.name).is_some() {
-            persist_scrub_state(&self.scrub_state).await;
+            persist_scrub_state(&self.scrub_state, &self.scrub_persist).await;
         }
         if self.fsck_state.lock().await.remove(&req.name).is_some() {
             persist_fsck_state(&self.fsck_state).await;
@@ -4248,7 +4388,17 @@ impl FilesystemService {
         }
         let mount_point = fs.mount_point.as_ref().unwrap().clone();
         let fs_name = name.to_string();
+
+        // Reconcile persisted state first. After an engine restart, the
+        // process-local reservation is empty even if the orphaned child is
+        // still running.
+        if self.scrub_status(name).await?.running || scrub_process_is_alive(&mount_point).await {
+            return Err(FilesystemError::CommandFailed(
+                "a scrub is already running on this filesystem".to_string(),
+            ));
+        }
         let now = unix_now_secs();
+        let run = scrub_run_metadata().await;
 
         let ownership = LocalOperationReservation::acquire(&self.local_scrubs, fs_name.clone())
             .ok_or_else(|| {
@@ -4256,6 +4406,16 @@ impl FilesystemService {
                     "a scrub is already running on this filesystem".to_string(),
                 )
             })?;
+        {
+            let mut controls = self.scrub_controls.lock().await;
+            controls.local_runs.insert(
+                fs_name.clone(),
+                LocalScrubRun {
+                    run_id: run.run_id.clone(),
+                    spawn_attempted: false,
+                },
+            );
+        }
 
         // Stamp the in-memory state with started_at *before* we spawn,
         // so a `scrub_status` call landing 50ms later sees `running`.
@@ -4271,17 +4431,38 @@ impl FilesystemService {
                 last_duration_secs: None,
                 last_outcome: None,
                 last_output: None,
+                run_id: None,
+                last_exit_code: None,
+                last_corrected_bytes: None,
+                last_uncorrected_bytes: None,
+                last_error_kind: None,
+                bcachefs_tools_version: None,
+                kernel_version: None,
+                bcachefs_module_version: None,
+                cancel_requested: false,
                 raw: "No scrub running".into(),
             });
             entry.running = true;
             entry.started_at = Some(now);
+            entry.run_id = Some(run.run_id.clone());
+            entry.bcachefs_tools_version = run.bcachefs_tools_version.clone();
+            entry.kernel_version = run.kernel_version.clone();
+            entry.bcachefs_module_version = run.bcachefs_module_version.clone();
+            entry.cancel_requested = false;
             entry.raw = "Scrub in progress...".into();
         }
-        persist_scrub_state(&self.scrub_state).await;
+        persist_scrub_state(&self.scrub_state, &self.scrub_persist).await;
 
         let store = self.scrub_state.clone();
-        let cancels = self.scrub_cancels.clone();
-        info!("Starting scrub on filesystem '{}'", name);
+        let persist = self.scrub_persist.clone();
+        let controls = self.scrub_controls.clone();
+        info!(
+            run_id = %run.run_id,
+            bcachefs_tools_version = ?run.bcachefs_tools_version,
+            kernel_version = ?run.kernel_version,
+            bcachefs_module_version = ?run.bcachefs_module_version,
+            "Starting scrub on filesystem '{name}'"
+        );
         tokio::spawn(async move {
             let mount = mount_point;
             // Stream stdout+stderr line-by-line so we can pick the
@@ -4289,40 +4470,77 @@ impl FilesystemService {
             // updates as it runs. Falls back gracefully when the
             // binary doesn't print percent at all — the chip just
             // shows "scrubbing (Nh ago)" via the elapsed timestamp.
-            let (outcome, captured) = stream_scrub_and_collect(&mount, &fs_name, &store).await;
-            // Honor a cancel request: a terminated scrub exits non-zero
-            // (Failed), but if the operator asked for it, record it as
-            // Cancelled rather than a misleading failure (#553).
+            let result =
+                stream_scrub_and_collect(&mount, &fs_name, &store, &controls, &run.run_id).await;
+            // Only turn an interruption/signal into Cancelled. If cancel
+            // raced with a completed error result, preserve the errors.
             let outcome = {
-                let mut c = cancels.lock().await;
-                if c.remove(&fs_name) {
-                    ScrubOutcome::Cancelled
-                } else {
-                    outcome
+                let mut control = controls.lock().await;
+                let cancelled = control
+                    .cancellations
+                    .remove(&fs_name)
+                    .is_some_and(|cancelled_run_id| cancelled_run_id == run.run_id);
+                if control
+                    .local_runs
+                    .get(&fs_name)
+                    .is_some_and(|local| local.run_id == run.run_id)
+                {
+                    control.local_runs.remove(&fs_name);
                 }
+                scrub_outcome_after_cancel(
+                    result.outcome,
+                    result.error_kind,
+                    result.exit_code,
+                    cancelled,
+                )
             };
             let end = unix_now_secs();
             let duration = (end - now).max(0) as u64;
+            let corrected_bytes = result.counts.map(|counts| counts.corrected_bytes);
+            let uncorrected_bytes = result.counts.map(|counts| counts.uncorrected_bytes);
 
-            match outcome {
-                ScrubOutcome::Ok => info!("Scrub on '{fs_name}' completed in {duration}s: ok",),
-                ScrubOutcome::Errors => warn!(
-                    "Scrub on '{fs_name}' completed in {duration}s: errors detected (see WebUI for full output)",
-                ),
-                ScrubOutcome::Failed => {
-                    warn!("Scrub on '{fs_name}' failed after {duration}s: {captured}",)
+            match (outcome, result.error_kind) {
+                (ScrubOutcome::Ok, _) => {
+                    info!(run_id = %run.run_id, exit_code = ?result.exit_code, "Scrub on '{fs_name}' completed in {duration}s: ok")
                 }
-                ScrubOutcome::Cancelled => {
-                    info!("Scrub on '{fs_name}' cancelled after {duration}s")
+                (ScrubOutcome::Errors, Some(ScrubErrorKind::Corrected)) => {
+                    warn!(run_id = %run.run_id, exit_code = ?result.exit_code, corrected_bytes = ?corrected_bytes, "Scrub on '{fs_name}' completed in {duration}s with corrected errors")
+                }
+                (ScrubOutcome::Errors, Some(ScrubErrorKind::Uncorrected)) => {
+                    warn!(run_id = %run.run_id, exit_code = ?result.exit_code, corrected_bytes = ?corrected_bytes, uncorrected_bytes = ?uncorrected_bytes, "Scrub on '{fs_name}' completed in {duration}s with uncorrected errors")
+                }
+                (ScrubOutcome::Errors, None) => {
+                    warn!(run_id = %run.run_id, exit_code = ?result.exit_code, "Scrub on '{fs_name}' completed in {duration}s: errors detected (see WebUI for full output)")
+                }
+                (ScrubOutcome::Failed, Some(error_kind)) => {
+                    warn!(run_id = %run.run_id, exit_code = ?result.exit_code, ?error_kind, corrected_bytes = ?corrected_bytes, uncorrected_bytes = ?uncorrected_bytes, "Scrub on '{fs_name}' failed after {duration}s with reported errors: {}", result.output)
+                }
+                (ScrubOutcome::Failed, None) => {
+                    warn!(run_id = %run.run_id, exit_code = ?result.exit_code, "Scrub on '{fs_name}' failed after {duration}s: {}", result.output)
+                }
+                (ScrubOutcome::Cancelled, _) => {
+                    info!(run_id = %run.run_id, exit_code = ?result.exit_code, "Scrub on '{fs_name}' cancelled after {duration}s")
                 }
             }
 
-            let truncated = truncate_tail(&captured, SCRUB_OUTPUT_KEEP_BYTES);
-            let summary = match outcome {
-                ScrubOutcome::Ok => "Last scrub: ok".to_string(),
-                ScrubOutcome::Errors => "Last scrub: errors detected".to_string(),
-                ScrubOutcome::Failed => "Last scrub: failed".to_string(),
-                ScrubOutcome::Cancelled => "Last scrub: cancelled".to_string(),
+            let truncated = truncate_tail(&result.output, SCRUB_OUTPUT_KEEP_BYTES);
+            let summary = match (outcome, result.error_kind) {
+                (ScrubOutcome::Ok, _) => "Last scrub: ok".to_string(),
+                (ScrubOutcome::Errors, Some(ScrubErrorKind::Corrected)) => {
+                    "Last scrub: completed with corrected errors".to_string()
+                }
+                (ScrubOutcome::Errors, Some(ScrubErrorKind::Uncorrected)) => {
+                    "Last scrub: completed with uncorrected errors".to_string()
+                }
+                (ScrubOutcome::Errors, None) => "Last scrub: errors detected".to_string(),
+                (ScrubOutcome::Failed, Some(ScrubErrorKind::Corrected)) => {
+                    "Last scrub: failed with corrected errors".to_string()
+                }
+                (ScrubOutcome::Failed, Some(ScrubErrorKind::Uncorrected)) => {
+                    "Last scrub: failed with uncorrected errors".to_string()
+                }
+                (ScrubOutcome::Failed, None) => "Last scrub: failed".to_string(),
+                (ScrubOutcome::Cancelled, _) => "Last scrub: cancelled".to_string(),
             };
             {
                 let mut state = store.lock().await;
@@ -4334,6 +4552,15 @@ impl FilesystemService {
                     last_duration_secs: None,
                     last_outcome: None,
                     last_output: None,
+                    run_id: None,
+                    last_exit_code: None,
+                    last_corrected_bytes: None,
+                    last_uncorrected_bytes: None,
+                    last_error_kind: None,
+                    bcachefs_tools_version: None,
+                    kernel_version: None,
+                    bcachefs_module_version: None,
+                    cancel_requested: false,
                     raw: summary.clone(),
                 });
                 entry.running = false;
@@ -4343,9 +4570,18 @@ impl FilesystemService {
                 entry.last_duration_secs = Some(duration);
                 entry.last_outcome = Some(outcome);
                 entry.last_output = Some(truncated);
+                entry.run_id = Some(run.run_id.clone());
+                entry.last_exit_code = result.exit_code;
+                entry.last_corrected_bytes = corrected_bytes;
+                entry.last_uncorrected_bytes = uncorrected_bytes;
+                entry.last_error_kind = result.error_kind;
+                entry.bcachefs_tools_version = run.bcachefs_tools_version.clone();
+                entry.kernel_version = run.kernel_version.clone();
+                entry.bcachefs_module_version = run.bcachefs_module_version.clone();
+                entry.cancel_requested = false;
                 entry.raw = summary;
             }
-            persist_scrub_state(&store).await;
+            persist_scrub_state(&store, &persist).await;
             drop(ownership);
         });
 
@@ -4358,7 +4594,11 @@ impl FilesystemService {
     /// engine restart orphans the child, and a pattern still finds it.
     /// Flags the cancel first so the completion path records a
     /// `Cancelled` outcome instead of `Failed` (#553).
-    pub async fn scrub_cancel(&self, name: &str) -> Result<(), FilesystemError> {
+    pub async fn scrub_cancel(
+        &self,
+        name: &str,
+        expected_run_id: Option<&str>,
+    ) -> Result<(), FilesystemError> {
         let fs = self.get(name).await?;
         let mount = fs.mount_point.clone().ok_or_else(|| {
             FilesystemError::CommandFailed("filesystem is not mounted".to_string())
@@ -4366,25 +4606,92 @@ impl FilesystemService {
 
         // Refuse if nothing is running, so the UI button can't fire a
         // stray pkill against an unrelated future scrub.
-        let running = self
-            .scrub_state
-            .lock()
-            .await
+        // Hold control, persistence, and state locks through signaling.
+        // Completion cannot overtake the durable cancellation marker, and a
+        // replacement start cannot make `pkill` drift onto a newer run.
+        let mut controls = self.scrub_controls.lock().await;
+        let _persist = self.scrub_persist.lock().await;
+        let mut state = self.scrub_state.lock().await;
+        let run_id = state
             .get(name)
-            .map(|s| s.running)
-            .unwrap_or(false);
-        if !running {
+            .filter(|status| status.running)
+            .map(|status| scrub_status_run_id(status, name))
+            .ok_or_else(|| {
+                FilesystemError::CommandFailed("no scrub is running on this filesystem".to_string())
+            })?;
+        if !scrub_cancel_targets_run(expected_run_id, &run_id) {
             return Err(FilesystemError::CommandFailed(
-                "no scrub is running on this filesystem".to_string(),
+                "the scrub run changed before cancellation; refresh and try again".to_string(),
             ));
         }
 
-        self.scrub_cancels.lock().await.insert(name.to_string());
-        let pattern = format!("bcachefs scrub {mount}");
-        info!("Cancelling scrub on '{name}' via pkill -TERM -f '{pattern}'");
-        // pkill exits 1 when nothing matched — fine; the child may have
-        // just finished. The completion path still clears `running`.
-        nasty_common::cmd::try_run("pkill", &["-TERM", "-f", &pattern]).await;
+        let already_requested = controls
+            .cancellations
+            .get(name)
+            .is_some_and(|cancelled_run_id| cancelled_run_id == &run_id);
+        if !already_requested {
+            controls
+                .cancellations
+                .insert(name.to_string(), run_id.clone());
+        }
+        let spawn_pending = controls
+            .local_runs
+            .get(name)
+            .is_some_and(|local| local.run_id == run_id && !local.spawn_attempted);
+        if let Some(entry) = state.get_mut(name) {
+            entry.cancel_requested = true;
+        }
+        if let Err(error) = write_scrub_state_snapshot(&state).await {
+            if !already_requested {
+                controls.cancellations.remove(name);
+                if let Some(entry) = state.get_mut(name) {
+                    entry.cancel_requested = false;
+                }
+            }
+            return Err(FilesystemError::CommandFailed(format!(
+                "failed to persist scrub cancellation before signaling: {error}"
+            )));
+        }
+
+        let pattern = scrub_process_pattern(&mount);
+        info!(%run_id, "Cancelling scrub on '{name}' via pkill -TERM -f '{pattern}'");
+        match cmd::run("pkill", &["-TERM", "-f", &pattern]).await {
+            Ok(output) if output.status.success() => {}
+            // Intent is already durable, so no-match is an accepted race. A
+            // local completion still preserves clean or error-bearing results;
+            // a pending spawn observes the marker and skips child creation.
+            Ok(output) if output.status.code() == Some(1) => {
+                debug!(%run_id, status = %output.status, %already_requested, %spawn_pending, "Scrub process was absent when cancellation signal was sent");
+            }
+            Ok(output) => {
+                let command_error = format!(
+                    "failed to cancel scrub ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                if !already_requested
+                    && let Err(rollback_error) =
+                        rollback_scrub_cancel_state(&mut controls, &mut state, name, &run_id).await
+                {
+                    return Err(FilesystemError::CommandFailed(format!(
+                        "{command_error}; cancellation state rollback also failed: {rollback_error}"
+                    )));
+                }
+                return Err(FilesystemError::CommandFailed(command_error));
+            }
+            Err(error) => {
+                let command_error = format!("failed to cancel scrub: {error}");
+                if !already_requested
+                    && let Err(rollback_error) =
+                        rollback_scrub_cancel_state(&mut controls, &mut state, name, &run_id).await
+                {
+                    return Err(FilesystemError::CommandFailed(format!(
+                        "{command_error}; cancellation state rollback also failed: {rollback_error}"
+                    )));
+                }
+                return Err(FilesystemError::CommandFailed(command_error));
+            }
+        }
         Ok(())
     }
 
@@ -4393,6 +4700,7 @@ impl FilesystemService {
     /// `pgrep` cross-check so that an engine restart during a scrub
     /// (which orphans the bcachefs child to init) is recorded as
     /// `Failed` rather than leaving the FS forever stuck in "running".
+    /// If this engine cancelled an orphaned child, records `Cancelled`.
     pub async fn scrub_status(&self, name: &str) -> Result<ScrubStatus, FilesystemError> {
         // Confirm the FS exists in the catalog (this is the only
         // input validation we need — historical scrub state is useful
@@ -4413,6 +4721,15 @@ impl FilesystemService {
                 last_duration_secs: None,
                 last_outcome: None,
                 last_output: None,
+                run_id: None,
+                last_exit_code: None,
+                last_corrected_bytes: None,
+                last_uncorrected_bytes: None,
+                last_error_kind: None,
+                bcachefs_tools_version: None,
+                kernel_version: None,
+                bcachefs_module_version: None,
+                cancel_requested: false,
                 raw: "Never scrubbed".into(),
             })
         };
@@ -4427,10 +4744,7 @@ impl FilesystemService {
             // at all there's nothing for bcachefs scrub to be running
             // against, so we treat that as "definitely not alive".
             let alive = if let Some(mp) = fs.mount_point.as_deref() {
-                cmd::run_ok("pgrep", &["-fa", "bcachefs scrub"])
-                    .await
-                    .map(|out| out.lines().any(|l| l.contains(mp)))
-                    .unwrap_or(false)
+                scrub_process_is_alive(mp).await
             } else {
                 false
             };
@@ -4441,6 +4755,7 @@ impl FilesystemService {
                     .map(|s| (end - s).max(0) as u64)
                     .unwrap_or(0);
                 let mut persist = false;
+                let mut controls = self.scrub_controls.lock().await;
                 let mut state = self.scrub_state.lock().await;
                 // Check ownership while the state entry is locked. A new run
                 // reserves ownership before it can replace this entry.
@@ -4455,24 +4770,44 @@ impl FilesystemService {
                     owned_now,
                     alive,
                 ) {
+                    let cancelled =
+                        status.cancel_requested || scrub_cancel_requested(&controls, name, &status);
                     entry.running = false;
                     entry.started_at = None;
                     entry.progress_percent = None;
                     entry.last_run_at = Some(end);
                     entry.last_duration_secs = Some(duration);
-                    entry.last_outcome = Some(ScrubOutcome::Failed);
-                    entry.last_output = Some(
-                        "engine restarted while scrub was running — the bcachefs child \
-                         was lost; restart the scrub if you want a fresh full pass."
-                            .into(),
-                    );
-                    entry.raw = "Last scrub: failed (engine restart)".into();
+                    entry.last_outcome = Some(if cancelled {
+                        ScrubOutcome::Cancelled
+                    } else {
+                        ScrubOutcome::Failed
+                    });
+                    entry.last_exit_code = None;
+                    entry.last_corrected_bytes = None;
+                    entry.last_uncorrected_bytes = None;
+                    entry.last_error_kind = None;
+                    entry.cancel_requested = false;
+                    if cancelled {
+                        entry.last_output = Some(
+                            "The scrub process stopped after cancellation was requested.".into(),
+                        );
+                        entry.raw = "Last scrub: cancelled".into();
+                        controls.cancellations.remove(name);
+                    } else {
+                        entry.last_output = Some(
+                            "engine restarted while scrub was running — the bcachefs child \
+                             was lost; restart the scrub if you want a fresh full pass."
+                                .into(),
+                        );
+                        entry.raw = "Last scrub: failed (engine restart)".into();
+                    }
                     persist = true;
                 }
                 status = entry.clone();
                 drop(state);
+                drop(controls);
                 if persist {
-                    persist_scrub_state(&self.scrub_state).await;
+                    persist_scrub_state(&self.scrub_state, &self.scrub_persist).await;
                 }
             }
         }
@@ -6114,21 +6449,28 @@ async fn save_fs_state(state: &FsState) -> Result<(), FilesystemError> {
     Ok(())
 }
 
-/// Persist the in-memory scrub state map to disk. Best-effort: a
-/// write failure is logged but doesn't abort the caller (the in-memory
-/// state is still authoritative for the current engine lifetime).
-async fn persist_scrub_state(store: &ScrubStateMap) {
+/// Persist the in-memory scrub state map with serialized atomic replacement.
+/// Best-effort for ordinary status updates; cancellation uses the strict
+/// snapshot helper directly because its intent must land before signaling.
+async fn persist_scrub_state(store: &ScrubStateMap, persist: &ScrubPersistLock) {
+    let _persist = persist.lock().await;
     let snapshot = store.lock().await.clone();
-    let json = match serde_json::to_string_pretty(&snapshot) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("serialize scrub state failed: {e}");
-            return;
-        }
-    };
-    if let Err(e) = tokio::fs::write(SCRUB_STATE_PATH, json).await {
-        warn!("write {SCRUB_STATE_PATH} failed: {e}");
+    if let Err(error) = write_scrub_state_snapshot(&snapshot).await {
+        warn!("{error}");
     }
+}
+
+async fn write_scrub_state_snapshot(snapshot: &HashMap<String, ScrubStatus>) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(snapshot)
+        .map_err(|error| format!("serialize scrub state failed: {error}"))?;
+    let temp_path = format!("{SCRUB_STATE_PATH}.tmp");
+    tokio::fs::write(&temp_path, json)
+        .await
+        .map_err(|error| format!("write {SCRUB_STATE_PATH} failed: {error}"))?;
+    tokio::fs::rename(&temp_path, SCRUB_STATE_PATH)
+        .await
+        .map_err(|error| format!("replace {SCRUB_STATE_PATH} failed: {error}"))?;
+    Ok(())
 }
 
 async fn persist_mount_state(store: &MountStateMap) {
@@ -6530,6 +6872,47 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn first_nonempty_line(value: String) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+async fn read_trimmed(path: &str) -> Option<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .and_then(first_nonempty_line)
+}
+
+async fn scrub_run_metadata() -> ScrubRunMetadata {
+    let tools = async {
+        cmd::run_ok("bcachefs", &["version"])
+            .await
+            .ok()
+            .and_then(first_nonempty_line)
+    };
+    let module = async {
+        if let Some(version) = read_trimmed("/sys/module/bcachefs/version").await {
+            return Some(version);
+        }
+        cmd::run_ok("modinfo", &["bcachefs", "--field", "version"])
+            .await
+            .ok()
+            .and_then(first_nonempty_line)
+    };
+    let (bcachefs_tools_version, kernel_version, bcachefs_module_version) =
+        tokio::join!(tools, read_trimmed("/proc/sys/kernel/osrelease"), module,);
+    ScrubRunMetadata {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        bcachefs_tools_version,
+        kernel_version,
+        bcachefs_module_version,
+    }
+}
+
 /// Heuristic: does the captured bcachefs scrub output contain
 /// lines that look like reported errors? We default to "no" because
 /// bcachefs prints "errors: 0" on a clean run and we don't want to
@@ -6566,6 +6949,104 @@ fn combined_indicates_errors(s: &str) -> bool {
         }
     }
     false
+}
+
+const SCRUB_EXIT_INTERRUPTED: i32 = 1;
+const SCRUB_EXIT_CORRECTED: i32 = 2;
+const SCRUB_EXIT_UNCORRECTED: i32 = 4;
+const SCRUB_EXIT_KNOWN_MASK: i32 =
+    SCRUB_EXIT_INTERRUPTED | SCRUB_EXIT_CORRECTED | SCRUB_EXIT_UNCORRECTED;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ScrubErrorBytes {
+    corrected_bytes: u64,
+    uncorrected_bytes: u64,
+    device_offline: bool,
+}
+
+fn parse_scrub_error_bytes(output: &str) -> Option<ScrubErrorBytes> {
+    let mut columns = None;
+    let mut totals = ScrubErrorBytes::default();
+    let mut rows = 0;
+
+    for line in output.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if columns.is_none() {
+            let corrected = fields.iter().position(|field| *field == "corrected");
+            let uncorrected = fields.iter().position(|field| *field == "uncorrected");
+            if let (Some(corrected), Some(uncorrected)) = (corrected, uncorrected) {
+                columns = Some((corrected, uncorrected));
+            }
+            continue;
+        }
+
+        let (corrected_column, uncorrected_column) = columns.unwrap();
+        let complete = fields.contains(&"complete");
+        let offline = fields.contains(&"offline");
+        if !complete && !offline {
+            continue;
+        }
+        let Some(corrected) = fields
+            .get(corrected_column)
+            .and_then(|value| parse_human_bytes(value))
+        else {
+            continue;
+        };
+        let Some(uncorrected) = fields
+            .get(uncorrected_column)
+            .and_then(|value| parse_human_bytes(value))
+        else {
+            continue;
+        };
+        totals.corrected_bytes = totals.corrected_bytes.saturating_add(corrected);
+        totals.uncorrected_bytes = totals.uncorrected_bytes.saturating_add(uncorrected);
+        totals.device_offline |= offline;
+        rows += 1;
+    }
+
+    (rows > 0).then_some(totals)
+}
+
+fn classify_scrub_result(
+    exit_code: Option<i32>,
+    counts: Option<ScrubErrorBytes>,
+    output: &str,
+) -> (ScrubOutcome, Option<ScrubErrorKind>) {
+    let exit_uncorrected = exit_code.is_some_and(|code| code & SCRUB_EXIT_UNCORRECTED != 0);
+    let exit_corrected = exit_code.is_some_and(|code| code & SCRUB_EXIT_CORRECTED != 0);
+    let error_kind = if exit_uncorrected || counts.is_some_and(|value| value.uncorrected_bytes > 0)
+    {
+        Some(ScrubErrorKind::Uncorrected)
+    } else if exit_corrected || counts.is_some_and(|value| value.corrected_bytes > 0) {
+        Some(ScrubErrorKind::Corrected)
+    } else {
+        None
+    };
+    let interrupted = exit_code.is_none_or(|code| {
+        code < 0 || code & SCRUB_EXIT_INTERRUPTED != 0 || code & !SCRUB_EXIT_KNOWN_MASK != 0
+    }) || counts.is_some_and(|value| value.device_offline);
+    let outcome = if interrupted {
+        ScrubOutcome::Failed
+    } else if error_kind.is_some() || combined_indicates_errors(output) {
+        ScrubOutcome::Errors
+    } else {
+        ScrubOutcome::Ok
+    };
+    (outcome, error_kind)
+}
+
+fn scrub_outcome_after_cancel(
+    outcome: ScrubOutcome,
+    error_kind: Option<ScrubErrorKind>,
+    exit_code: Option<i32>,
+    cancel_requested: bool,
+) -> ScrubOutcome {
+    let interrupted = exit_code.is_none_or(|code| code & SCRUB_EXIT_INTERRUPTED != 0);
+    if cancel_requested && interrupted && error_kind.is_none() && outcome == ScrubOutcome::Failed {
+        ScrubOutcome::Cancelled
+    } else {
+        outcome
+    }
 }
 
 /// Keep at most the last `max` bytes of `s`, preserving the trailing
@@ -6783,25 +7264,56 @@ impl ScrubScreen {
 /// every line (and every `\r`-separated progress update — bcachefs
 /// uses carriage returns for in-place percent updates), feed the
 /// most-recent `XX%` token back into the in-memory scrub state, and
-/// return the (outcome, full captured transcript) on process exit.
+/// return the classified result and full captured transcript on exit.
 async fn stream_scrub_and_collect(
     mount: &str,
     fs_name: &str,
     store: &ScrubStateMap,
-) -> (ScrubOutcome, String) {
+    controls: &ScrubControls,
+    run_id: &str,
+) -> ScrubProcessResult {
     use tokio::io::AsyncReadExt;
-    let mut child = match nasty_common::priority::bulk_command("bcachefs")
+
+    // Serialize the spawn decision with cancellation. If cancel won the
+    // lock first, do not create a child after pkill already reported no match.
+    let mut control = controls.lock().await;
+    let cancelled_before_spawn = control
+        .cancellations
+        .get(fs_name)
+        .is_some_and(|cancelled_run_id| cancelled_run_id == run_id);
+    if let Some(local) = control
+        .local_runs
+        .get_mut(fs_name)
+        .filter(|local| local.run_id == run_id)
+    {
+        local.spawn_attempted = true;
+    }
+    if cancelled_before_spawn {
+        drop(control);
+        return ScrubProcessResult {
+            outcome: ScrubOutcome::Failed,
+            error_kind: None,
+            output: "scrub cancelled before the bcachefs process started".to_string(),
+            exit_code: None,
+            counts: None,
+        };
+    }
+    let child = nasty_common::priority::bulk_command("bcachefs")
         .args(["scrub", mount])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .spawn();
+    drop(control);
+    let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            return (
-                ScrubOutcome::Failed,
-                format!("failed to spawn bcachefs scrub: {e}"),
-            );
+            return ScrubProcessResult {
+                outcome: ScrubOutcome::Failed,
+                error_kind: None,
+                output: format!("failed to spawn bcachefs scrub: {e}"),
+                exit_code: None,
+                counts: None,
+            };
         }
     };
 
@@ -6909,23 +7421,28 @@ async fn stream_scrub_and_collect(
         Ok(s) => s,
         Err(e) => {
             let _ = drain_handle.await;
-            return (
-                ScrubOutcome::Failed,
-                format!("bcachefs scrub child wait failed: {e}"),
-            );
+            return ScrubProcessResult {
+                outcome: ScrubOutcome::Failed,
+                error_kind: None,
+                output: format!("bcachefs scrub child wait failed: {e}"),
+                exit_code: None,
+                counts: None,
+            };
         }
     };
     let _ = drain_handle.await;
 
     let captured = capture.lock().map(|g| g.render()).unwrap_or_default();
-    let outcome = if !status.success() {
-        ScrubOutcome::Failed
-    } else if combined_indicates_errors(&captured) {
-        ScrubOutcome::Errors
-    } else {
-        ScrubOutcome::Ok
-    };
-    (outcome, captured)
+    let exit_code = status.code();
+    let counts = parse_scrub_error_bytes(&captured);
+    let (outcome, error_kind) = classify_scrub_result(exit_code, counts, &captured);
+    ScrubProcessResult {
+        outcome,
+        error_kind,
+        output: captured,
+        exit_code,
+        counts,
+    }
 }
 
 /// Apply a freshly-read chunk to both consumers of the scrub stream:
@@ -8471,6 +8988,80 @@ weird_future_op: ...
     }
 
     #[test]
+    fn scrub_process_pattern_is_exact_and_escapes_mount_metacharacters() {
+        assert_eq!(
+            scrub_process_pattern("/fs/pool.1+[copy]"),
+            r"(^|.*/)bcachefs scrub /fs/pool\.1\+\[copy\]$"
+        );
+    }
+
+    #[test]
+    fn orphaned_scrub_cancel_marker_must_match_the_run() {
+        let status: ScrubStatus = serde_json::from_str(
+            r#"{
+                "running": true,
+                "started_at": 1700000000,
+                "run_id": "current-run",
+                "raw": "Scrub in progress..."
+            }"#,
+        )
+        .unwrap();
+        let mut controls = ScrubControlState {
+            cancellations: HashMap::from([("tank".to_string(), "older-run".to_string())]),
+            local_runs: HashMap::new(),
+        };
+
+        assert!(!scrub_cancel_requested(&controls, "tank", &status));
+        controls
+            .cancellations
+            .insert("tank".to_string(), "current-run".to_string());
+        assert!(scrub_cancel_requested(&controls, "tank", &status));
+    }
+
+    #[test]
+    fn scrub_cancel_rejects_a_replacement_run() {
+        assert!(scrub_cancel_targets_run(None, "current-run"));
+        assert!(scrub_cancel_targets_run(Some("current-run"), "current-run"));
+        assert!(!scrub_cancel_targets_run(Some("older-run"), "current-run"));
+    }
+
+    #[tokio::test]
+    async fn scrub_cancel_before_spawn_prevents_child_launch() {
+        let store = Arc::new(Mutex::new(HashMap::new()));
+        let controls = Arc::new(Mutex::new(ScrubControlState {
+            cancellations: HashMap::from([("tank".to_string(), "run-1".to_string())]),
+            local_runs: HashMap::from([(
+                "tank".to_string(),
+                LocalScrubRun {
+                    run_id: "run-1".to_string(),
+                    spawn_attempted: false,
+                },
+            )]),
+        }));
+
+        let result = stream_scrub_and_collect("/fs/tank", "tank", &store, &controls, "run-1").await;
+
+        assert_eq!(result.exit_code, None);
+        assert_eq!(
+            result.output,
+            "scrub cancelled before the bcachefs process started"
+        );
+        assert!(
+            controls
+                .lock()
+                .await
+                .local_runs
+                .get("tank")
+                .unwrap()
+                .spawn_attempted
+        );
+        assert_eq!(
+            scrub_outcome_after_cancel(result.outcome, result.error_kind, result.exit_code, true,),
+            ScrubOutcome::Cancelled
+        );
+    }
+
+    #[test]
     fn scrub_clean_run_classifies_as_ok() {
         // bcachefs prints a final summary line; a clean run reports
         // zero errors. We must NOT misclassify "errors: 0" as Errors —
@@ -8493,6 +9084,235 @@ weird_future_op: ...
         // Operators looking at the captured output expect Errors.
         let out = "scrubbing /fs/tank ...\ndev 0: error: io_error reading block 0xabc\nerrors: 1\n";
         assert!(combined_indicates_errors(out));
+    }
+
+    #[test]
+    fn scrub_exit_bitmask_distinguishes_completed_errors_from_failure() {
+        assert_eq!(
+            classify_scrub_result(Some(0), None, ""),
+            (ScrubOutcome::Ok, None)
+        );
+        assert_eq!(
+            classify_scrub_result(Some(2), None, ""),
+            (ScrubOutcome::Errors, Some(ScrubErrorKind::Corrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(4), None, ""),
+            (ScrubOutcome::Errors, Some(ScrubErrorKind::Uncorrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(6), None, ""),
+            (ScrubOutcome::Errors, Some(ScrubErrorKind::Uncorrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(1), None, ""),
+            (ScrubOutcome::Failed, None)
+        );
+        assert_eq!(
+            classify_scrub_result(Some(3), None, ""),
+            (ScrubOutcome::Failed, Some(ScrubErrorKind::Corrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(5), None, ""),
+            (ScrubOutcome::Failed, Some(ScrubErrorKind::Uncorrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(7), None, ""),
+            (ScrubOutcome::Failed, Some(ScrubErrorKind::Uncorrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(8), None, ""),
+            (ScrubOutcome::Failed, None)
+        );
+        assert_eq!(
+            classify_scrub_result(None, None, ""),
+            (ScrubOutcome::Failed, None)
+        );
+    }
+
+    #[test]
+    fn scrub_error_bytes_are_summed_from_device_table() {
+        let out = "\
+Starting scrub on 3 devices: sda sdb sdc
+device                checked    corrected  uncorrected        total
+sda                     72.4G           0B        14.1M        70.5G   102%  complete
+sdb                     70.5G         4.0K           0B        70.5G   100%  complete
+sdc                     72.3G         1.5M        21.8M        70.5G   102%  complete
+";
+        assert_eq!(
+            parse_scrub_error_bytes(out),
+            Some(ScrubErrorBytes {
+                corrected_bytes: parse_human_bytes("4.0K").unwrap()
+                    + parse_human_bytes("1.5M").unwrap(),
+                uncorrected_bytes: parse_human_bytes("14.1M").unwrap()
+                    + parse_human_bytes("21.8M").unwrap(),
+                device_offline: false,
+            })
+        );
+    }
+
+    #[test]
+    fn scrub_offline_device_counts_errors_but_marks_run_failed() {
+        let out = "\
+device                checked    corrected  uncorrected        total
+sda                     70.5G         4.0K        14.1M        70.5G   100%  offline
+";
+        let counts = parse_scrub_error_bytes(out).unwrap();
+        assert!(counts.device_offline);
+        assert_eq!(counts.corrected_bytes, 4096);
+        assert_eq!(
+            counts.uncorrected_bytes,
+            parse_human_bytes("14.1M").unwrap()
+        );
+        assert_eq!(
+            classify_scrub_result(Some(4), Some(counts), out),
+            (ScrubOutcome::Failed, Some(ScrubErrorKind::Uncorrected))
+        );
+    }
+
+    #[test]
+    fn scrub_counts_backstop_zero_exit_from_older_tools() {
+        let corrected = ScrubErrorBytes {
+            corrected_bytes: 4096,
+            uncorrected_bytes: 0,
+            device_offline: false,
+        };
+        let uncorrected = ScrubErrorBytes {
+            corrected_bytes: 0,
+            uncorrected_bytes: 4096,
+            device_offline: false,
+        };
+        assert_eq!(
+            classify_scrub_result(Some(0), Some(corrected), ""),
+            (ScrubOutcome::Errors, Some(ScrubErrorKind::Corrected))
+        );
+        assert_eq!(
+            classify_scrub_result(Some(0), Some(uncorrected), ""),
+            (ScrubOutcome::Errors, Some(ScrubErrorKind::Uncorrected))
+        );
+    }
+
+    #[test]
+    fn scrub_cancel_race_preserves_completed_or_reported_errors() {
+        assert_eq!(
+            scrub_outcome_after_cancel(ScrubOutcome::Failed, None, None, true),
+            ScrubOutcome::Cancelled
+        );
+        assert_eq!(
+            scrub_outcome_after_cancel(ScrubOutcome::Failed, None, Some(1), true),
+            ScrubOutcome::Cancelled
+        );
+        assert_eq!(
+            scrub_outcome_after_cancel(
+                ScrubOutcome::Errors,
+                Some(ScrubErrorKind::Uncorrected),
+                Some(4),
+                true,
+            ),
+            ScrubOutcome::Errors
+        );
+        assert_eq!(
+            scrub_outcome_after_cancel(
+                ScrubOutcome::Failed,
+                Some(ScrubErrorKind::Uncorrected),
+                Some(5),
+                true,
+            ),
+            ScrubOutcome::Failed
+        );
+        assert_eq!(
+            scrub_outcome_after_cancel(ScrubOutcome::Ok, None, Some(0), true),
+            ScrubOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn scrub_status_deserializes_legacy_state_without_run_details() {
+        let status: ScrubStatus = serde_json::from_str(
+            r#"{
+                "running": false,
+                "last_run_at": 1700000000,
+                "last_outcome": "errors",
+                "raw": "Last scrub: errors detected"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(status.last_outcome, Some(ScrubOutcome::Errors));
+        assert!(status.run_id.is_none());
+        assert!(status.last_exit_code.is_none());
+        assert!(status.last_corrected_bytes.is_none());
+        assert!(status.last_uncorrected_bytes.is_none());
+        assert!(status.last_error_kind.is_none());
+        assert!(status.bcachefs_tools_version.is_none());
+        assert!(status.kernel_version.is_none());
+        assert!(status.bcachefs_module_version.is_none());
+        assert!(!status.cancel_requested);
+    }
+
+    #[test]
+    fn scrub_cancel_intent_survives_state_roundtrip() {
+        let status: ScrubStatus = serde_json::from_str(
+            r#"{
+                "running": true,
+                "started_at": 1700000000,
+                "run_id": "current-run",
+                "cancel_requested": true,
+                "raw": "Scrub in progress..."
+            }"#,
+        )
+        .unwrap();
+
+        let restored: ScrubStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert!(restored.cancel_requested);
+    }
+
+    #[test]
+    fn scrub_cancel_request_keeps_legacy_name_only_shape() {
+        let legacy: ScrubCancelRequest = serde_json::from_str(r#"{"name":"tank"}"#).unwrap();
+        assert_eq!(legacy.name, "tank");
+        assert!(legacy.run_id.is_none());
+
+        let scoped: ScrubCancelRequest =
+            serde_json::from_str(r#"{"name":"tank","run_id":"run-1"}"#).unwrap();
+        assert_eq!(scoped.run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn scrub_status_persists_exit_counts_versions_and_run_id() {
+        let status = ScrubStatus {
+            running: false,
+            started_at: None,
+            progress_percent: None,
+            last_run_at: Some(1_700_000_000),
+            last_duration_secs: Some(3600),
+            last_outcome: Some(ScrubOutcome::Errors),
+            last_output: Some("device table".into()),
+            run_id: Some("27d5ac0d-f877-48aa-89eb-83ebfbaee17f".into()),
+            last_exit_code: Some(4),
+            last_corrected_bytes: Some(4096),
+            last_uncorrected_bytes: Some(8192),
+            last_error_kind: Some(ScrubErrorKind::Uncorrected),
+            bcachefs_tools_version: Some("1.39.5".into()),
+            kernel_version: Some("6.18.47".into()),
+            bcachefs_module_version: Some("1.39.5".into()),
+            cancel_requested: false,
+            raw: "Last scrub: completed with uncorrected errors".into(),
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let restored: ScrubStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.run_id, status.run_id);
+        assert_eq!(restored.last_exit_code, Some(4));
+        assert_eq!(restored.last_corrected_bytes, Some(4096));
+        assert_eq!(restored.last_uncorrected_bytes, Some(8192));
+        assert_eq!(restored.last_error_kind, Some(ScrubErrorKind::Uncorrected));
+        assert_eq!(restored.bcachefs_tools_version.as_deref(), Some("1.39.5"));
+        assert_eq!(restored.kernel_version.as_deref(), Some("6.18.47"));
+        assert_eq!(restored.bcachefs_module_version.as_deref(), Some("1.39.5"));
+        assert!(json.contains("\"last_outcome\":\"errors\""));
+        assert!(json.contains("\"last_error_kind\":\"uncorrected\""));
     }
 
     #[test]

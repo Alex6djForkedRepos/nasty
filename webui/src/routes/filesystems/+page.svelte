@@ -205,6 +205,9 @@
 	function scrubChip(s: ScrubStatus | undefined): { label: string; cls: string; title: string } {
 		if (!s) return { label: 'scrub: —', cls: 'text-muted-foreground', title: 'No scrub data' };
 		if (s.running) {
+			if (s.cancel_requested) {
+				return { label: 'cancelling scrub', cls: 'text-amber-500', title: 'Scrub cancellation requested' };
+			}
 			// Prefer the parsed bcachefs percent when we have one;
 			// fall back to elapsed time so a tools build that doesn't
 			// print percent (or hasn't yet) still shows motion.
@@ -219,16 +222,25 @@
 		}
 		const ago = humanAgo(s.last_run_at);
 		const outcome = s.last_outcome ?? 'ok';
+		const errorKind = s.last_error_kind;
 		const dur = s.last_duration_secs ? humanDuration(s.last_duration_secs) : '';
 		const cls =
 			outcome === 'ok' ? 'text-green-500' :
-			outcome === 'errors' ? 'text-amber-500' :
+			outcome === 'errors' && errorKind !== 'uncorrected' ? 'text-amber-500' :
 			outcome === 'cancelled' ? 'text-muted-foreground' :
 			'text-red-500';
 		const label = outcome === 'ok'
 			? `scrubbed ${ago}, ok`
+			: outcome === 'errors' && errorKind === 'corrected'
+			? `scrubbed ${ago}, corrected errors`
+			: outcome === 'errors' && errorKind === 'uncorrected'
+			? `scrubbed ${ago}, uncorrected errors`
 			: outcome === 'errors'
 			? `scrubbed ${ago}, errors`
+			: outcome === 'failed' && errorKind === 'corrected'
+			? `scrub failed ${ago}, corrected errors`
+			: outcome === 'failed' && errorKind === 'uncorrected'
+			? `scrub failed ${ago}, uncorrected errors`
 			: outcome === 'cancelled'
 			? `scrub cancelled ${ago}`
 			: `scrub failed ${ago}`;

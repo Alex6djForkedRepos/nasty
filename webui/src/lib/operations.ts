@@ -26,6 +26,10 @@ export function operationDetail(
 	const outcomeLabels = {
 		ok: 'clean',
 		errors: 'found errors',
+		corrected: 'corrected errors',
+		uncorrected: 'found uncorrected errors',
+		failed_corrected: 'failed with corrected errors',
+		failed_uncorrected: 'failed with uncorrected errors',
 		failed: 'failed',
 		cancelled: 'cancelled',
 	} satisfies Record<NonNullable<Operation['last_outcome']>, string>;
