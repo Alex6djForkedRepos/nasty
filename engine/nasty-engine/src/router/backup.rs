@@ -24,6 +24,25 @@ fn profile_requires_admin(profile: &nasty_backup::BackupProfile) -> bool {
     profile.sources.iter().any(|source| !is_data_source(source))
 }
 
+fn backup_read_requires_unscoped(method: &str) -> bool {
+    matches!(
+        method,
+        "backup.profile.list"
+            | "backup.schedule.list"
+            | "backup.profile.get"
+            | "backup.status"
+            | "backup.snapshots"
+            | "backup.jobs.list"
+            | "backup.jobs.get"
+    )
+}
+
+fn backup_read_access_error(method: &str, session: &Session) -> Option<&'static str> {
+    (backup_read_requires_unscoped(method)
+        && (session.filesystem.is_some() || session.owner.is_some()))
+    .then_some("backup management requires an unscoped session")
+}
+
 fn profile_access_error(
     session: &Session,
     profile: &nasty_backup::BackupProfile,
@@ -64,6 +83,9 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if let Some(message) = backup_read_access_error(&req.method, session) {
+        return Some(err(req, message));
+    }
     Some(match req.method.as_str() {
         "backup.profile.list" => ok(req, state.backups.list_profiles().await),
         "backup.schedule.list" => ok(req, state.backups.list_schedule(chrono::Utc::now()).await),
@@ -195,7 +217,10 @@ pub(super) async fn try_route(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_data_source, profile_access_error};
+    use super::{
+        backup_read_access_error, backup_read_requires_unscoped, is_data_source,
+        profile_access_error,
+    };
     use crate::auth::{Role, Session};
 
     fn profile(sources: &[&str]) -> nasty_backup::BackupProfile {
@@ -242,5 +267,35 @@ mod tests {
         assert!(profile_access_error(&session(Role::Operator, false), &system).is_some());
         assert!(profile_access_error(&session(Role::Admin, false), &system).is_none());
         assert!(profile_access_error(&session(Role::Admin, true), &system).is_some());
+    }
+
+    #[test]
+    fn profile_derived_backup_reads_require_unscoped_sessions() {
+        for method in [
+            "backup.profile.list",
+            "backup.schedule.list",
+            "backup.profile.get",
+            "backup.status",
+            "backup.snapshots",
+            "backup.jobs.list",
+            "backup.jobs.get",
+        ] {
+            assert!(backup_read_requires_unscoped(method), "{method}");
+        }
+        assert!(!backup_read_requires_unscoped("backup.secrets_status"));
+        assert!(!backup_read_requires_unscoped("backup.profile.create"));
+    }
+
+    #[test]
+    fn backup_read_scope_rejects_filesystem_and_owner_credentials() {
+        let unscoped = session(Role::ReadOnly, false);
+        let filesystem_scoped = session(Role::Admin, true);
+        let mut owner_scoped = session(Role::Admin, false);
+        owner_scoped.owner = Some("token-a".to_string());
+
+        assert!(backup_read_access_error("backup.profile.list", &unscoped).is_none());
+        assert!(backup_read_access_error("backup.profile.list", &filesystem_scoped).is_some());
+        assert!(backup_read_access_error("backup.profile.list", &owner_scoped).is_some());
+        assert!(backup_read_access_error("backup.secrets_status", &owner_scoped).is_none());
     }
 }
