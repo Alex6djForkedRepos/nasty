@@ -250,11 +250,13 @@ fn is_read_only(method: &str) -> bool {
             // can hold sensitive settings. Its `.get` suffix would otherwise slip
             // it into the universally-allowed read set; keep it Admin-only.
             | "system.custom_config.get"
-            // These return container environment, raw Docker metadata, or
-            // compose source that can contain credentials.
+            // These return container environment, raw Docker metadata,
+            // compose source, or notification endpoint details that can
+            // contain credentials.
             | "apps.config"
             | "apps.inspect"
             | "apps.compose.get"
+            | "notifications.config.get"
     ) {
         return false;
     }
@@ -341,7 +343,6 @@ fn is_read_only(method: &str) -> bool {
                 | "firmware.constraints"
                 | "firmware.check"
                 | "firmware.devices"
-                | "notifications.config.get"
                 | "apps.inspect_image"
                 | "apps.caddy.routes"
                 | "apps.ingress.check_conflict"
@@ -528,7 +529,7 @@ async fn route(req: &Request, state: &AppState, session: &Session) -> Response {
         "auth" => auth::try_route(req, state, session).await,
         "audit" => audit::try_route(req, state, session).await,
         "alert" | "telemetry" => alerts::try_route(req, state, session).await,
-        "notifications" => notifications::try_route(req, state, session).await,
+        "notifications" => notifications::try_route(req, session).await,
         "backup" => backup::try_route(req, state, session).await,
         "fs" | "device" => fs::try_route(req, state, session).await,
         "bcachefs" => bcachefs::try_route(req, state, session).await,

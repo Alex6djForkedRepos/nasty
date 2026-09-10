@@ -5,6 +5,7 @@
 	import { applyNetworkUpdate } from '$lib/rollbackState.svelte';
 	import { tempUnit } from '$lib/temperature.svelte';
 	import { requiredFieldCls } from '$lib/utils';
+	import { hasRootEquivalentAccess } from '$lib/access';
 	import {
 		promoteOrphanedMembers,
 		validateDnsServer,
@@ -19,7 +20,7 @@
 	import { domain, domainRefresh, domainJoin, domainLeave } from '$lib/domain.svelte';
 	import { dc, dcRefresh, dcProvision } from '$lib/dc.svelte';
 	import DcPanel from '$lib/directory/DcPanel.svelte';
-	import type { Settings, SystemInfo, CustomConfig, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig, VfConfig } from '$lib/types';
+	import type { Settings, SystemInfo, CustomConfig, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig, VfConfig, AuthMe } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import BridgeCreator from '$lib/components/BridgeCreator.svelte';
@@ -31,6 +32,7 @@
 	import type { NotificationConfig, NotificationChannel } from '$lib/types';
 	let notifConfig: NotificationConfig = $state({ channels: [] });
 	let notifLoaded = $state(false);
+	let canManageNotifications = $state(false);
 	let notifSaving = $state(false);
 	let notifTesting = $state<string | null>(null);
 	let notifAddType: 'smtp' | 'telegram' | 'webhook' | 'ntfy' | 'signal' | null = $state(null);
@@ -288,6 +290,10 @@
 	const client = getClient();
 
 	onMount(async () => {
+		try {
+			const identity = await client.call<AuthMe>('auth.me');
+			canManageNotifications = hasRootEquivalentAccess(identity.role, identity.scoped);
+		} catch { /* Fail closed if session details are unavailable. */ }
 		await withToast(async () => {
 			let liveLogFilter: string;
 			[settings, info, timezones, networkState, liveLogFilter] = await Promise.all([
@@ -815,12 +821,14 @@
 			? 'border-b-2 border-primary text-foreground'
 			: 'text-muted-foreground hover:text-foreground'}"
 	>Network</button>
-	<button
-		onclick={() => switchTab('notifications')}
-		class="px-4 py-2 text-sm font-medium transition-colors {activeTab === 'notifications'
-			? 'border-b-2 border-primary text-foreground'
-			: 'text-muted-foreground hover:text-foreground'}"
-	>Notifications</button>
+	{#if canManageNotifications}
+		<button
+			onclick={() => switchTab('notifications')}
+			class="px-4 py-2 text-sm font-medium transition-colors {activeTab === 'notifications'
+				? 'border-b-2 border-primary text-foreground'
+				: 'text-muted-foreground hover:text-foreground'}"
+		>Notifications</button>
+	{/if}
 	<button
 		onclick={() => switchTab('tuning')}
 		class="px-4 py-2 text-sm font-medium transition-colors {activeTab === 'tuning'

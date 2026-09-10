@@ -2064,21 +2064,21 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "notifications.config.get",
-                    desc: "Return the persisted notification-channels configuration (SMTP / Telegram / Webhook / ntfy / Signal).",
-                    role: MethodRole::Any,
+                    desc: "Return the persisted notification-channels configuration (SMTP / Telegram / Webhook / ntfy / Signal), with dedicated secret fields redacted. Requires an unscoped Admin because endpoint URLs and arbitrary headers can contain credentials.",
+                    role: MethodRole::Admin,
                     params: MethodParams::None,
                     result: Some(gen_schema::<NotificationConfig>(generator)),
                 },
                 Method {
                     name: "notifications.config.update",
-                    desc: "Replace the on-disk notifications config with the supplied one. File is chmod 0600 because it carries SMTP passwords and bot tokens.",
+                    desc: "Replace the on-disk notifications config with the supplied one. Requires an unscoped Admin. File is chmod 0600 because it carries SMTP passwords and bot tokens.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<NotificationConfig>(generator)),
                     result: None,
                 },
                 Method {
                     name: "notifications.test",
-                    desc: "Send a one-shot test message (\"NASty Test\") through the supplied channel configuration without persisting it.",
+                    desc: "Send a one-shot test message (\"NASty Test\") through the supplied channel configuration without persisting it. Requires an unscoped Admin.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<ChannelType>(generator)),
                     result: Some(
@@ -2087,7 +2087,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "notifications.test_saved",
-                    desc: "Send a test message through an already-saved channel, identified by id. Sealed secrets are resolved server-side, so the secret never has to round-trip through the client.",
+                    desc: "Send a test message through an already-saved channel, identified by id. Requires an unscoped Admin. Sealed secrets are resolved server-side, so the secret never has to round-trip through the client.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(serde_json::json!({
                         "type": "object",
