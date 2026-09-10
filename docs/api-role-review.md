@@ -180,11 +180,20 @@ and the shared VM image inventory.
 
 ### Notification webhook credentials are incompletely redacted
 
-`notifications.config.get` masks dedicated secret fields but leaves webhook
-URLs and arbitrary headers visible to ReadOnly callers.
+Status: fixed by requiring an unscoped Admin for notification configuration
+reads and writes and for both supplied and saved-channel test delivery. The
+WebUI hides the notification controls when the session lacks that access.
+
+`notifications.config.get` masks dedicated secret fields, but webhook URLs and
+arbitrary headers can themselves contain credentials. The same root-equivalent
+boundary now covers global configuration mutation and outbound test delivery.
 
 - `engine/nasty-system/src/notifications.rs:57-71`
 - `engine/nasty-system/src/notifications.rs:167-214`
+- `engine/nasty-engine/src/router/notifications.rs:14-34`
+- `engine/nasty-engine/src/registry/methods.rs:2066-2092`
+- `webui/src/routes/settings/+page.svelte:290-297`
+- `webui/src/routes/settings/+page.svelte:821-832`
 
 ### `audit.list` returns every user's records
 
