@@ -40,6 +40,20 @@
 	const certActive = $derived.by(() => Boolean(displayAcmeStatus?.state === 'success' && tlsAcmeEnabled));
 	const configuredFilesPortalUrl = $derived(configuredFilesDomain ? `https://${configuredFilesDomain}/portal` : '');
 	const filesDomainError = $derived(validateOptionalFilesDomain(filesDomain, tlsDomain));
+	const dnsCredentialsPlaceholder = $derived.by(() => {
+		switch (tlsDnsProvider) {
+			case 'cloudflare': return 'CLOUDFLARE_DNS_API_TOKEN=xxxxx';
+			case 'duckdns': return 'DUCKDNS_TOKEN=xxxxx';
+			case 'linode': return 'LINODE_TOKEN=xxxxx';
+			case 'desec': return 'DESEC_TOKEN=xxxxx';
+			case 'hetzner': return 'HETZNER_API_TOKEN=xxxxx';
+			case 'porkbun': return 'PORKBUN_API_KEY=xxxxx';
+			case 'namecheap': return 'NAMECHEAP_USER=xxxxx';
+			case 'rfc2136': return 'RFC2136_KEY_NAME=xxxxx';
+			case 'route53': return 'AWS_REGION=xxxxx';
+			default: return 'KEY=VALUE';
+		}
+	});
 
 	function validateOptionalFilesDomain(value: string, mainDomain: string): string | null {
 		const host = value.trim();
@@ -414,7 +428,7 @@
 						oninput={() => tlsChanged = true}
 						rows={4}
 						class="w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
-						placeholder={dnsCredsStored && !dnsCredsClear ? 'stored — leave blank to keep, paste to replace' : 'CF_API_TOKEN=xxxxx'}
+						placeholder={dnsCredsStored && !dnsCredsClear ? 'stored — leave blank to keep, paste to replace' : dnsCredentialsPlaceholder}
 					></textarea>
 					<span class="mt-1 block text-xs text-muted-foreground">
 						One KEY=VALUE per line. Written to a Caddy <code>EnvironmentFile</code> and referenced from the
