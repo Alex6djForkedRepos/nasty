@@ -47,10 +47,10 @@
 			case 'linode': return 'LINODE_TOKEN=xxxxx';
 			case 'desec': return 'DESEC_TOKEN=xxxxx';
 			case 'hetzner': return 'HETZNER_API_TOKEN=xxxxx';
-			case 'porkbun': return 'PORKBUN_API_KEY=xxxxx';
-			case 'namecheap': return 'NAMECHEAP_USER=xxxxx';
-			case 'rfc2136': return 'RFC2136_KEY_NAME=xxxxx';
-			case 'route53': return 'AWS_REGION=xxxxx';
+			case 'porkbun': return 'PORKBUN_API_KEY=xxxxx\nPORKBUN_SECRET_API_KEY=xxxxx';
+			case 'namecheap': return 'NAMECHEAP_USER=xxxxx\nNAMECHEAP_API_KEY=xxxxx\nNAMECHEAP_CLIENT_IP=192.0.2.1';
+			case 'rfc2136': return 'RFC2136_KEY_NAME=xxxxx\nRFC2136_KEY=xxxxx\nRFC2136_KEY_ALG=hmac-sha256\nRFC2136_SERVER=192.0.2.1:53';
+			case 'route53': return 'AWS_REGION=xxxxx\nAWS_ACCESS_KEY_ID=xxxxx\nAWS_SECRET_ACCESS_KEY=xxxxx\nAWS_SESSION_TOKEN=xxxxx';
 			default: return 'KEY=VALUE';
 		}
 	});
