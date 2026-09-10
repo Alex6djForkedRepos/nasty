@@ -156,15 +156,15 @@ credentials and before changing the global REST server storage path.
 
 ### Scoped reads return global resource inventories
 
-Status: partially fixed. NFS, SMB, iSCSI, and NVMe-oF list/get responses are
-filtered by filesystem and owner scope, and direct profile-derived backup RPCs
-require an unscoped session. Residual filesystem and alert-derived inventory
-reads remain open.
+Status: partially fixed. Share inventories and direct subvolume/dependency reads
+now enforce filesystem and owner scope. Direct profile-derived backup reads,
+global alert APIs, aggregate system status, and block-device inventory require
+an unscoped session. Filesystem operations and diagnostics filter filesystem
+scope and reject owner scope where attribution is unavailable.
 
-Share `list`/`get` and direct backup profile/snapshot/job reads now enforce
-scope. Several filesystem status/dependency methods and global alerts/status do
-not consistently filter filesystem or owner scope; backup alerts can include
-profile identifiers, names, timestamps, and errors.
+Broader host telemetry and adjacent storage reads remain open, including global
+system statistics, disk health, TLS host status, update build-directory mounts,
+and the shared VM image inventory.
 
 - `engine/nasty-engine/src/router/share.rs:530-539`
 - `engine/nasty-engine/src/router/share.rs:607-616`
@@ -172,8 +172,11 @@ profile identifiers, names, timestamps, and errors.
 - `engine/nasty-engine/src/router/share.rs:1054-1063`
 - `engine/nasty-engine/src/router/backup.rs:27-44`
 - `engine/nasty-engine/src/router/backup.rs:81-88`
-- `engine/nasty-engine/src/router/alerts.rs:24-49`
-- `engine/nasty-engine/src/router/system.rs:982-1058`
+- `engine/nasty-engine/src/router/fs.rs:64-85`
+- `engine/nasty-engine/src/router/bcachefs.rs:14-35`
+- `engine/nasty-engine/src/router/subvolume.rs:14-30`
+- `engine/nasty-engine/src/router/alerts.rs:14-29`
+- `engine/nasty-engine/src/router/system.rs:985-994`
 
 ### Notification webhook credentials are incompletely redacted
 

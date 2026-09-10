@@ -68,6 +68,9 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if let Some(message) = system_inventory_access_error(&req.method, session) {
+        return Some(err(req, message));
+    }
     Some(match req.method.as_str() {
         "system.info" => ok(req, state.system.info().await),
         "system.health" => ok(req, state.system.health().await),
@@ -89,7 +92,10 @@ pub(super) async fn try_route(
             }
             ok(req, status)
         }
-        "system.operations.list" => ok(req, build_operations(state).await),
+        "system.operations.list" => ok(
+            req,
+            build_operations(state, session.filesystem.as_deref()).await,
+        ),
         "system.custom_config.get" => match custom_config_get().await {
             Ok(config) => ok(req, config),
             Err(e) => err(req, format!("read /etc/nixos/custom.nix: {e}")),
@@ -976,6 +982,17 @@ pub(super) async fn try_route(
     })
 }
 
+fn system_inventory_access_error(method: &str, session: &Session) -> Option<&'static str> {
+    let scoped = session.filesystem.is_some() || session.owner.is_some();
+    ((method == "system.status" && scoped)
+        || (method == "system.operations.list" && session.owner.is_some()))
+    .then_some("access denied: scoped credentials cannot read global system inventory")
+}
+
+fn filesystem_visible(name: &str, filter: Option<&str>) -> bool {
+    filter.is_none_or(|filter| name == filter)
+}
+
 /// Aggregate the sidebar status band (#528): current alert counts (reusing the
 /// shared alert evaluation) plus a scan of every filesystem for in-progress
 /// array operations (device evacuation, running scrub, active reconcile).
@@ -1087,13 +1104,19 @@ async fn custom_config_get() -> std::io::Result<nasty_system::CustomConfig> {
 /// acknowledgement row when nothing is draining), plus the pausable
 /// background jobs reconcile and copygc (Pause/Resume), shown even when
 /// idle so they can be toggled.
-async fn build_operations(state: &AppState) -> Vec<nasty_system::Operation> {
+async fn build_operations(
+    state: &AppState,
+    filesystem_filter: Option<&str>,
+) -> Vec<nasty_system::Operation> {
     let mut ops: Vec<nasty_system::Operation> = Vec::new();
     let Ok(filesystems) = state.filesystems.list().await else {
         return ops;
     };
     let mut any_evacuating = false;
     for fs in &filesystems {
+        if !filesystem_visible(&fs.name, filesystem_filter) {
+            continue;
+        }
         if !fs.mounted {
             continue;
         }
@@ -1397,8 +1420,44 @@ mod tests {
 
 #[cfg(test)]
 mod operations_tests {
-    use super::{evacuate_idle_row, scrub_idle_detail, scrub_outcome_name};
+    use super::{
+        evacuate_idle_row, filesystem_visible, scrub_idle_detail, scrub_outcome_name,
+        system_inventory_access_error,
+    };
+    use crate::auth::{Role, Session};
     use nasty_storage::filesystem::{ScrubErrorKind, ScrubOutcome, ScrubStatus};
+
+    fn session(filesystem: bool, owner: bool) -> Session {
+        Session {
+            token: "token".into(),
+            username: "user".into(),
+            role: Role::ReadOnly,
+            file_principal: None,
+            filesystem: filesystem.then(|| "tank".into()),
+            owner: owner.then(|| "token-a".into()),
+            created_at: 0,
+            must_change_password: false,
+            client_ip: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_system_reads_fail_closed_when_the_scope_cannot_be_applied() {
+        assert!(system_inventory_access_error("system.status", &session(false, false)).is_none());
+        assert!(system_inventory_access_error("system.status", &session(true, false)).is_some());
+        assert!(system_inventory_access_error("system.status", &session(false, true)).is_some());
+        assert!(
+            system_inventory_access_error("system.operations.list", &session(true, false))
+                .is_none()
+        );
+        assert!(
+            system_inventory_access_error("system.operations.list", &session(false, true))
+                .is_some()
+        );
+        assert!(filesystem_visible("tank", Some("tank")));
+        assert!(!filesystem_visible("other", Some("tank")));
+        assert!(filesystem_visible("other", None));
+    }
 
     fn status(last_run_at: Option<i64>, last_outcome: Option<ScrubOutcome>) -> ScrubStatus {
         ScrubStatus {

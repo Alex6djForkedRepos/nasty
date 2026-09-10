@@ -11,6 +11,24 @@ use super::*;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
+fn filter_owner_visible_children(
+    mut children: Vec<String>,
+    visible_names: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let Some(visible_names) = visible_names else {
+        return children;
+    };
+    children.retain(|child| visible_names.contains(child));
+    children
+}
+
+fn owner_can_read_children(
+    parent: &str,
+    visible_names: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    visible_names.is_none_or(|visible_names| visible_names.contains(parent))
+}
+
 pub(super) async fn try_route(
     req: &Request,
     state: &AppState,
@@ -46,15 +64,13 @@ pub(super) async fn try_route(
         // bucket references by owning subvolume rather than paying
         // service-fanout N times.
         "subvolume.list_dependents" => {
-            let all = crate::subvolume_dependents::find_all_subvolume_dependents(state).await;
-            // Apply the same scope guard as subvolume.list_all — a
-            // filesystem-scoped session shouldn't see usage data for
-            // subvolumes on other filesystems.
-            let filtered = match session.filesystem.as_deref() {
-                Some(fs) => all.into_iter().filter(|d| d.filesystem == fs).collect(),
-                None => all,
-            };
-            ok(req, filtered)
+            let dependents = crate::subvolume_dependents::find_all_subvolume_dependents(
+                state,
+                session.filesystem.as_deref(),
+                session.owner.as_deref(),
+            )
+            .await;
+            ok(req, dependents)
         }
         "subvolume.list" => match require_str(req, "filesystem") {
             Ok(fs_name) => {
@@ -91,10 +107,39 @@ pub(super) async fn try_route(
             (Err(r), _) | (_, Err(r)) => r,
         },
         "subvolume.children" => match (require_str(req, "filesystem"), require_str(req, "name")) {
-            (Ok(fs_name), Ok(name)) => match state.subvolumes.list_children(fs_name, name).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
-            },
+            (Ok(fs_name), Ok(name)) => {
+                if session.filesystem.as_deref().is_some_and(|p| p != fs_name) {
+                    err(req, "access denied")
+                } else {
+                    let visible_names = if session.owner.is_some() {
+                        match state
+                            .subvolumes
+                            .list(fs_name, session.owner.as_deref())
+                            .await
+                        {
+                            Ok(visible) => Some(
+                                visible
+                                    .into_iter()
+                                    .map(|subvolume| subvolume.name)
+                                    .collect::<std::collections::HashSet<_>>(),
+                            ),
+                            Err(error) => return Some(err(req, error)),
+                        }
+                    } else {
+                        None
+                    };
+                    if !owner_can_read_children(name, visible_names.as_ref()) {
+                        return Some(err(req, "access denied"));
+                    }
+                    match state.subvolumes.list_children(fs_name, name).await {
+                        Ok(children) => ok(
+                            req,
+                            filter_owner_visible_children(children, visible_names.as_ref()),
+                        ),
+                        Err(e) => err(req, e),
+                    }
+                }
+            }
             (Err(r), _) | (_, Err(r)) => r,
         },
         "subvolume.create" => {
@@ -311,4 +356,24 @@ pub(super) async fn try_route(
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{filter_owner_visible_children, owner_can_read_children};
+
+    #[test]
+    fn child_inventory_requires_a_visible_parent_and_filters_hidden_children() {
+        let children = vec!["parent/own".to_string(), "parent/foreign".to_string()];
+        let visible = HashSet::from(["parent".to_string(), "parent/own".to_string()]);
+        assert_eq!(
+            filter_owner_visible_children(children, Some(&visible)),
+            vec!["parent/own"]
+        );
+        assert!(owner_can_read_children("parent", Some(&visible)));
+        assert!(!owner_can_read_children("foreign-parent", Some(&visible)));
+        assert!(owner_can_read_children("foreign-parent", None));
+    }
 }
