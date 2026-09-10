@@ -144,6 +144,9 @@ reinstalling it.
 
 ### Scoped Admin can control the global backup REST server
 
+Status: fixed by requiring an unscoped Admin session before reading or rotating
+credentials and before changing the global REST server storage path.
+
 `service.rest_server.configure`, `service.rest_server.credentials`, and
 `service.rest_server.rotate_credentials` lack unscoped Admin checks.
 
