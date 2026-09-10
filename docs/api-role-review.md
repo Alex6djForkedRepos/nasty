@@ -197,9 +197,11 @@ boundary now covers global configuration mutation and outbound test delivery.
 
 ### `audit.list` returns every user's records
 
-The method is `Any`; `audit.mine` already provides a self-scoped alternative.
+Status: fixed by requiring an unscoped Admin before reading the global audit
+log. `audit.mine` remains available as the self-scoped alternative.
 
-- `engine/nasty-engine/src/router/audit.rs:20-39`
+- `engine/nasty-engine/src/router/audit.rs:13-49`
+- `engine/nasty-engine/src/registry/methods.rs:1324-1341`
 
 ### `apps.fix_volume_perms` can recursively chown broad host paths
 
