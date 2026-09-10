@@ -894,14 +894,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "share.nfs.list",
-                    desc: "List all NFS shares.",
+                    desc: "List NFS shares visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<NfsShare>>(generator)),
                 },
                 Method {
                     name: "share.nfs.get",
-                    desc: "Get an NFS share by ID.",
+                    desc: "Get an NFS share by ID when it is visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Unique share identifier.")),
                     result: Some(gen_schema::<NfsShare>(generator)),
@@ -934,14 +934,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "share.smb.list",
-                    desc: "List all SMB shares.",
+                    desc: "List SMB shares visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<SmbShare>>(generator)),
                 },
                 Method {
                     name: "share.smb.get",
-                    desc: "Get an SMB share by ID.",
+                    desc: "Get an SMB share by ID when it is visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Unique share identifier.")),
                     result: Some(gen_schema::<SmbShare>(generator)),
@@ -974,14 +974,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "share.iscsi.list",
-                    desc: "List all iSCSI targets.",
+                    desc: "List iSCSI targets whose complete backing storage is visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<IscsiTarget>>(generator)),
                 },
                 Method {
                     name: "share.iscsi.get",
-                    desc: "Get an iSCSI target by ID.",
+                    desc: "Get an iSCSI target by ID when all of its backing storage is visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Unique share identifier.")),
                     result: Some(gen_schema::<IscsiTarget>(generator)),
@@ -1063,14 +1063,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "share.nvmeof.list",
-                    desc: "List all NVMe-oF subsystems.",
+                    desc: "List NVMe-oF subsystems whose complete backing storage is visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<NvmeofSubsystem>>(generator)),
                 },
                 Method {
                     name: "share.nvmeof.get",
-                    desc: "Get an NVMe-oF subsystem by ID.",
+                    desc: "Get an NVMe-oF subsystem by ID when all of its backing storage is visible to the current credential scope.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Unique share identifier.")),
                     result: Some(gen_schema::<NvmeofSubsystem>(generator)),
