@@ -316,7 +316,7 @@
 				{
 					term: 'Audit Log',
 					summary: 'Append-only record of every action operators take on the box.',
-					detail: 'Lives at /var/lib/nasty/audit.log (mode 0600) and is mirrored to journald with target "audit", so tampering with the file still leaves a trail. Every state-changing RPC the engine accepts is recorded with the username, client IP, method name, and a safelist-filtered parameter summary (secrets like passwords / API tokens / TLS DNS credentials never make it in). Logged in addition to mutations: every login attempt (success and failure), permission denials, terminal / VM-console / log-stream opens, and unsafe app deploys — anything an auditor would want to reconstruct after the fact. Read it via the audit.list RPC or the Logs page in the WebUI; rotated by logrotate at 10 MB.',
+					detail: 'Lives at /var/lib/nasty/audit.log (mode 0600) and is mirrored to journald with target "audit", so tampering with the file still leaves a trail. Every state-changing RPC the engine accepts is recorded with the username, client IP, method name, and a safelist-filtered parameter summary (secrets like passwords / API tokens / TLS DNS credentials never make it in). Logged in addition to mutations: every login attempt (success and failure), permission denials, terminal / VM-console / log-stream opens, and unsafe app deploys — anything an auditor would want to reconstruct after the fact. Unscoped administrators can read the global history via the audit.list RPC or the Logs page; other users can read their own activity via audit.mine. Rotated by logrotate at 10 MB.',
 				},
 				{
 					term: 'WebAuthn / Passkey / Security Key',

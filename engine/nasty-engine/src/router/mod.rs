@@ -257,6 +257,9 @@ fn is_read_only(method: &str) -> bool {
             | "apps.inspect"
             | "apps.compose.get"
             | "notifications.config.get"
+            // Global audit records contain other users' identities, client
+            // addresses, denied operations, and mutation details.
+            | "audit.list"
     ) {
         return false;
     }
@@ -321,7 +324,6 @@ fn is_read_only(method: &str) -> bool {
                 | "system.version.tagged_release_notice"
                 | "system.log.level"
                 | "system.settings.timezones"
-                | "audit.list"
                 | "audit.mine"
                 | "apps.check_ports"
                 | "apps.check_devices"
@@ -527,7 +529,7 @@ async fn route(req: &Request, state: &AppState, session: &Session) -> Response {
         .unwrap_or(req.method.as_str());
     let resp = match prefix {
         "auth" => auth::try_route(req, state, session).await,
-        "audit" => audit::try_route(req, state, session).await,
+        "audit" => audit::try_route(req, session).await,
         "alert" | "telemetry" => alerts::try_route(req, state, session).await,
         "notifications" => notifications::try_route(req, session).await,
         "backup" => backup::try_route(req, state, session).await,
@@ -630,6 +632,22 @@ pub(super) fn require_root_equivalent(
         crate::auth::EndpointAccess::RootEquivalent,
         reason,
         true,
+    )
+}
+
+/// Gate a sensitive read as root-equivalent without emitting the mutation-style
+/// success preflight event. The dispatcher audits the successful RPC once.
+pub(super) fn require_root_equivalent_read(
+    req: &Request,
+    session: &Session,
+    reason: &str,
+) -> Option<Response> {
+    require_endpoint_access(
+        req,
+        session,
+        crate::auth::EndpointAccess::RootEquivalent,
+        reason,
+        false,
     )
 }
 

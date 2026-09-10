@@ -1322,8 +1322,8 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "audit.list",
-                    desc: "Return the most recent audit-log entries (default 200, capped by `limit`), parsed line-by-line in reverse chronological order. Entry shape depends on the action being audited.",
-                    role: MethodRole::Any,
+                    desc: "Return the most recent global audit-log entries (default 200, capped by `limit`), parsed line-by-line in reverse chronological order. Requires an unscoped Admin because records include other users' identities, client addresses, denied operations, and mutation details.",
+                    role: MethodRole::Admin,
                     params: MethodParams::AdHoc(serde_json::json!({
                         "type": "object",
                         "properties": {
