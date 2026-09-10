@@ -237,14 +237,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "system.status",
-                    desc: "Aggregated system status for the sidebar band (#528): one level (healthy / activity / critical), a headline, the in-progress array operations (device evacuation, scrub, reconcile), and active alert counts. Cached ~10s.",
+                    desc: "Aggregated system status for the sidebar band (#528): one level (healthy / activity / critical), a headline, the in-progress array operations (device evacuation, scrub, reconcile), and active alert counts. Cached ~10s. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<SystemStatus>(generator)),
                 },
                 Method {
                     name: "system.operations.list",
-                    desc: "List controllable data operations across mounted filesystems for the Operations panel (#553): per-pool scrubs (start when idle, cancel when running), device evacuations (cancel while draining, with an idle acknowledgement when none run), and the pausable background jobs reconcile and copygc, each with the action the UI can take.",
+                    desc: "List controllable data operations across mounted filesystems for the Operations panel (#553): per-pool scrubs (start when idle, cancel when running), device evacuations (cancel while draining, with an idle acknowledgement when none run), and the pausable background jobs reconcile and copygc, each with the action the UI can take. Filesystem-scoped sessions see only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<Operation>>(generator)),
@@ -272,7 +272,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "system.alerts",
-                    desc: "Evaluate alert rules against current system state and return any active alerts.",
+                    desc: "Evaluate alert rules against current system state and return any active alerts. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<AlertOccurrence>>(generator)),
@@ -470,7 +470,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "alert.acknowledge",
-                    desc: "Acknowledge one active alert occurrence until its condition resolves.",
+                    desc: "Acknowledge one active alert occurrence until its condition resolves. Requires an unscoped session.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "instance_id",
@@ -480,28 +480,28 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "alert.rules.list",
-                    desc: "List all alert rules.",
+                    desc: "List all alert rules. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<AlertRule>>(generator)),
                 },
                 Method {
                     name: "alert.rules.create",
-                    desc: "Create a new alert rule.",
+                    desc: "Create a new alert rule. Requires an unscoped session.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<AlertRule>(generator)),
                     result: Some(gen_schema::<AlertRule>(generator)),
                 },
                 Method {
                     name: "alert.rules.update",
-                    desc: "Update an existing alert rule. Only provided fields are changed.",
+                    desc: "Update an existing alert rule. Only provided fields are changed. Requires an unscoped session.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<AlertRuleUpdate>(generator)),
                     result: Some(gen_schema::<AlertRule>(generator)),
                 },
                 Method {
                     name: "alert.rules.delete",
-                    desc: "Delete an alert rule by ID.",
+                    desc: "Delete an alert rule by ID. Requires an unscoped session.",
                     role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Unique rule identifier.")),
                     result: None,
@@ -513,7 +513,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "device.list",
-                    desc: "List all block devices and partitions visible to the system.",
+                    desc: "List all block devices and partitions visible to the system. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<BlockDevice>>(generator)),
@@ -549,21 +549,21 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "fs.list",
-                    desc: "List all filesystems. Filesystem-scoped tokens see only their assigned filesystem.",
+                    desc: "List all filesystems. Filesystem-scoped sessions see only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<Filesystem>>(generator)),
                 },
                 Method {
                     name: "fs.unavailable.list",
-                    desc: "List UUID-bound host registrations whose filesystem is not currently visible. Filesystem-scoped tokens see only their assigned filesystem.",
+                    desc: "List UUID-bound host registrations whose filesystem is not currently visible. Filesystem-scoped sessions see only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<UnavailableFilesystem>>(generator)),
                 },
                 Method {
                     name: "fs.get",
-                    desc: "Get a single filesystem by name.",
+                    desc: "Get a single filesystem by name. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<Filesystem>(generator)),
@@ -614,7 +614,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.usage",
-                    desc: "Return detailed bcachefs `fs usage` breakdown.",
+                    desc: "Return detailed bcachefs `fs usage` breakdown. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<FsUsage>(generator)),
@@ -628,7 +628,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.scrub.status",
-                    desc: "Return current scrub status.",
+                    desc: "Return current scrub status. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<ScrubStatus>(generator)),
@@ -650,28 +650,28 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.fsck.status",
-                    desc: "Return current fsck status.",
+                    desc: "Return current fsck status. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<FsckStatus>(generator)),
                 },
                 Method {
                     name: "fs.reconcile.status",
-                    desc: "Return bcachefs background work (reconcile) status.",
+                    desc: "Return bcachefs background work (reconcile) status. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<ReconcileStatus>(generator)),
                 },
                 Method {
                     name: "bcachefs.usage",
-                    desc: "Return raw `bcachefs fs usage` output for a filesystem.",
+                    desc: "Return raw `bcachefs fs usage` output for a filesystem. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<FsUsage>(generator)),
                 },
                 Method {
                     name: "fs.tpm.status",
-                    desc: "Report TPM2 host capability and per-filesystem bind state. `tpm_available` reflects whether `/dev/tpmrm0` is present; `bound` reflects whether a sealed-key blob exists for this filesystem.",
+                    desc: "Report TPM2 host capability and per-filesystem bind state. `tpm_available` reflects whether `/dev/tpmrm0` is present; `bound` reflects whether a sealed-key blob exists for this filesystem. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<TpmBindStatus>(generator)),
@@ -2232,14 +2232,14 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "fs.dependents",
-                    desc: "Return all downstream entities (subvolumes, apps, VMs, backup jobs, NFS/SMB/iSCSI/NVMe-oF shares) that reference a given filesystem, used to preview impact before destructive operations like lock.",
+                    desc: "Return all downstream entities (subvolumes, apps, VMs, backup jobs, NFS/SMB/iSCSI/NVMe-oF shares) that reference a given filesystem, used to preview impact before destructive operations like lock. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<FsDependents>(generator)),
                 },
                 Method {
                     name: "fs.locked_dependents",
-                    desc: "Return the reverse-index of currently locked encrypted filesystems mapped to their app/VM dependents (for the WebUI's \"locked on FS\" badges).",
+                    desc: "Return the reverse-index of currently locked encrypted filesystems mapped to their app/VM dependents (for the WebUI's \"locked on FS\" badges). Filesystem-scoped sessions see only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<FsDependents>>(generator)),
@@ -2252,7 +2252,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "bcachefs.top",
-                    desc: "Capture ~2 seconds of `bcachefs fs top` output for the named filesystem via a PTY, strip ANSI/header noise, and return the last complete frame as plain text.",
+                    desc: "Capture ~2 seconds of `bcachefs fs top` output for the named filesystem via a PTY, strip ANSI/header noise, and return the last complete frame as plain text. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(
@@ -2261,7 +2261,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "bcachefs.timestats",
-                    desc: "Run `bcachefs fs timestats --json --once` against the named filesystem's mount point and return the parsed JSON (latency/duration histograms for bcachefs operations).",
+                    desc: "Run `bcachefs fs timestats --json --once` against the named filesystem's mount point and return the parsed JSON (latency/duration histograms for bcachefs operations). Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(
@@ -2276,7 +2276,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "subvolume.children",
-                    desc: "List nested child subvolume names found beneath the named parent subvolume on the given filesystem.",
+                    desc: "List nested child subvolume names found beneath the named parent subvolume on the given filesystem, filtered by the session's filesystem and owner scopes.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_two(
                         "filesystem",
@@ -2305,7 +2305,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "subvolume.list_dependents",
-                    desc: "Batched read returning the set of downstream entities (apps, VMs, backup jobs, shares of every protocol) attributed to each subvolume on the system, optionally filtered to the session's scoped filesystem.",
+                    desc: "Batched read returning the set of downstream entities (apps, VMs, backup jobs, shares of every protocol) attributed to each subvolume visible under the session's filesystem and owner scopes.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<SubvolumeDependents>>(generator)),

@@ -59,21 +59,33 @@ fn owning_subvol<'a>(paths_desc: &'a [String], target: &str) -> Option<&'a str> 
     None
 }
 
+fn owner_visible(owner: Option<&str>, owner_filter: Option<&str>) -> bool {
+    match owner_filter {
+        Some(filter) => owner == Some(filter),
+        None => true,
+    }
+}
+
 /// Walk every downstream service once, and bucket every reference into
 /// the subvolume that owns its path. Batched (rather than per-subvolume)
 /// because the Usage column wants the value for every row at once —
 /// per-subvolume would mean N × cost-of-listing-each-service round-trips
 /// per page load, where the dominant cost (apps.list = a Docker
 /// round-trip) doesn't get cheaper at finer granularity.
-pub async fn find_all_subvolume_dependents(state: &AppState) -> Vec<SubvolumeDependents> {
+pub async fn find_all_subvolume_dependents(
+    state: &AppState,
+    filesystem_filter: Option<&str>,
+    owner_filter: Option<&str>,
+) -> Vec<SubvolumeDependents> {
     let subvols = state
         .subvolumes
-        .list_all(None, None)
+        .list_all(filesystem_filter, None)
         .await
         .unwrap_or_default();
 
-    // Seed the result: one entry per known subvolume, keyed by path so
-    // attribution is a hashmap lookup, not a linear scan per service hit.
+    // Attribute against every subvolume before filtering the response. If a
+    // hidden nested subvolume were omitted here, its dependents could be
+    // incorrectly attributed to a visible ancestor.
     let mut by_path: HashMap<String, SubvolumeDependents> = HashMap::new();
     // Index of block-device → subvolume path, for the loop-backed case.
     let mut by_block_dev: HashMap<String, String> = HashMap::new();
@@ -256,6 +268,7 @@ pub async fn find_all_subvolume_dependents(state: &AppState) -> Vec<SubvolumeDep
     // by index if it ever wants to (today it joins on path/name).
     subvols
         .into_iter()
+        .filter(|subvolume| owner_visible(subvolume.owner.as_deref(), owner_filter))
         .filter_map(|sv| by_path.remove(&sv.path))
         .collect()
 }
@@ -287,6 +300,14 @@ mod tests {
             owning_subvol(&paths, "/fs/tank/media/movie.mkv"),
             Some("/fs/tank")
         );
+    }
+
+    #[test]
+    fn owner_visibility_fails_closed() {
+        assert!(owner_visible(Some("token-a"), Some("token-a")));
+        assert!(!owner_visible(Some("token-b"), Some("token-a")));
+        assert!(!owner_visible(None, Some("token-a")));
+        assert!(owner_visible(Some("token-b"), None));
     }
 
     #[test]

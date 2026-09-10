@@ -11,11 +11,31 @@ use super::*;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
+fn alert_requires_unscoped(method: &str) -> bool {
+    matches!(
+        method,
+        "system.alerts"
+            | "alert.acknowledge"
+            | "alert.rules.list"
+            | "alert.rules.create"
+            | "alert.rules.update"
+            | "alert.rules.delete"
+    )
+}
+
+fn alert_scope_access_error(method: &str, session: &Session) -> Option<&'static str> {
+    (alert_requires_unscoped(method) && (session.filesystem.is_some() || session.owner.is_some()))
+        .then_some("access denied: alert management requires unscoped credentials")
+}
+
 pub(super) async fn try_route(
     req: &Request,
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if let Some(message) = alert_scope_access_error(&req.method, session) {
+        return Some(err(req, message));
+    }
     Some(match req.method.as_str() {
         "telemetry.send" => {
             let sent = crate::telemetry::send_report(state).await;
@@ -85,4 +105,42 @@ pub(super) async fn try_route(
         },
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alert_requires_unscoped, alert_scope_access_error};
+    use crate::auth::{Role, Session};
+
+    fn session(filesystem: bool, owner: bool) -> Session {
+        Session {
+            token: "token".into(),
+            username: "user".into(),
+            role: Role::ReadOnly,
+            file_principal: None,
+            filesystem: filesystem.then(|| "tank".into()),
+            owner: owner.then(|| "token-a".into()),
+            created_at: 0,
+            must_change_password: false,
+            client_ip: None,
+        }
+    }
+
+    #[test]
+    fn global_alert_reads_and_mutations_require_unscoped_credentials() {
+        for method in [
+            "system.alerts",
+            "alert.acknowledge",
+            "alert.rules.list",
+            "alert.rules.create",
+            "alert.rules.update",
+            "alert.rules.delete",
+        ] {
+            assert!(alert_requires_unscoped(method), "{method}");
+            assert!(alert_scope_access_error(method, &session(true, false)).is_some());
+            assert!(alert_scope_access_error(method, &session(false, true)).is_some());
+            assert!(alert_scope_access_error(method, &session(false, false)).is_none());
+        }
+        assert!(!alert_requires_unscoped("telemetry.send"));
+    }
 }

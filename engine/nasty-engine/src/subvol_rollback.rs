@@ -55,7 +55,7 @@ pub async fn rollback_with_dependents(
     }
 
     let subvol_path = sv.path.clone();
-    let deps = find_all_subvolume_dependents(state)
+    let deps = find_all_subvolume_dependents(state, None, None)
         .await
         .into_iter()
         .find(|d| d.filesystem == req.filesystem && d.name == req.subvolume)

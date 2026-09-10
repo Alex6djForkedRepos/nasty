@@ -61,6 +61,29 @@ fn filesystem_scope_denied(scope: Option<&str>, requested: Option<&str>) -> bool
     matches!((scope, requested), (Some(scope), Some(requested)) if requested != scope)
 }
 
+fn owner_scoped_fs_read(method: &str) -> bool {
+    matches!(
+        method,
+        "fs.list"
+            | "fs.unavailable.list"
+            | "fs.get"
+            | "fs.dependents"
+            | "fs.locked_dependents"
+            | "fs.usage"
+            | "fs.scrub.status"
+            | "fs.fsck.status"
+            | "fs.reconcile.status"
+            | "fs.tpm.status"
+    )
+}
+
+fn scoped_inventory_access_error(method: &str, session: &Session) -> Option<&'static str> {
+    let scoped = session.filesystem.is_some() || session.owner.is_some();
+    ((method == "device.list" && scoped)
+        || (session.owner.is_some() && owner_scoped_fs_read(method)))
+    .then_some("access denied: scoped credentials cannot read global storage inventory")
+}
+
 async fn require_block_share_recovery_access(
     req: &Request,
     state: &AppState,
@@ -89,6 +112,9 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if let Some(message) = scoped_inventory_access_error(&req.method, session) {
+        return Some(err(req, message));
+    }
     if requires_root_equivalent(&req.method)
         && let Some(response) = require_root_equivalent(req, session, "global_storage_mutation")
     {
@@ -280,10 +306,13 @@ pub(super) async fn try_route(
             ),
             Err(r) => r,
         },
-        "fs.locked_dependents" => ok(
-            req,
-            crate::fs_dependents::find_locked_dependents(state).await,
-        ),
+        "fs.locked_dependents" => {
+            let mut dependents = crate::fs_dependents::find_locked_dependents(state).await;
+            if let Some(filesystem) = session.filesystem.as_deref() {
+                dependents.retain(|entry| entry.filesystem == filesystem);
+            }
+            ok(req, dependents)
+        }
         "fs.key.export" => match require_str(req, "name") {
             Ok(name) => match state.filesystems.export_key(name).await {
                 Ok(key) => ok(req, key),
@@ -647,7 +676,25 @@ pub(crate) async fn reconcile_block_shares_under_lock(state: &AppState) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{filesystem_param, filesystem_scope_denied, requires_root_equivalent};
+    use super::{
+        filesystem_param, filesystem_scope_denied, owner_scoped_fs_read, requires_root_equivalent,
+        scoped_inventory_access_error,
+    };
+    use crate::auth::{Role, Session};
+
+    fn session(filesystem: bool, owner: bool) -> Session {
+        Session {
+            token: "token".into(),
+            username: "user".into(),
+            role: Role::ReadOnly,
+            file_principal: None,
+            filesystem: filesystem.then(|| "tank".into()),
+            owner: owner.then(|| "token-a".into()),
+            created_at: 0,
+            must_change_password: false,
+            client_ip: None,
+        }
+    }
 
     #[test]
     fn filesystem_operations_identify_and_enforce_their_scope_parameter() {
@@ -671,5 +718,36 @@ mod tests {
             assert!(requires_root_equivalent(method), "{method}");
         }
         assert!(!requires_root_equivalent("fs.destroy"));
+    }
+
+    #[test]
+    fn storage_inventory_reads_fail_closed_when_the_scope_cannot_be_applied() {
+        let unscoped = session(false, false);
+        let filesystem_scoped = session(true, false);
+        let owner_scoped = session(false, true);
+
+        assert!(scoped_inventory_access_error("fs.list", &unscoped).is_none());
+        assert!(scoped_inventory_access_error("fs.list", &filesystem_scoped).is_none());
+        for method in [
+            "fs.list",
+            "fs.unavailable.list",
+            "fs.get",
+            "fs.dependents",
+            "fs.locked_dependents",
+            "fs.usage",
+            "fs.scrub.status",
+            "fs.fsck.status",
+            "fs.reconcile.status",
+            "fs.tpm.status",
+        ] {
+            assert!(owner_scoped_fs_read(method), "{method}");
+            assert!(
+                scoped_inventory_access_error(method, &owner_scoped).is_some(),
+                "{method}"
+            );
+        }
+        assert!(!owner_scoped_fs_read("fs.create"));
+        assert!(scoped_inventory_access_error("device.list", &filesystem_scoped).is_some());
+        assert!(scoped_inventory_access_error("device.list", &owner_scoped).is_some());
     }
 }
