@@ -194,12 +194,14 @@ The method is `Any`; `audit.mine` already provides a self-scoped alternative.
 
 ### `apps.fix_volume_perms` can recursively chown broad host paths
 
-The method accepts absolute paths outside `/fs` except for a small denylist. A
-scoped Admin can therefore modify ownership outside its assigned filesystem.
+Status: fixed by requiring an unscoped Admin before parsing the request. The
+service also requires an existing canonical non-symlink target and invokes
+`chown` with no-dereference and preserve-root safeguards.
 
-- `engine/nasty-engine/src/router/apps.rs:267-273`
-- `engine/nasty-apps/src/lib.rs:772-826`
-- `engine/nasty-apps/src/lib.rs:5253-5294`
+- `engine/nasty-engine/src/router/apps.rs:22-26`
+- `engine/nasty-engine/src/router/apps.rs:122-129`
+- `engine/nasty-apps/src/lib.rs:839-868`
+- `engine/nasty-apps/src/lib.rs:5294-5324`
 
 ### `firmware.check` is not a pure read
 

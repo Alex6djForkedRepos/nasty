@@ -774,28 +774,38 @@ fn fs_root_is_mounted(path: &str) -> bool {
 /// admin-policy violations the user can't fix from the wizard — the
 /// volume-warning code skips them silently because surfacing them
 /// would just be noise.
-fn validate_chown_target_security(host_path: &str) -> Result<(), AppsError> {
-    if host_path.contains("..") {
-        return Err(AppsError::ForbiddenBind(format!(
-            "'{host_path}' contains '..'"
-        )));
-    }
-    if host_path == "/" {
-        return Err(AppsError::ForbiddenBind(
-            "host root '/' is never allowed".to_string(),
-        ));
-    }
-    if host_path == "/var/lib/nasty" || host_path.starts_with("/var/lib/nasty/") {
-        return Err(AppsError::ForbiddenBind(format!(
-            "'{host_path}' targets engine state"
-        )));
-    }
-    if !host_path.starts_with('/') {
+fn validate_chown_target_security(host_path: &str) -> Result<PathBuf, AppsError> {
+    let path = Path::new(host_path);
+    if !path.is_absolute() {
         return Err(AppsError::ForbiddenBind(format!(
             "'{host_path}' is not absolute"
         )));
     }
-    Ok(())
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(AppsError::ForbiddenBind(format!(
+            "'{host_path}' contains '..'"
+        )));
+    }
+    let normalized: PathBuf = path.components().collect();
+    if normalized == Path::new("/") {
+        return Err(AppsError::ForbiddenBind(
+            "host root '/' is never allowed".to_string(),
+        ));
+    }
+    if normalized == Path::new("/fs") {
+        return Err(AppsError::ForbiddenBind(
+            "filesystem root '/fs' is never allowed".to_string(),
+        ));
+    }
+    if normalized.starts_with("/var/lib/nasty") {
+        return Err(AppsError::ForbiddenBind(format!(
+            "'{host_path}' targets engine state"
+        )));
+    }
+    Ok(normalized)
 }
 
 /// Filesystem-existence half of the bind validator: a path of the
@@ -820,10 +830,42 @@ fn validate_fs_root_mounted(host_path: &str) -> Result<(), AppsError> {
 
 /// Full bind validator used by `fix_volume_perms` and the
 /// pre-create step. Combines the security and FS-mounted checks.
-fn validate_chown_target(host_path: &str) -> Result<(), AppsError> {
-    validate_chown_target_security(host_path)?;
-    validate_fs_root_mounted(host_path)?;
-    Ok(())
+fn validate_chown_target(host_path: &str) -> Result<PathBuf, AppsError> {
+    let normalized = validate_chown_target_security(host_path)?;
+    validate_fs_root_mounted(&normalized.to_string_lossy())?;
+    Ok(normalized)
+}
+
+fn existing_chown_target(host_path: &str) -> Result<PathBuf, AppsError> {
+    let normalized = validate_chown_target(host_path)?;
+    let metadata = std::fs::symlink_metadata(&normalized)
+        .map_err(|error| AppsError::CommandFailed(format!("stat({host_path}): {error}")))?;
+    if metadata.file_type().is_symlink() {
+        return Err(AppsError::ForbiddenBind(format!(
+            "'{host_path}' is a symbolic link"
+        )));
+    }
+    let canonical = std::fs::canonicalize(&normalized)
+        .map_err(|error| AppsError::CommandFailed(format!("canonicalize({host_path}): {error}")))?;
+    validate_chown_target(&canonical.to_string_lossy())?;
+    Ok(canonical)
+}
+
+fn chown_args(owner: &str, target: &Path, recursive: bool) -> Vec<String> {
+    let mut args = vec!["-h".to_string()];
+    if recursive {
+        args.extend([
+            "-R".to_string(),
+            "-P".to_string(),
+            "--preserve-root".to_string(),
+        ]);
+    }
+    args.extend([
+        "--".to_string(),
+        owner.to_string(),
+        target.to_string_lossy().into_owned(),
+    ]);
+    args
 }
 
 /// Parse a Docker image `User` field (e.g. `1000`, `1000:1000`, `nonroot`,
@@ -2405,9 +2447,8 @@ pub struct VolumeMismatch {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FixVolumePermsRequest {
-    /// Host bind-mount source to chown. Validated against the same
-    /// forbidden-bind rules as compose deploys (no `..`, no `/`, no
-    /// engine state).
+    /// Existing, non-symlink host bind-mount source to chown. Validated against
+    /// the same forbidden-bind rules as compose deploys.
     pub host_path: String,
     pub uid: u32,
     pub gid: u32,
@@ -5173,11 +5214,12 @@ impl AppsService {
             // skip those. Filesystem-missing failures (`/fs/<X>/…`
             // where `<X>` isn't mounted) ARE user-fixable and get
             // surfaced as a distinct mismatch below.
-            if validate_chown_target_security(&bind.host_path).is_err() {
-                continue;
-            }
+            let normalized = match validate_chown_target_security(&bind.host_path) {
+                Ok(path) => path,
+                Err(_) => continue,
+            };
             let line = find_line(&req.compose, &bind.host_path);
-            if validate_fs_root_mounted(&bind.host_path).is_err() {
+            if validate_fs_root_mounted(&normalized.to_string_lossy()).is_err() {
                 // Don't even stat() — the path's prefix is invalid and
                 // would normally turn into a rootfs mkdir at deploy
                 // time. Flag it as filesystem_missing so the WebUI
@@ -5197,7 +5239,13 @@ impl AppsService {
                 });
                 continue;
             }
-            match tokio::fs::metadata(&bind.host_path).await {
+            if tokio::fs::symlink_metadata(&normalized)
+                .await
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                continue;
+            }
+            match tokio::fs::metadata(&normalized).await {
                 Ok(md) => {
                     let cur_uid = md.uid();
                     let cur_gid = md.gid();
@@ -5250,31 +5298,18 @@ impl AppsService {
         out
     }
 
-    /// Chown a bind-mount source to (uid, gid). Optionally recursive.
-    /// Path is validated against the same forbidden-bind rules as the
-    /// deploy pipeline, so a malicious WebUI session can't wipe `/etc`
-    /// ownership through this entrypoint.
+    /// Chown an existing bind-mount source to (uid, gid). Optionally recursive.
+    /// The RPC layer limits this root-equivalent operation to unscoped Admins;
+    /// this service additionally canonicalizes the target and refuses symlinks.
     pub async fn fix_volume_perms(&self, req: FixVolumePermsRequest) -> Result<(), AppsError> {
-        validate_chown_target(&req.host_path)?;
-        // If the target doesn't exist, create it. Mode 0o755 mirrors
-        // what `mkdir -p` produces; the chown below sets ownership.
-        if tokio::fs::metadata(&req.host_path).await.is_err() {
-            tokio::fs::create_dir_all(&req.host_path)
-                .await
-                .map_err(|e| {
-                    AppsError::CommandFailed(format!("create_dir_all({}): {e}", req.host_path))
-                })?;
-        }
+        let target = existing_chown_target(&req.host_path)?;
         let owner = format!("{}:{}", req.uid, req.gid);
         let mut cmd = if req.recursive {
             nasty_common::priority::bulk_command("chown")
         } else {
             Command::new("chown")
         };
-        if req.recursive {
-            cmd.arg("-R");
-        }
-        cmd.arg(&owner).arg(&req.host_path);
+        cmd.args(chown_args(&owner, &target, req.recursive));
         let output = cmd
             .output()
             .await
@@ -5283,13 +5318,15 @@ impl AppsService {
             return Err(AppsError::CommandFailed(format!(
                 "chown {} {}: {}",
                 owner,
-                req.host_path,
+                target.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
         info!(
             "Chowned {} to {} (recursive={})",
-            req.host_path, owner, req.recursive
+            target.display(),
+            owner,
+            req.recursive
         );
         Ok(())
     }
@@ -6963,7 +7000,7 @@ mod tests {
         render_startup_override, validate_app_name, validate_new_app_name,
         validate_new_app_request, validate_simple_volumes, validate_volume_name,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     #[tokio::test]
@@ -7515,9 +7552,9 @@ services:
     }
 
     use super::{
-        AppsService, CheckComposeRequest, CheckDevicesRequest, CheckVolumesRequest,
-        extract_compose_binds, extract_line_number, parse_compose_diagnostics,
-        validate_chown_target,
+        AppsService, CheckComposeRequest, CheckDevicesRequest, CheckVolumesRequest, chown_args,
+        existing_chown_target, extract_compose_binds, extract_line_number,
+        parse_compose_diagnostics, validate_chown_target,
     };
 
     #[tokio::test]
@@ -7684,8 +7721,13 @@ services:
     fn validate_chown_target_rejects_dangerous_paths() {
         for bad in [
             "/",
+            "//",
+            "/./",
+            "/fs",
+            "/fs/",
             "/etc/../passwd",
             "/var/lib/nasty",
+            "/var//lib/nasty",
             "/var/lib/nasty/auth.json",
             "relative/path",
         ] {
@@ -7707,6 +7749,44 @@ services:
                 "expected accept for {ok}"
             );
         }
+    }
+
+    #[test]
+    fn existing_chown_target_requires_a_real_non_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("data");
+        std::fs::create_dir(&target).unwrap();
+        assert_eq!(
+            existing_chown_target(target.to_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&target).unwrap()
+        );
+
+        let link = temp.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert!(existing_chown_target(link.to_str().unwrap()).is_err());
+        assert!(existing_chown_target(temp.path().join("missing").to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn chown_arguments_do_not_dereference_or_cross_symlinks() {
+        assert_eq!(
+            chown_args("1000:1000", Path::new("/appdata/example"), false),
+            ["-h", "--", "1000:1000", "/appdata/example"]
+        );
+        assert_eq!(
+            chown_args("1000:1000", Path::new("/appdata/example"), true),
+            [
+                "-h",
+                "-R",
+                "-P",
+                "--preserve-root",
+                "--",
+                "1000:1000",
+                "/appdata/example",
+            ]
+        );
     }
 
     #[test]
@@ -7877,6 +7957,29 @@ services:
         assert!(!r[0].exists);
         assert!(!r[0].filesystem_missing);
         assert_eq!(r[0].expected_uid, 3001);
+    }
+
+    #[tokio::test]
+    async fn check_volumes_does_not_offer_repairs_for_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let link = temp.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let svc = AppsService::new();
+        for host_path in [link.display().to_string(), format!("{}/.", link.display())] {
+            let mismatches = svc
+                .check_volumes(CheckVolumesRequest {
+                    compose: format!(
+                        "services:\n  app:\n    image: foo\n    user: \"4294967294:4294967294\"\n    volumes:\n      - {host_path}:/data\n"
+                    ),
+                })
+                .await;
+            assert!(mismatches.is_empty(), "got {mismatches:?}");
+        }
     }
 
     #[tokio::test]
