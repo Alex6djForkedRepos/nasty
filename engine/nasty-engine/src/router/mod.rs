@@ -390,7 +390,15 @@ fn audit_detail(request: &Request) -> String {
     };
 
     // Try common identifier fields in order of specificity
-    for key in ["name", "username", "filesystem", "target", "id", "path"] {
+    for key in [
+        "name",
+        "username",
+        "filesystem",
+        "target",
+        "id",
+        "path",
+        "host_path",
+    ] {
         if let Some(val) = params.get(key).and_then(|v| v.as_str()) {
             return val.to_string();
         }
@@ -1892,10 +1900,22 @@ pub(super) async fn read_bcachefs_error_count(uuid: &str) -> (u64, bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlertCoverage, ReconcileProgress, ReconcileProgressSample, clear_reconcile_tracker,
-        is_operator_allowed, is_read_only, is_universally_allowed, is_user_allowed,
-        reconcile_progress, reconcile_stall_check_at,
+        AlertCoverage, ReconcileProgress, ReconcileProgressSample, audit_detail,
+        clear_reconcile_tracker, is_operator_allowed, is_read_only, is_universally_allowed,
+        is_user_allowed, reconcile_progress, reconcile_stall_check_at,
     };
+
+    #[test]
+    fn audit_detail_includes_host_path_mutations() {
+        let request: nasty_common::Request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "apps.fix_volume_perms",
+            "params": {"host_path": "/appdata/example", "uid": 1000, "gid": 1000}
+        }))
+        .unwrap();
+        assert_eq!(audit_detail(&request), "/appdata/example");
+    }
 
     fn smart_attribute_alert(source: &str) -> nasty_system::alerts::ActiveAlert {
         nasty_system::alerts::ActiveAlert {

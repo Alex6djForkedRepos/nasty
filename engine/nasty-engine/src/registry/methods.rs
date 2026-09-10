@@ -3103,7 +3103,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "apps.fix_volume_perms",
-                    desc: "Chown a host bind-mount source path to the given uid/gid (optionally recursively), enforcing the same forbidden-bind validation as compose deploys.",
+                    desc: "Chown an existing, non-symlink host bind-mount source path to the given uid/gid (optionally recursively), enforcing the same forbidden-bind validation as compose deploys. Requires an unscoped Admin session.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<FixVolumePermsRequest>(generator)),
                     result: Some(serde_json::json!({

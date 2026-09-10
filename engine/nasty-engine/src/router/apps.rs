@@ -19,6 +19,12 @@ fn app_requires_admin(app: &nasty_apps::App) -> bool {
     app.kind == "compose" || app.unsafe_mode || app.network.as_deref() == Some("host")
 }
 
+fn preflight_access_error(req: &Request, session: &Session) -> Option<Response> {
+    (req.method == "apps.fix_volume_perms")
+        .then(|| require_root_equivalent(req, session, "host_volume_ownership_change"))
+        .flatten()
+}
+
 async fn existing_app_requires_admin(state: &AppState, name: &str) -> Result<bool, String> {
     let app = state
         .apps
@@ -118,6 +124,9 @@ pub(super) async fn try_route(
     state: &AppState,
     session: &Session,
 ) -> Option<Response> {
+    if let Some(response) = preflight_access_error(req, session) {
+        return Some(response);
+    }
     let response = match req.method.as_str() {
         "apps.status" => ok(req, state.apps.status().await),
         "apps.enable" => {
@@ -770,5 +779,42 @@ mod tests {
         assert!(app_requires_admin(&existing_app(serde_json::json!({
             "network": "host"
         }))));
+    }
+
+    #[test]
+    fn volume_permission_repair_requires_root_equivalent_access() {
+        fn session(role: Role, filesystem: bool, owner: bool) -> Session {
+            Session {
+                token: "token".into(),
+                username: "user".into(),
+                role,
+                file_principal: None,
+                filesystem: filesystem.then(|| "tank".into()),
+                owner: owner.then(|| "token-a".into()),
+                created_at: 0,
+                must_change_password: false,
+                client_ip: None,
+            }
+        }
+
+        let malformed: Request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "apps.fix_volume_perms",
+            "params": "not an object"
+        }))
+        .unwrap();
+        assert!(preflight_access_error(&malformed, &session(Role::Admin, false, false)).is_none());
+        assert!(preflight_access_error(&malformed, &session(Role::Admin, true, false)).is_some());
+        assert!(preflight_access_error(&malformed, &session(Role::Admin, false, true)).is_some());
+        assert!(
+            preflight_access_error(&malformed, &session(Role::Operator, false, false)).is_some()
+        );
+
+        let unrelated = Request {
+            method: "apps.check_volumes".into(),
+            ..malformed
+        };
+        assert!(preflight_access_error(&unrelated, &session(Role::Admin, true, true)).is_none());
     }
 }
