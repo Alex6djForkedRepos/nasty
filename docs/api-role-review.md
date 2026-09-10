@@ -156,6 +156,10 @@ credentials and before changing the global REST server storage path.
 
 ### Scoped reads return global resource inventories
 
+Status: partially fixed by filtering all NFS, SMB, iSCSI, and NVMe-oF list/get
+responses against filesystem and owner scope. Backup and residual filesystem
+inventory reads remain open.
+
 Share `list`/`get`, backup profile/snapshot/job reads, and several filesystem
 status/dependency methods do not consistently filter filesystem or owner scope.
 

@@ -182,6 +182,150 @@ fn path_source_matches_scope(
     containing_matches && nested_matches
 }
 
+type PathScopeCandidate = (std::path::PathBuf, String, Option<String>);
+type BlockScopeCandidate = (BlockVolumeId, String, Option<String>);
+
+struct ShareScopeInventory {
+    paths: Vec<PathScopeCandidate>,
+    blocks: Vec<BlockScopeCandidate>,
+    filesystem: Option<String>,
+    owner: Option<String>,
+}
+
+impl ShareScopeInventory {
+    async fn load(state: &AppState, session: &Session) -> Result<Self, String> {
+        let subvolumes = state
+            .subvolumes
+            .list_all(None, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut paths = Vec::with_capacity(subvolumes.len());
+        let mut blocks = Vec::new();
+        for subvolume in subvolumes {
+            let filesystem = subvolume.filesystem;
+            let owner = subvolume.owner;
+            if subvolume.subvolume_type == nasty_storage::subvolume::SubvolumeType::Block
+                && let Some(identity) = subvolume.block_volume_id
+            {
+                blocks.push((identity, filesystem.clone(), owner.clone()));
+            }
+            let path = tokio::fs::canonicalize(subvolume.path)
+                .await
+                .map_err(|_| "share scope inventory unavailable".to_string())?;
+            paths.push((path, filesystem, owner));
+        }
+        Ok(Self {
+            paths,
+            blocks,
+            filesystem: session.filesystem.clone(),
+            owner: session.owner.clone(),
+        })
+    }
+
+    async fn path_matches(&self, requested: &str) -> bool {
+        let Ok(canonical) = tokio::fs::canonicalize(requested).await else {
+            return false;
+        };
+        path_source_matches_scope(
+            &canonical,
+            &self.paths,
+            self.filesystem.as_deref(),
+            self.owner.as_deref(),
+        )
+    }
+
+    async fn fileio_matches(&self, requested: &str) -> bool {
+        let Ok(canonical) = canonical_fileio_source(requested).await else {
+            return false;
+        };
+        canonical.starts_with("/fs")
+            && path_source_matches_scope(
+                &canonical,
+                &self.paths,
+                self.filesystem.as_deref(),
+                self.owner.as_deref(),
+            )
+    }
+
+    fn block_matches(&self, identity: &BlockVolumeId) -> bool {
+        block_volume_matches_scope(
+            identity,
+            &self.blocks,
+            self.filesystem.as_deref(),
+            self.owner.as_deref(),
+        )
+    }
+
+    async fn iscsi_target_matches(&self, target: &nasty_sharing::iscsi::IscsiTarget) -> bool {
+        if target.luns.is_empty() {
+            return false;
+        }
+        for lun in &target.luns {
+            let matches = match lun.backstore_type.as_str() {
+                "block" => {
+                    !lun.backing_volume_unresolved
+                        && lun
+                            .backing_volume
+                            .as_ref()
+                            .is_some_and(|identity| self.block_matches(identity))
+                }
+                "fileio" => self.fileio_matches(&lun.backstore_path).await,
+                _ => false,
+            };
+            if !matches {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn nvmeof_subsystem_matches(&self, subsystem: &nasty_sharing::nvmeof::NvmeofSubsystem) -> bool {
+        !subsystem.namespaces.is_empty()
+            && subsystem.namespaces.iter().all(|namespace| {
+                !namespace.backing_volume_unresolved
+                    && namespace
+                        .backing_volume
+                        .as_ref()
+                        .is_some_and(|identity| self.block_matches(identity))
+            })
+    }
+}
+
+fn block_volume_matches_scope(
+    identity: &BlockVolumeId,
+    candidates: &[BlockScopeCandidate],
+    filesystem_filter: Option<&str>,
+    owner_filter: Option<&str>,
+) -> bool {
+    let mut matches = candidates
+        .iter()
+        .filter(|(candidate, _, _)| candidate == identity);
+    let Some((_, filesystem, owner)) = matches.next() else {
+        return false;
+    };
+    matches.next().is_none()
+        && resource_matches_scope(
+            filesystem,
+            owner.as_deref(),
+            filesystem_filter,
+            owner_filter,
+        )
+}
+
+fn is_scoped_share_read(method: &str) -> bool {
+    matches!(
+        method,
+        "share.nfs.list"
+            | "share.nfs.get"
+            | "share.smb.list"
+            | "share.smb.get"
+            | "share.iscsi.list"
+            | "share.iscsi.get"
+            | "share.nvmeof.list"
+            | "share.nvmeof.get"
+    )
+}
+
 pub(super) async fn authorize_path_source(
     state: &AppState,
     session: &Session,
@@ -516,6 +660,19 @@ async fn quiesce_nvmeof_after_failed_repair(state: &AppState) -> Option<String> 
 }
 
 async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Option<Response> {
+    let scope = if session_is_scoped(session) && is_scoped_share_read(&req.method) {
+        if req.method.ends_with(".get")
+            && let Err(response) = require_str(req, "id")
+        {
+            return Some(response);
+        }
+        match ShareScopeInventory::load(state, session).await {
+            Ok(scope) => Some(scope),
+            Err(error) => return Some(err(req, error)),
+        }
+    } else {
+        None
+    };
     let is_block_share_mutation = (req.method.starts_with("share.iscsi.")
         || req.method.starts_with("share.nvmeof."))
         && !req.method.ends_with(".list")
@@ -528,12 +685,30 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
 
     Some(match req.method.as_str() {
         "share.nfs.list" => match state.nfs.list().await {
-            Ok(v) => ok(req, v),
+            Ok(shares) => {
+                let Some(scope) = scope.as_ref() else {
+                    return Some(ok(req, shares));
+                };
+                let mut visible = Vec::with_capacity(shares.len());
+                for share in shares {
+                    if scope.path_matches(&share.path).await {
+                        visible.push(share);
+                    }
+                }
+                ok(req, visible)
+            }
             Err(e) => err(req, e),
         },
         "share.nfs.get" => match require_str(req, "id") {
             Ok(id) => match state.nfs.get(id).await {
-                Ok(v) => ok(req, v),
+                Ok(share) => {
+                    if let Some(scope) = scope.as_ref()
+                        && !scope.path_matches(&share.path).await
+                    {
+                        return Some(err(req, "access denied"));
+                    }
+                    ok(req, share)
+                }
                 Err(e) => err(req, e),
             },
             Err(r) => r,
@@ -605,12 +780,30 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
         }
         "share.smb.list" => match state.smb.list().await {
-            Ok(v) => ok(req, v),
+            Ok(shares) => {
+                let Some(scope) = scope.as_ref() else {
+                    return Some(ok(req, shares));
+                };
+                let mut visible = Vec::with_capacity(shares.len());
+                for share in shares {
+                    if scope.path_matches(&share.path).await {
+                        visible.push(share);
+                    }
+                }
+                ok(req, visible)
+            }
             Err(e) => err(req, e),
         },
         "share.smb.get" => match require_str(req, "id") {
             Ok(id) => match state.smb.get(id).await {
-                Ok(v) => ok(req, v),
+                Ok(share) => {
+                    if let Some(scope) = scope.as_ref()
+                        && !scope.path_matches(&share.path).await
+                    {
+                        return Some(err(req, "access denied"));
+                    }
+                    ok(req, share)
+                }
                 Err(e) => err(req, e),
             },
             Err(r) => r,
@@ -707,12 +900,34 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
         }
         "share.iscsi.list" => match state.iscsi.list().await {
-            Ok(v) => ok(req, v),
+            Ok(targets) => {
+                let Some(scope) = scope.as_ref() else {
+                    return Some(ok(req, targets));
+                };
+                let mut visible = Vec::with_capacity(targets.len());
+                for target in targets {
+                    if scope.iscsi_target_matches(&target).await {
+                        visible.push(target);
+                    }
+                }
+                ok(req, visible)
+            }
             Err(e) => err(req, e),
         },
         "share.iscsi.get" => match require_str(req, "id") {
             Ok(id) => match state.iscsi.get(id).await {
-                Ok(v) => ok(req, v),
+                Ok(target) => {
+                    if let Some(scope) = scope.as_ref()
+                        && !scope.iscsi_target_matches(&target).await
+                    {
+                        return Some(block_authorization_error(
+                            req,
+                            session,
+                            "access denied".to_string(),
+                        ));
+                    }
+                    ok(req, target)
+                }
                 Err(e) => err(req, e),
             },
             Err(r) => r,
@@ -1052,12 +1267,28 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
         }
         "share.nvmeof.list" => match state.nvmeof.list().await {
-            Ok(v) => ok(req, v),
+            Ok(mut subsystems) => {
+                if let Some(scope) = scope.as_ref() {
+                    subsystems.retain(|subsystem| scope.nvmeof_subsystem_matches(subsystem));
+                }
+                ok(req, subsystems)
+            }
             Err(e) => err(req, e),
         },
         "share.nvmeof.get" => match require_str(req, "id") {
             Ok(id) => match state.nvmeof.get(id).await {
-                Ok(v) => ok(req, v),
+                Ok(subsystem) => {
+                    if let Some(scope) = scope.as_ref()
+                        && !scope.nvmeof_subsystem_matches(&subsystem)
+                    {
+                        return Some(block_authorization_error(
+                            req,
+                            session,
+                            "access denied".to_string(),
+                        ));
+                    }
+                    ok(req, subsystem)
+                }
                 Err(e) => err(req, e),
             },
             Err(r) => r,
@@ -1396,6 +1627,78 @@ mod tests {
         )
     }
 
+    fn block_id(filesystem_uuid: &str, subvolume_id: u32) -> BlockVolumeId {
+        BlockVolumeId {
+            filesystem_uuid: filesystem_uuid.to_string(),
+            subvolume_id,
+        }
+    }
+
+    fn block_candidate(
+        identity: BlockVolumeId,
+        filesystem: &str,
+        owner: Option<&str>,
+    ) -> BlockScopeCandidate {
+        (identity, filesystem.to_string(), owner.map(str::to_string))
+    }
+
+    fn scope(blocks: Vec<BlockScopeCandidate>) -> ShareScopeInventory {
+        ShareScopeInventory {
+            paths: Vec::new(),
+            blocks,
+            filesystem: Some("first".to_string()),
+            owner: Some("token-a".to_string()),
+        }
+    }
+
+    fn block_lun(identity: Option<BlockVolumeId>) -> nasty_sharing::iscsi::Lun {
+        nasty_sharing::iscsi::Lun {
+            lun_id: 0,
+            backstore_path: "/dev/loop0".to_string(),
+            backstore_name: "lun0".to_string(),
+            backstore_type: "block".to_string(),
+            size_bytes: None,
+            backing_volume: identity,
+            backing_volume_unresolved: false,
+        }
+    }
+
+    fn iscsi_target(luns: Vec<nasty_sharing::iscsi::Lun>) -> nasty_sharing::iscsi::IscsiTarget {
+        nasty_sharing::iscsi::IscsiTarget {
+            id: "target".to_string(),
+            iqn: "iqn.2137-04.storage.nasty:target".to_string(),
+            alias: None,
+            portals: Vec::new(),
+            luns,
+            acls: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    fn namespace(identity: Option<BlockVolumeId>) -> nasty_sharing::nvmeof::Namespace {
+        nasty_sharing::nvmeof::Namespace {
+            nsid: 1,
+            device_path: "/dev/loop0".to_string(),
+            enabled: true,
+            backing_volume: identity,
+            backing_volume_unresolved: false,
+        }
+    }
+
+    fn nvmeof_subsystem(
+        namespaces: Vec<nasty_sharing::nvmeof::Namespace>,
+    ) -> nasty_sharing::nvmeof::NvmeofSubsystem {
+        nasty_sharing::nvmeof::NvmeofSubsystem {
+            id: "subsystem".to_string(),
+            nqn: "nqn.2137-04.storage.nasty:subsystem".to_string(),
+            namespaces,
+            ports: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allow_any_host: false,
+            enabled: true,
+        }
+    }
+
     fn session(role: Role, filesystem: Option<&str>, owner: Option<&str>) -> Session {
         Session {
             token: "token".to_string(),
@@ -1556,5 +1859,133 @@ mod tests {
             Some("token-a"),
         ));
         assert!(resource_matches_scope("first", None, Some("first"), None));
+    }
+
+    #[test]
+    fn scoped_share_read_policy_covers_every_list_and_get_method() {
+        for method in [
+            "share.nfs.list",
+            "share.nfs.get",
+            "share.smb.list",
+            "share.smb.get",
+            "share.iscsi.list",
+            "share.iscsi.get",
+            "share.nvmeof.list",
+            "share.nvmeof.get",
+        ] {
+            assert!(is_scoped_share_read(method), "{method}");
+        }
+        assert!(!is_scoped_share_read("share.nfs.create"));
+    }
+
+    #[test]
+    fn block_scope_requires_one_authoritative_matching_identity() {
+        let owned = block_id("uuid-first", 1);
+        let foreign = block_id("uuid-second", 2);
+        let candidates = vec![
+            block_candidate(owned.clone(), "first", Some("token-a")),
+            block_candidate(foreign.clone(), "second", Some("token-b")),
+        ];
+
+        assert!(block_volume_matches_scope(
+            &owned,
+            &candidates,
+            Some("first"),
+            Some("token-a")
+        ));
+        assert!(!block_volume_matches_scope(
+            &foreign,
+            &candidates,
+            Some("first"),
+            Some("token-a")
+        ));
+        assert!(!block_volume_matches_scope(
+            &block_id("missing", 3),
+            &candidates,
+            Some("first"),
+            Some("token-a")
+        ));
+
+        let duplicates = vec![
+            block_candidate(owned.clone(), "first", Some("token-a")),
+            block_candidate(owned.clone(), "first", Some("token-a")),
+        ];
+        assert!(!block_volume_matches_scope(
+            &owned,
+            &duplicates,
+            Some("first"),
+            Some("token-a")
+        ));
+    }
+
+    #[tokio::test]
+    async fn iscsi_reads_require_every_backing_resource_in_scope() {
+        let owned = block_id("uuid-first", 1);
+        let foreign = block_id("uuid-second", 2);
+        let scope = scope(vec![
+            block_candidate(owned.clone(), "first", Some("token-a")),
+            block_candidate(foreign.clone(), "second", Some("token-b")),
+        ]);
+
+        assert!(
+            scope
+                .iscsi_target_matches(&iscsi_target(vec![block_lun(Some(owned.clone()))]))
+                .await
+        );
+        assert!(
+            !scope
+                .iscsi_target_matches(&iscsi_target(vec![
+                    block_lun(Some(owned)),
+                    block_lun(Some(foreign)),
+                ]))
+                .await
+        );
+        assert!(!scope.iscsi_target_matches(&iscsi_target(Vec::new())).await);
+        assert!(
+            !scope
+                .iscsi_target_matches(&iscsi_target(vec![block_lun(None)]))
+                .await
+        );
+
+        let mut unresolved = block_lun(Some(block_id("uuid-first", 1)));
+        unresolved.backing_volume_unresolved = true;
+        assert!(
+            !scope
+                .iscsi_target_matches(&iscsi_target(vec![unresolved]))
+                .await
+        );
+
+        let mut unmanaged_fileio = block_lun(None);
+        unmanaged_fileio.backstore_type = "fileio".to_string();
+        unmanaged_fileio.backstore_path = "/outside-scope.img".to_string();
+        assert!(
+            !scope
+                .iscsi_target_matches(&iscsi_target(vec![unmanaged_fileio]))
+                .await
+        );
+    }
+
+    #[test]
+    fn nvmeof_reads_require_every_namespace_in_scope() {
+        let owned = block_id("uuid-first", 1);
+        let foreign = block_id("uuid-second", 2);
+        let scope = scope(vec![
+            block_candidate(owned.clone(), "first", Some("token-a")),
+            block_candidate(foreign.clone(), "second", Some("token-b")),
+        ]);
+
+        assert!(
+            scope.nvmeof_subsystem_matches(&nvmeof_subsystem(vec![namespace(Some(owned.clone()))]))
+        );
+        assert!(!scope.nvmeof_subsystem_matches(&nvmeof_subsystem(vec![
+            namespace(Some(owned)),
+            namespace(Some(foreign)),
+        ])));
+        assert!(!scope.nvmeof_subsystem_matches(&nvmeof_subsystem(Vec::new())));
+        assert!(!scope.nvmeof_subsystem_matches(&nvmeof_subsystem(vec![namespace(None)])));
+
+        let mut unresolved = namespace(Some(block_id("uuid-first", 1)));
+        unresolved.backing_volume_unresolved = true;
+        assert!(!scope.nvmeof_subsystem_matches(&nvmeof_subsystem(vec![unresolved])));
     }
 }
