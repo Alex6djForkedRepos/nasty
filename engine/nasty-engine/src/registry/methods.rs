@@ -2617,28 +2617,28 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "backup.status",
-                    desc: "Report whether any backup is currently running and which profile id it belongs to.",
+                    desc: "Report whether any backup is currently running and which profile id it belongs to. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<BackupStatus>(generator)),
                 },
                 Method {
                     name: "backup.profile.list",
-                    desc: "Return all configured backup profiles.",
+                    desc: "Return all configured backup profiles. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<BackupProfile>>(generator)),
                 },
                 Method {
                     name: "backup.schedule.list",
-                    desc: "Return enabled backup schedules with their next nominal UTC cron occurrence.",
+                    desc: "Return enabled backup schedules with their next nominal UTC cron occurrence. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<BackupScheduleEntry>>(generator)),
                 },
                 Method {
                     name: "backup.profile.get",
-                    desc: "Return a single backup profile by id.",
+                    desc: "Return a single backup profile by id. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Backup profile identifier.")),
                     result: Some(gen_schema::<BackupProfile>(generator)),
@@ -2673,7 +2673,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "backup.snapshots",
-                    desc: "List all snapshots stored in the profile's repository (id, time, hostname, paths, tags).",
+                    desc: "List all snapshots stored in the profile's repository (id, time, hostname, paths, tags). Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("id", "Backup profile identifier.")),
                     result: Some(gen_schema::<Vec<BackupSnapshot>>(generator)),
@@ -2710,7 +2710,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "backup.jobs.list",
-                    desc: "List active and recently-finished backup jobs (init / run / check), newest first. Optional `profile_id` filter narrows the list to one profile. Terminal jobs are GC'd one hour after they finish, so this returns a bounded window rather than full history.",
+                    desc: "List active and recently-finished backup jobs (init / run / check), newest first. Optional `profile_id` filter narrows the list to one profile. Terminal jobs are GC'd one hour after they finish, so this returns a bounded window rather than full history. Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(serde_json::json!({
                         "type": "object",
@@ -2725,7 +2725,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "backup.jobs.get",
-                    desc: "Return one backup job by id. 404-equivalent error when the id is unknown (job never existed or was GC'd after its retention window).",
+                    desc: "Return one backup job by id. 404-equivalent error when the id is unknown (job never existed or was GC'd after its retention window). Requires an unscoped session.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "id",

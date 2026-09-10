@@ -156,19 +156,24 @@ credentials and before changing the global REST server storage path.
 
 ### Scoped reads return global resource inventories
 
-Status: partially fixed by filtering all NFS, SMB, iSCSI, and NVMe-oF list/get
-responses against filesystem and owner scope. Backup and residual filesystem
-inventory reads remain open.
+Status: partially fixed. NFS, SMB, iSCSI, and NVMe-oF list/get responses are
+filtered by filesystem and owner scope, and direct profile-derived backup RPCs
+require an unscoped session. Residual filesystem and alert-derived inventory
+reads remain open.
 
-Share `list`/`get`, backup profile/snapshot/job reads, and several filesystem
-status/dependency methods do not consistently filter filesystem or owner scope.
+Share `list`/`get` and direct backup profile/snapshot/job reads now enforce
+scope. Several filesystem status/dependency methods and global alerts/status do
+not consistently filter filesystem or owner scope; backup alerts can include
+profile identifiers, names, timestamps, and errors.
 
 - `engine/nasty-engine/src/router/share.rs:530-539`
 - `engine/nasty-engine/src/router/share.rs:607-616`
 - `engine/nasty-engine/src/router/share.rs:709-718`
 - `engine/nasty-engine/src/router/share.rs:1054-1063`
-- `engine/nasty-engine/src/router/backup.rs:68-75`
-- `engine/nasty-engine/src/router/backup.rs:116-189`
+- `engine/nasty-engine/src/router/backup.rs:27-44`
+- `engine/nasty-engine/src/router/backup.rs:81-88`
+- `engine/nasty-engine/src/router/alerts.rs:24-49`
+- `engine/nasty-engine/src/router/system.rs:982-1058`
 
 ### Notification webhook credentials are incompletely redacted
 
