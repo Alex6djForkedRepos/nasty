@@ -2326,7 +2326,7 @@ in {
           "github.com/caddy-dns/desec@v1.1.0"
           "github.com/caddy-dns/rfc2136@v1.0.0"
         ];
-        hash = "sha256-Lw+YLl09LkIznrrRXNx7KpwIahLbAt1hyUtpnKN4SaE=";
+        hash = "sha256-4iF976LfeFS3xmRmLUG9lfPnYkWc2tY5XyGaB32FYoM=";
       };
       globalConfig = ''
         # auto_https stays ON so Caddy generates the per-hostname
