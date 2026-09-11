@@ -116,6 +116,7 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "share.iscsi.remove_acl"
                 | "share.iscsi.add_portal"
                 | "share.iscsi.remove_portal"
+                | "share.iscsi.set_portals"
                 | "share.nvmeof.create"
                 | "share.nvmeof.delete"
                 | "share.nvmeof.add_namespace"
@@ -2276,6 +2277,18 @@ mod tests {
             assert!(!is_read_only(method));
             assert!(!is_universally_allowed(method));
             assert!(!is_operator_allowed(method));
+        }
+    }
+
+    #[test]
+    fn iscsi_portal_mutations_are_operator_allowed() {
+        for method in [
+            "share.iscsi.add_portal",
+            "share.iscsi.remove_portal",
+            "share.iscsi.set_portals",
+        ] {
+            assert!(!is_read_only(method));
+            assert!(is_operator_allowed(method));
         }
     }
 
