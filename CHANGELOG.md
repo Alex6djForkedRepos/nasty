@@ -329,10 +329,10 @@
 - The Help & Community page links to `r/NAStyProject` (#714).
 - Linux moves from 6.18.38 to **6.18.40** across three weekly nixpkgs updates
   (#672, #693, #705).
-- `diskwatch` moves from 0.1.2 to **0.1.5**, adding independent-filesystem
-  attribution fixes and runtime-selectable themes (#669, #706).
-- `nasty-top` moves from 0.0.8 to **0.0.9**, fixing bcachefs 1.38.8 by-UUID
-  discovery and hardening monitoring (#673). bcachefs remains at 1.38.8.
+- `diskwatch` moves from 0.1.2 to **0.5.2**, adding runtime-selectable themes,
+  configurable Hot Files roots, and process attribution for active writers.
+- `nasty-top` moves from 0.0.8 to **0.0.10**, adding bcachefs cache-memory,
+  per-device queue, target-capacity, and garbage-collection pressure metrics.
 
 ### Upgrading
 

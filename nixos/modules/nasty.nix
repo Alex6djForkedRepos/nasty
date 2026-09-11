@@ -782,12 +782,12 @@ in {
         nastyTopSrc = pkgs.fetchFromGitHub {
           owner = "nasty-project";
           repo = "nasty-top";
-          rev = "v0.0.9";
-          hash = "sha256-Qm2e1pk7cgcIPxL60A2bmYPbaniQGvuOEc/8OpWpXYQ=";
+          rev = "v0.0.10";
+          hash = "sha256-yZIYTDJdua6LD3tzXq4lY9Y+O7qiC/Oosim/8LweanA=";
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "nasty-top";
-        version = "0.0.9";
+        version = "0.0.10";
         src = nastyTopSrc;
         # Vendor via Cargo.lock instead of a separate cargoHash so a
         # `cargo update` in nasty-top doesn't silently break this build.
@@ -810,12 +810,12 @@ in {
         diskwatchSrc = pkgs.fetchFromGitHub {
           owner = "matthart1983";
           repo = "diskwatch";
-          rev = "v0.4.0";
-          hash = "sha256-pKo4zXyoX2OiOIwirCdzQuuFW1dMye/AA4MNVYgki3A=";
+          rev = "v0.5.2";
+          hash = "sha256-aebepClhjC5Gnw9Ct+z04XX0bcDRytk2Z88BeA0lE8Y=";
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "diskwatch";
-        version = "0.4.0";
+        version = "0.5.2";
         src = diskwatchSrc;
         cargoLock.lockFile = "${diskwatchSrc}/Cargo.lock";
         meta.mainProgram = "diskwatch";

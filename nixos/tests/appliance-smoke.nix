@@ -404,7 +404,7 @@ pkgs.testers.runNixOSTest {
 
     machine.start()
 
-    machine.succeed("diskwatch --version | grep -Fq '0.4.0'")
+    machine.succeed("diskwatch --version | grep -Fq '0.5.2'")
     machine.succeed("netwatch --version | grep -Fq '0.29.2'")
     machine.succeed("syswatch --version | grep -Fq '0.10.0'")
 
