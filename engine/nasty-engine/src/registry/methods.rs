@@ -2122,8 +2122,8 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "firmware.check",
-                    desc: "Refresh LVFS metadata via `fwupdmgr refresh` then return the device list with `update_available`/`update_version`/`update_description` populated for devices with pending updates.",
-                    role: MethodRole::Any,
+                    desc: "Refresh host-wide LVFS metadata via `fwupdmgr refresh` then return pending firmware updates. Requires an unscoped Admin session.",
+                    role: MethodRole::Admin,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<FirmwareDevice>>(generator)),
                 },
