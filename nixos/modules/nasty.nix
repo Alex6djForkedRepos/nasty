@@ -779,15 +779,20 @@ in {
       rustic             # deduplicating encrypted backups (restic-compatible)
       restic-rest-server # REST API server for receiving backups from other machines
       (let
-        nastyTopSrc = pkgs.fetchFromGitHub {
-          owner = "nasty-project";
-          repo = "nasty-top";
-          rev = "v0.0.10";
-          hash = "sha256-yZIYTDJdua6LD3tzXq4lY9Y+O7qiC/Oosim/8LweanA=";
+        nastyTopSrc = pkgs.applyPatches {
+          name = "nasty-top-0.0.11-source";
+          src = pkgs.fetchFromGitHub {
+            owner = "nasty-project";
+            repo = "nasty-top";
+            rev = "v0.0.11";
+            hash = "sha256-rF2R55TVMcw/jsz+Oe4jBUjFFp72CbxeA98/ijvQZOo=";
+          };
+          # The v0.0.11 tag was published with 0.0.10 in both manifests.
+          patches = [ ../nasty-top-0.0.11-version.patch ];
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "nasty-top";
-        version = "0.0.10";
+        version = "0.0.11";
         src = nastyTopSrc;
         # Vendor via Cargo.lock instead of a separate cargoHash so a
         # `cargo update` in nasty-top doesn't silently break this build.
