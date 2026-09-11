@@ -7,9 +7,9 @@ Date: 2026-09-07
 Static review of all 329 methods registered in
 `engine/nasty-engine/src/registry/methods.rs`:
 
-- 123 `Any`
+- 125 `Any`
 - 80 `Operator`
-- 126 `Admin`
+- 124 `Admin`
 
 The registry declarations match the central dispatcher. The findings below are
 semantic authorization problems that the registry/dispatcher consistency tests
@@ -228,8 +228,9 @@ inventory.
 - Status: fixed. `share.iscsi.set_portals` is now Operator-level like the
   equivalent add/remove operations; existing target-scope, raw-backing, and
   iSER authorization checks still apply.
-- `system.network.pending` and `system.network.nm_preview` are pure reads but
-  Admin-only: `engine/nasty-engine/src/registry/methods.rs:1935-1953`.
+- Status: fixed. `system.network.pending` and `system.network.nm_preview` are
+  management-role reads, including for scoped credentials; standard `User`
+  accounts remain deny-by-default.
 
 ## Additional API Defects
 

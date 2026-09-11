@@ -1933,8 +1933,8 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "system.network.pending",
-                    desc: "Return the list of network-update transactions still awaiting confirm-or-rollback. (Admin-only by current role-gate even though it's a read.)",
-                    role: MethodRole::Admin,
+                    desc: "Return the list of network-update transactions still awaiting confirm-or-rollback.",
+                    role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<NetworkPendingTxn>>(generator)),
                 },
@@ -1947,8 +1947,8 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "system.network.nm_preview",
-                    desc: "Compute the diff between desired NetworkManager profiles and NM's current state without applying.",
-                    role: MethodRole::Admin,
+                    desc: "Compute the diff between desired NetworkManager profiles and NM's current state without applying or persisting changes.",
+                    role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<NmDiff>(generator)),
                 },
