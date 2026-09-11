@@ -280,6 +280,8 @@ fn is_read_only(method: &str) -> bool {
                 | "system.stats"
                 | "system.disks"
                 | "system.network.get"
+                | "system.network.pending"
+                | "system.network.nm_preview"
                 | "system.logs.units"
                 | "system.ssh.status"
                 | "system.alerts"
@@ -2149,6 +2151,8 @@ mod tests {
             "auth.list_users",
             "fs.list",
             "share.smb.list",
+            "system.network.pending",
+            "system.network.nm_preview",
             "new.feature.list",
             "auth.token.create",
             "auth.webauthn.reset_for_user",
@@ -2168,6 +2172,26 @@ mod tests {
     #[test]
     fn fs_tpm_status_is_read_only() {
         assert!(is_read_only("fs.tpm.status"));
+    }
+
+    #[test]
+    fn network_inspection_methods_are_management_reads() {
+        for method in ["system.network.pending", "system.network.nm_preview"] {
+            assert!(is_read_only(method));
+            assert!(is_universally_allowed(method));
+            assert!(is_operator_allowed(method));
+            assert!(!is_user_allowed(method));
+        }
+
+        for method in [
+            "system.network.update",
+            "system.network.confirm",
+            "system.network.nm_apply",
+        ] {
+            assert!(!is_read_only(method));
+            assert!(!is_operator_allowed(method));
+            assert!(!is_user_allowed(method));
+        }
     }
 
     /// Every status endpoint in the codebase is a pure read.
