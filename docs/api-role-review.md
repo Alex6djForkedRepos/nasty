@@ -7,9 +7,9 @@ Date: 2026-09-07
 Static review of all 329 methods registered in
 `engine/nasty-engine/src/registry/methods.rs`:
 
-- 126 `Any`
+- 125 `Any`
 - 79 `Operator`
-- 124 `Admin`
+- 125 `Admin`
 
 The registry declarations match the central dispatcher. The findings below are
 semantic authorization problems that the registry/dispatcher consistency tests
@@ -216,10 +216,12 @@ service also requires an existing canonical non-symlink target and invokes
 
 ### `firmware.check` is not a pure read
 
-The `Any` method forces a host-wide LVFS metadata refresh before returning
-available updates.
+Status: fixed by requiring an unscoped Admin for the host-wide LVFS metadata
+refresh. Other management roles retain access to the pure `firmware.devices`
+inventory.
 
 - `engine/nasty-system/src/firmware.rs:133-174`
+- `engine/nasty-engine/src/router/system.rs:803-820`
 
 ## Over-Restricted
 

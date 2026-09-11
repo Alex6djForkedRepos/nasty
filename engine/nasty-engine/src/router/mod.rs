@@ -343,7 +343,6 @@ fn is_read_only(method: &str) -> bool {
                 | "vm.images.import_info"
                 | "firmware.available"
                 | "firmware.constraints"
-                | "firmware.check"
                 | "firmware.devices"
                 | "apps.inspect_image"
                 | "apps.caddy.routes"
@@ -2272,10 +2271,12 @@ mod tests {
     }
 
     #[test]
-    fn firmware_flash_is_admin_only() {
-        assert!(!is_read_only("firmware.update"));
-        assert!(!is_universally_allowed("firmware.update"));
-        assert!(!is_operator_allowed("firmware.update"));
+    fn firmware_mutations_are_admin_only() {
+        for method in ["firmware.check", "firmware.update"] {
+            assert!(!is_read_only(method));
+            assert!(!is_universally_allowed(method));
+            assert!(!is_operator_allowed(method));
+        }
     }
 
     /// The .list / .get suffix matches that existed before this

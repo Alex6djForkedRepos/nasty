@@ -803,7 +803,14 @@ pub(super) async fn try_route(
         "firmware.available" => ok(req, state.firmware.is_available().await),
         "firmware.constraints" => ok(req, state.firmware.constraints().await),
         "firmware.devices" => ok(req, state.firmware.list_devices().await),
-        "firmware.check" => ok(req, state.firmware.check_updates().await),
+        "firmware.check" => {
+            if let Some(response) =
+                require_root_equivalent(req, session, "firmware_metadata_refresh")
+            {
+                return Some(response);
+            }
+            ok(req, state.firmware.check_updates().await)
+        }
         "firmware.update" => {
             if let Some(response) = require_root_equivalent(req, session, "firmware_flash") {
                 return Some(response);

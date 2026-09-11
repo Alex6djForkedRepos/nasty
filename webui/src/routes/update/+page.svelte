@@ -675,7 +675,9 @@
 			firmwareAvailable = await client.call<boolean>('firmware.available');
 			if (firmwareAvailable) {
 				const [devices, constraints] = await Promise.all([
-					client.call<FirmwareDevice[]>('firmware.check'),
+					canFlashFirmware
+						? client.call<FirmwareDevice[]>('firmware.check')
+						: client.call<FirmwareDevice[]>('firmware.devices'),
 					client.call<FirmwareConstraints>('firmware.constraints'),
 				]);
 				firmwareDevices = devices;
