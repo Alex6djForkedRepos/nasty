@@ -331,8 +331,9 @@
   (#672, #693, #705).
 - `diskwatch` moves from 0.1.2 to **0.5.2**, adding runtime-selectable themes,
   configurable Hot Files roots, and process attribution for active writers.
-- `nasty-top` moves from 0.0.8 to **0.0.10**, adding bcachefs cache-memory,
-  per-device queue, target-capacity, and garbage-collection pressure metrics.
+- `nasty-top` moves from 0.0.8 to **0.0.11**, adding bcachefs cache-memory,
+  per-device queue, target-capacity, garbage-collection pressure, peer-latency,
+  and evidence-based advisor diagnostics.
 
 ### Upgrading
 

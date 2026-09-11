@@ -1,0 +1,25 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 043d39c..08c4a31 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "nasty-top"
+-version = "0.0.10"
++version = "0.0.11"
+ edition = "2024"
+ license = "GPL-3.0-only"
+ description = "A top-like TUI for bcachefs filesystems"
+diff --git a/Cargo.lock b/Cargo.lock
+index 508c31e..ef430f9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -801,7 +801,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "nasty-top"
+-version = "0.0.10"
++version = "0.0.11"
+ dependencies = [
+  "clap",
+  "crossterm",
