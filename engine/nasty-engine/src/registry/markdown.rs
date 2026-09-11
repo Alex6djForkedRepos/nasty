@@ -39,6 +39,7 @@ pub fn render_markdown(groups: &[(&str, Vec<Method>)]) -> String {
     out.push_str("| `operator` | Day-to-day storage, sharing, app, and VM operations without Admin-only system or root-equivalent access |\n");
     out.push_str("| `readonly` | Non-privileged read-only API access |\n");
     out.push_str("| `user` | Self-service account methods and authorized file-portal access |\n\n");
+    out.push_str("The method role label `any` means any authenticated management role (`admin`, `operator`, or `readonly`). It does not include the standard `user` role, whose API access is separately allowlisted.\n\n");
     out.push_str(
         "API tokens can additionally be scoped to a single **filesystem** (restricts visibility) ",
     );

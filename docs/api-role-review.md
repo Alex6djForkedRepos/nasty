@@ -234,10 +234,12 @@ inventory.
 
 ## Additional API Defects
 
-- `apps.compose.get` is documented as returning a string but returns a
-  `ComposeContent` object containing `compose_file` and `env_file`.
-- `MethodRole::Any` says "any authenticated user", but most such methods are
-  unavailable to `Role::User`, which has a separate explicit allowlist.
+- Status: fixed. `apps.compose.get` is registered and documented as returning
+  the `ComposeContent` object containing `compose_file` and `env_file`, with a
+  registry regression test covering that schema contract.
+- Status: fixed. `MethodRole::Any` and generated API documentation now define
+  `any` as any authenticated management role (`Admin`, `Operator`, or
+  `ReadOnly`). Standard `User` API access remains a separate explicit allowlist.
 
 ## Existing Coverage
 

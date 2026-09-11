@@ -42,7 +42,7 @@ pub fn render_openapi(version: &'static str, groups: &[(&str, Vec<Method>)]) -> 
         "info": {
             "title": "NASty JSON-RPC API (REST gateway)",
             "version": version,
-            "description": "NASty's JSON-RPC API surface, exposed over a thin REST gateway.\n\nEach JSON-RPC method `foo.bar.baz` is mounted at `/api/v1/foo/bar/baz` with an HTTP verb inferred from the method's last segment (`.get`/`.list`/`.status` → GET, `.delete`/`.remove` → DELETE, `.set`/`.update` → PUT, everything else → POST).\n\nGET methods take their params as query string; everything else takes a JSON body. Authentication mirrors the WebSocket transport: send the `nasty_session` cookie or an `Authorization: Bearer <token>` header.\n\nStreaming endpoints (log_stream, terminal, vm_console, telemetry pushes, event broadcasts) stay on the WebSocket at `/ws` and are intentionally not modeled here.",
+            "description": "NASty's JSON-RPC API surface, exposed over a thin REST gateway.\n\nEach JSON-RPC method `foo.bar.baz` is mounted at `/api/v1/foo/bar/baz` with an HTTP verb inferred from the method's last segment (`.get`/`.list`/`.status` → GET, `.delete`/`.remove` → DELETE, `.set`/`.update` → PUT, everything else → POST).\n\nGET methods take their params as query string; everything else takes a JSON body. Authentication mirrors the WebSocket transport: send the `nasty_session` cookie or an `Authorization: Bearer <token>` header.\n\nThe method role label `any` means any authenticated management role (`admin`, `operator`, or `readonly`). It does not include the standard `user` role, whose API access is separately allowlisted.\n\nStreaming endpoints (log_stream, terminal, vm_console, telemetry pushes, event broadcasts) stay on the WebSocket at `/ws` and are intentionally not modeled here.",
         },
         "servers": [{"url": "/", "description": "This engine"}],
         "paths": Value::Object(paths),
@@ -84,9 +84,15 @@ fn build_operation(group: &str, m: &Method, schemas: &mut BTreeMap<String, Value
     op.insert(
         "description".into(),
         Value::String(format!(
-            "{}\n\n**Required role:** `{}`",
+            "{}\n\n**Required role:** {}",
             m.desc,
-            m.role.as_str()
+            match m.role {
+                MethodRole::Any => {
+                    "`any` management role (`admin`, `operator`, or `readonly`)"
+                }
+                MethodRole::Operator => "`operator`",
+                MethodRole::Admin => "`admin`",
+            }
         )),
     );
 
@@ -330,5 +336,17 @@ mod tests {
         assert!(doc.get("paths").unwrap().as_object().unwrap().len() > 250);
         // Every registered method maps to an existing path; sample one.
         assert!(doc.pointer("/paths/~1api~1v1~1system~1info/get").is_some());
+        assert!(
+            doc.pointer("/info/description")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("`any` means any authenticated management role")
+        );
+        assert!(
+            doc.pointer("/paths/~1api~1v1~1system~1info/get/description")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("`any` management role (`admin`, `operator`, or `readonly`)")
+        );
     }
 }
