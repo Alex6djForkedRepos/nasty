@@ -23,7 +23,8 @@ mod vm;
 use crate::AppState;
 use crate::auth::{Role, Session};
 
-/// Methods every authenticated user can call regardless of role.
+/// Methods every authenticated management role can call.
+/// Standard users are evaluated separately by `is_user_allowed`.
 /// Two categories:
 ///   1. Pure reads (`is_read_only`).
 ///   2. Mutations that only affect the caller's own session/account —

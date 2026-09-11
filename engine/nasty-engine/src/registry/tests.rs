@@ -190,6 +190,29 @@ fn registry_builds_without_panic() {
 }
 
 #[test]
+fn compose_get_result_matches_compose_content() {
+    let (_generator, groups) = super::build_full_registry();
+    let method = groups
+        .iter()
+        .flat_map(|(_, methods)| methods)
+        .find(|method| method.name == "apps.compose.get")
+        .expect("apps.compose.get must be registered");
+    let result = method
+        .result
+        .as_ref()
+        .expect("apps.compose.get must declare a result");
+
+    assert_eq!(result.get("type").and_then(|v| v.as_str()), Some("object"));
+    assert_eq!(
+        result
+            .pointer("/properties/compose_file/type")
+            .and_then(|v| v.as_str()),
+        Some("string")
+    );
+    assert!(result.pointer("/properties/env_file").is_some());
+}
+
+#[test]
 fn markdown_introduction_matches_current_transports_and_names() {
     let (_generator, groups) = super::build_full_registry();
     let rendered = render_markdown(&groups);
@@ -202,6 +225,7 @@ fn markdown_introduction_matches_current_transports_and_names() {
         "`/api/docs`",
         "`/api/openapi.json`",
         "\"event\": \"filesystem\"",
+        "The method role label `any` means any authenticated management role",
     ] {
         assert!(rendered.contains(expected), "missing `{expected}`");
     }

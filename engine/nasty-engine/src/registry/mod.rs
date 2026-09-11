@@ -34,8 +34,8 @@ pub use markdown::render_markdown;
 /// *minimum* role needed to call the method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodRole {
-    /// Any authenticated user, including ReadOnly. Pure reads + self-mutations
-    /// (logout, change own password, manage own webauthn credentials).
+    /// Any authenticated management role: Admin, Operator, or ReadOnly.
+    /// Standard User access is controlled by a separate explicit allowlist.
     Any,
     /// Operator or Admin. Subvolume/snapshot/share/vm/app management.
     Operator,
