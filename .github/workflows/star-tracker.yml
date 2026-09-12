@@ -18,4 +18,5 @@ jobs:
           github-token: ${{ secrets.STAR_TRACKER_TOKEN }}
           only-repos: '/^nasty$/'
           chart-custom-milestones: '100, 200, 300, 400'
+          chart-y-axis-side: 'right'
 
