@@ -30,6 +30,25 @@ let
   '';
   nastyFirewallBaseline = pkgs.writeText "nasty-firewall-baseline.nft" nastyFirewallBaselineText;
 
+  # Socket activation can bypass the engine's Apps restore guard. Verify that
+  # a Docker data-root symlink under /fs resolves through an actual mount, not
+  # a stale directory on the appliance root filesystem.
+  dockerStorageReady = pkgs.writeShellScript "nasty-docker-storage-ready" ''
+    if [[ ! -L /var/lib/docker ]]; then
+      exit 0
+    fi
+    target="$(${pkgs.coreutils}/bin/readlink -f -- /var/lib/docker 2>/dev/null)" || exit 1
+    case "$target" in
+      /fs/*)
+        rest="''${target#/fs/}"
+        filesystem="''${rest%%/*}"
+        [[ -n "$filesystem" ]] || exit 1
+        exec ${pkgs.util-linux}/bin/mountpoint -q -- "/fs/$filesystem"
+        ;;
+      *) exit 0 ;;
+    esac
+  '';
+
   # Secure Boot integration is opt-in per box. The wrapper flake at
   # /etc/nixos/flake.nix passes the lanzaboote input through as a
   # specialArg when it has the input declared; pre-#324-era wrappers
@@ -710,16 +729,12 @@ in {
     systemd.services.docker.wantedBy = lib.mkForce [];
     systemd.sockets.docker.wantedBy = lib.mkForce [];
 
-    # Refuse to start dockerd while its data-root symlink is *dangling*
-    # (#424). The engine symlinks /var/lib/docker onto the apps bcachefs
-    # filesystem; when that FS isn't mounted/unlocked at boot the symlink
-    # dangles, and dockerd's startup mkdir fails with "mkdir
-    # /var/lib/docker: file exists", crash-loops into start-limit-hit, and
-    # wedges the apps UI. The engine's restore() guards the path *it*
-    # drives, but docker.service is TriggeredBy=docker.socket — so a client
-    # connecting to the still-listening socket socket-activates dockerd
-    # behind the engine's back. A `Condition` (skip, not assert) covers
-    # every trigger path with no restart counter.
+    # Refuse to start dockerd while its data-root symlink is unsafe (#424).
+    # A missing filesystem usually leaves the symlink dangling, but stale
+    # directories below /fs can also make it resolve onto the root filesystem.
+    # The conditions reject dangling links; ExecCondition additionally verifies
+    # that a resolving /fs target crosses a real mount boundary. Both apply to
+    # engine starts and docker.socket activation.
     #
     # The two conditions are ORed (the `|` triggering prefix): start docker
     # iff /var/lib/docker resolves to a directory, OR is not a symlink at
@@ -731,12 +746,13 @@ in {
     # (skip) — ConditionPathExists/IsDirectory follow the link and can't.
     #
     #   absent           → IsDirectory=F, !IsSymlink=T → start (dockerd mkdirs it)
-    #   real dir / valid  → IsDirectory=T               → start
+    #   real dir / valid  → IsDirectory=T               → run ExecCondition
     #   dangling symlink → IsDirectory=F, !IsSymlink=F → skip
     systemd.services.docker.unitConfig = {
       ConditionPathIsDirectory = "|/var/lib/docker";
       ConditionPathIsSymbolicLink = "|!/var/lib/docker";
     };
+    systemd.services.docker.serviceConfig.ExecCondition = dockerStorageReady;
 
     # ── System packages ────────────────────────────────────────
 

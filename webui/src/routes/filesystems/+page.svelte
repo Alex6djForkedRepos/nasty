@@ -53,6 +53,7 @@
 	let hostTpmAvailable = $state(false);
 	let wizardStep: 0 | 1 | 2 | 3 = $state(0); // 0=hidden, 1=name+devices, 2=profile, 3=review
 	let loading = $state(true);
+	let creating = $state(false);
 
 	// Wizard state
 	let newName = $state('first');
@@ -683,10 +684,12 @@
 	});
 
 	async function createFs() {
+		if (creating) return;
 		if (!newName || selectedPaths.length === 0) return;
 		if (erasureCode && selectedPaths.length < replicas + 1) return;
 		if (encryption && (!passphrase || passphrase !== passphraseConfirm)) return;
 		const profile = activeProfile();
+		creating = true;
 		const ok = await withToast(
 			() => client.call('fs.create', {
 				name: newName,
@@ -711,9 +714,10 @@
 				encoded_extent_max: encodedExtentMax || undefined,
 				version_upgrade: versionUpgrade || undefined,
 				journal_flush_delay: journalFlushDelay ? parseInt(journalFlushDelay) : undefined,
-			}),
+			}, 300_000),
 			`Filesystem "${newName}" created`
 		);
+		creating = false;
 		if (ok !== undefined) {
 			wizardStep = 0;
 			newName = 'first';
@@ -1982,7 +1986,9 @@
 
 				<div class="flex gap-2">
 					<Button variant="secondary" size="sm" onclick={() => wizardStep = 2}>← Back</Button>
-					<Button size="sm" onclick={createFs} disabled={(erasureCode && selectedPaths.length < replicas + 1) || (encryption && (!passphrase || passphrase !== passphraseConfirm))}>Create Filesystem</Button>
+					<Button size="sm" onclick={createFs} disabled={creating || (erasureCode && selectedPaths.length < replicas + 1) || (encryption && (!passphrase || passphrase !== passphraseConfirm))}>
+						{creating ? 'Creating...' : 'Create Filesystem'}
+					</Button>
 				</div>
 			{/if}
 		</CardContent>
