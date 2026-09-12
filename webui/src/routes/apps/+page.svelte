@@ -148,6 +148,7 @@
 	let appStats = $state<Record<string, AppStats>>({});
 	let loading = $state(true);
 	let enabling = $state(false);
+	let disabling = $state(false);
 	// Inline enable prompt shown when the user clicks Install App while the
 	// runtime is disabled — keeps the empty-state apps page looking like the
 	// running page so the user doesn't see two unrelated layouts.
@@ -647,6 +648,9 @@
 
 	const client = getClient();
 	let startupPoll: ReturnType<typeof setInterval> | null = null;
+	let startupTimeout: ReturnType<typeof setTimeout> | null = null;
+	let startupPollGeneration = 0;
+	let startupTimedOut = $state(false);
 	let statsPoll: ReturnType<typeof setInterval> | null = null;
 	/** Idle poll for the apps list itself. Without this, the page only
 	 * refreshes apps.list after a user action — so a container that
@@ -918,7 +922,7 @@
 	onMount(async () => {
 		await Promise.all([refresh(), loadFilesystems(), refreshAppdataStatus()]);
 		loading = false;
-		if (status?.enabled && !status?.running) startStartupPolling();
+		if (shouldPollForStartup()) startStartupPolling();
 		if (status?.enabled && status?.running) {
 			startStatsPolling();
 			startListPolling();
@@ -987,19 +991,62 @@
 
 	function startStartupPolling() {
 		stopStartupPolling();
+		const generation = ++startupPollGeneration;
+		startupTimedOut = false;
 		startupPoll = setInterval(async () => {
-			await refresh();
-			if (status?.running) {
+			if (!await refreshStartupStatus(generation)) return;
+			if (!shouldPollForStartup()) {
 				stopStartupPolling();
-				startStatsPolling();
+				if (status?.running) {
+					startStatsPolling();
+					startListPolling();
+				}
 			}
 		}, 5000);
+		startupTimeout = setTimeout(async () => {
+			if (!await refreshStartupStatus(generation)) return;
+			if (!shouldPollForStartup()) {
+				stopStartupPolling();
+				if (status?.running) {
+					startStatsPolling();
+					startListPolling();
+				}
+				return;
+			}
+			if (startupPoll) clearInterval(startupPoll);
+			startupPoll = null;
+			startupTimeout = null;
+			startupTimedOut = true;
+		}, 60_000);
 	}
 
 	function stopStartupPolling() {
+		startupPollGeneration++;
 		if (startupPoll) {
 			clearInterval(startupPoll);
 			startupPoll = null;
+		}
+		if (startupTimeout) {
+			clearTimeout(startupTimeout);
+			startupTimeout = null;
+		}
+	}
+
+	function shouldPollForStartup(): boolean {
+		return status?.enabled === true
+			&& !status.running
+			&& (!status.storage_path || status.storage_ok);
+	}
+
+	async function refreshStartupStatus(generation: number): Promise<boolean> {
+		try {
+			const next = await client.call<AppsStatus>('apps.status');
+			if (generation !== startupPollGeneration) return false;
+			status = next;
+			if (!next.enabled || next.running) startupTimedOut = false;
+			return true;
+		} catch {
+			return generation === startupPollGeneration;
 		}
 	}
 
@@ -1056,15 +1103,21 @@
 
 	function onVisibilityChange() {
 		if (document.hidden) {
+			stopStartupPolling();
 			stopStatsPolling();
 			stopListPolling();
-		} else if (status?.enabled && status?.running) {
-			startStatsPolling();
-			startListPolling();
-			// Tab just came back — refresh once immediately so the user
-			// doesn't stare at stale data for up to 5s waiting for the
-			// next interval tick.
-			void refresh();
+		} else {
+			const generation = ++startupPollGeneration;
+			void refreshStartupStatus(generation).then((updated) => {
+				if (!updated) return;
+				if (status?.enabled && status.running) {
+					startStatsPolling();
+					startListPolling();
+					void refresh();
+				} else if (shouldPollForStartup()) {
+					startStartupPolling();
+				}
+			});
 		}
 	}
 
@@ -1081,6 +1134,7 @@
 	async function refresh() {
 		try {
 			status = await client.call<AppsStatus>('apps.status');
+			if (!status.enabled || status.running) startupTimedOut = false;
 			apps = await client.call<App[]>('apps.list');
 			if (status.enabled && status.running) {
 				await loadIngresses();
@@ -1162,7 +1216,25 @@
 		);
 		enabling = false;
 		await refresh();
-		if (status?.enabled && !status?.running) startStartupPolling();
+		if (shouldPollForStartup()) startStartupPolling();
+	}
+
+	async function disableAppsForMissingStorage() {
+		if (!await confirm(
+			'Disable Apps runtime?',
+			'This stops Docker and clears its saved storage association so the missing filesystem can be forgotten. App definitions and data on disk are not deleted.',
+		)) return;
+		disabling = true;
+		const disabled = await withToast(
+			() => client.call('apps.disable', undefined, 60_000),
+			'Apps runtime disabled',
+		);
+		disabling = false;
+		if (disabled !== undefined) {
+			stopStartupPolling();
+			startupTimedOut = false;
+			await refresh();
+		}
 	}
 
 	function addPort() {
@@ -1767,11 +1839,40 @@
 
 {#if loading}
 	<p class="text-muted-foreground">Loading...</p>
+{:else if status?.enabled && status.storage_path && !status.storage_ok}
+	<Card class="max-w-2xl border-destructive/40">
+		<CardContent class="py-8">
+			<h3 class="font-semibold text-destructive">App storage is unavailable</h3>
+			<p class="mt-2 text-sm text-muted-foreground">
+				Docker was not started because its configured storage path <code>{status.storage_path}</code> is not on a mounted filesystem.
+			</p>
+			<p class="mt-2 text-sm text-muted-foreground">
+				Reconnect and mount that filesystem to recover the apps, or disable the runtime to clear this storage association before forgetting the filesystem. Disabling does not erase app definitions or disk data.
+			</p>
+			<div class="mt-4 flex flex-wrap gap-2">
+				<Button size="sm" onclick={() => goto('/filesystems')}>Review Filesystems</Button>
+				<Button size="sm" variant="secondary" onclick={disableAppsForMissingStorage} disabled={disabling}>
+					{disabling ? 'Disabling...' : 'Disable Apps Runtime'}
+				</Button>
+			</div>
+		</CardContent>
+	</Card>
 {:else if filesystems.length === 0}
 	<div class="flex flex-col items-center justify-center py-12 text-center">
 		<p class="text-muted-foreground">Apps need a filesystem to store data.</p>
 		<Button size="sm" class="mt-2" onclick={() => goto('/filesystems?create')}>Create Filesystem</Button>
 	</div>
+{:else if status?.enabled && !status.running && startupTimedOut}
+	<Card class="max-w-2xl border-destructive/40">
+		<CardContent class="py-8 text-center">
+			<p class="font-medium text-destructive">App runtime did not start</p>
+			<p class="mt-1 text-sm text-muted-foreground">Docker did not become ready within 60 seconds. Review the service status before trying again.</p>
+			<div class="mt-4 flex justify-center gap-2">
+				<Button size="sm" onclick={startStartupPolling}>Retry Status Check</Button>
+				<Button size="sm" variant="secondary" onclick={() => goto('/services?configure=docker')}>Review Docker Service</Button>
+			</div>
+		</CardContent>
+	</Card>
 {:else if status?.enabled && !status?.running}
 	<Card class="mb-4">
 		<CardContent class="py-8 text-center">

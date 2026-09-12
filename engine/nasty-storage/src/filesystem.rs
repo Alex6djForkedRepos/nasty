@@ -1721,11 +1721,6 @@ async fn build_create_plan(
     }
 
     let mount_point = format!("{NASTY_MOUNT_BASE}/{}", req.name);
-    match tokio::fs::symlink_metadata(&mount_point).await {
-        Ok(_) => return Err(FilesystemError::AlreadyExists(req.name.clone())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(FilesystemError::Io(e)),
-    }
 
     let inventory = read_block_inventory().await?;
     let swaps = read_active_swaps(&inventory).await?;
@@ -1813,13 +1808,68 @@ async fn build_create_plan(
 
 async fn reserve_create_mount_point(plan: &CreateFilesystemPlan) -> Result<(), FilesystemError> {
     tokio::fs::create_dir_all(NASTY_MOUNT_BASE).await?;
-    match tokio::fs::create_dir(&plan.mount_point).await {
+    reserve_create_mount_point_at(&plan.mount_point, &plan.request.name).await
+}
+
+async fn reserve_create_mount_point_at(
+    mount_point: &str,
+    filesystem_name: &str,
+) -> Result<(), FilesystemError> {
+    match tokio::fs::create_dir(mount_point).await {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(FilesystemError::AlreadyExists(plan.request.name.clone()))
+            let metadata = tokio::fs::symlink_metadata(mount_point).await?;
+            if !metadata.is_dir() {
+                return Err(FilesystemError::InvalidInput(format!(
+                    "mount point {mount_point} already exists and is not a plain directory"
+                )));
+            }
+            if is_mountpoint(mount_point).await {
+                return Err(FilesystemError::InvalidInput(format!(
+                    "mount point {mount_point} is occupied"
+                )));
+            }
+
+            // Forget deliberately leaves the canonical directory in place.
+            // Reclaim it only when remove_dir proves atomically that it is
+            // empty; any raced write or operator-owned content fails closed.
+            match tokio::fs::remove_dir(mount_point).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                    return Err(FilesystemError::InvalidInput(format!(
+                        "mount point {mount_point} already exists and is not empty"
+                    )));
+                }
+                Err(error) => return Err(FilesystemError::Io(error)),
+            }
+
+            match tokio::fs::create_dir(mount_point).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(FilesystemError::AlreadyExists(filesystem_name.to_string()))
+                }
+                Err(error) => Err(FilesystemError::Io(error)),
+            }
         }
         Err(e) => Err(FilesystemError::Io(e)),
     }
+}
+
+async fn verify_create_mount_point_reserved(mount_point: &str) -> Result<(), FilesystemError> {
+    let metadata = tokio::fs::symlink_metadata(mount_point).await?;
+    if !metadata.is_dir() || is_mountpoint(mount_point).await {
+        return Err(FilesystemError::InvalidInput(format!(
+            "mount point {mount_point} changed after preflight; refusing to format devices"
+        )));
+    }
+    let mut entries = tokio::fs::read_dir(mount_point).await?;
+    if entries.next_entry().await?.is_some() {
+        return Err(FilesystemError::InvalidInput(format!(
+            "mount point {mount_point} is no longer empty; refusing to format devices"
+        )));
+    }
+    Ok(())
 }
 
 fn identity_changed(
@@ -2378,6 +2428,7 @@ impl FilesystemService {
             }
 
             info!("Mounting filesystem '{name}'...");
+            let _mutation_guard = self.block_mutations.lock().await;
             match self.mount_with_opts(name, opts).await {
                 Ok(_) => info!("Filesystem '{name}' mounted at {mount_point}"),
                 Err(e) => {
@@ -2655,6 +2706,7 @@ impl FilesystemService {
             let _ = tokio::fs::remove_dir(&mount_point).await;
             return Err(e);
         }
+        verify_create_mount_point_reserved(&mount_point).await?;
         let args = build_create_format_args(&req, &req.devices);
 
         // Format
@@ -3007,6 +3059,7 @@ impl FilesystemService {
         name: &str,
         force_degraded: bool,
     ) -> Result<Filesystem, FilesystemError> {
+        let _mutation_guard = self.block_mutations.lock().await;
         let state = load_fs_state().await;
         if state
             .get(name)
@@ -7809,6 +7862,19 @@ async fn verify_filesystem_device_identity(fs: &Filesystem) -> Result<(), Filesy
 mod tests {
     use super::*;
 
+    fn unique_tmp(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "nasty-filesystem-test-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
     fn create_request(paths: &[&str]) -> CreateFilesystemRequest {
         CreateFilesystemRequest {
             name: "tank".into(),
@@ -7839,6 +7905,57 @@ mod tests {
             version_upgrade: None,
             journal_flush_delay: None,
         }
+    }
+
+    #[tokio::test]
+    async fn create_mount_point_reclaims_only_an_empty_plain_directory() {
+        let base = unique_tmp("mount-reservation");
+        std::fs::create_dir_all(&base).unwrap();
+        let mount_point = base.join("first");
+        std::fs::create_dir(&mount_point).unwrap();
+
+        reserve_create_mount_point_at(mount_point.to_str().unwrap(), "first")
+            .await
+            .unwrap();
+        assert!(mount_point.is_dir());
+
+        let marker = mount_point.join("operator-data");
+        std::fs::write(&marker, b"keep").unwrap();
+        let error = verify_create_mount_point_reserved(mount_point.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is no longer empty"));
+        let error = reserve_create_mount_point_at(mount_point.to_str().unwrap(), "first")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not empty"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_mount_point_refuses_a_symlink() {
+        let base = unique_tmp("mount-symlink");
+        let target = base.join("target");
+        let mount_point = base.join("first");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &mount_point).unwrap();
+
+        let error = reserve_create_mount_point_at(mount_point.to_str().unwrap(), "first")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is not a plain directory"));
+        assert!(
+            mount_point
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target.is_dir());
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     fn filesystem_fixture(name: &str, uuid: &str) -> Filesystem {
