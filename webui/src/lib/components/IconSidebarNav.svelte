@@ -191,21 +191,19 @@
 		</div>
 	{:else if mode === 'full' && selectedGroup}
 		{@const GroupIcon = selectedGroup.icon}
-		<div class="mb-3 flex items-center gap-2 border-b border-border/70 pb-2">
-			<button
-				bind:this={backButton}
-				onclick={closeGroup}
-				class="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-				aria-label="Back to navigation categories"
-				title="Back to categories"
-			>
+		<button
+			bind:this={backButton}
+			onclick={closeGroup}
+			class="group mb-3 flex min-h-10 w-full items-center gap-2 border-b border-border/70 pb-2 text-left transition-colors hover:text-foreground"
+			aria-label="Back to navigation categories"
+			title="Back to categories"
+		>
+			<span class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors group-hover:bg-accent group-hover:text-foreground">
 				<ChevronLeft size={16} />
-			</button>
-			<div class="flex min-w-0 items-center gap-2">
-				<GroupIcon size={17} class="shrink-0 text-blue-400" />
-				<span class="truncate text-sm font-semibold">{selectedGroup.label}</span>
-			</div>
-		</div>
+			</span>
+			<GroupIcon size={17} class="shrink-0 text-blue-400" />
+			<span class="truncate text-sm font-semibold">{selectedGroup.label}</span>
+		</button>
 		<div class="grid grid-cols-2 gap-2">
 			{#each selectedGroup.children as child (child.id)}
 				{@const Icon = child.icon}
