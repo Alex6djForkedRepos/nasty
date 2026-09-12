@@ -60,7 +60,7 @@
   only static pending totals (#739).
 - The dashboard exposes approximate bcachefs btree-node cache usage. This is one
   component of bcachefs memory, not a total memory figure (#741).
-- The bundled bcachefs tools and DKMS module move from 1.38.8 to **1.39.2**
+- The bundled bcachefs tools and DKMS module move from 1.38.8 to **1.39.6**
   (#745, #756, #772).
 
 ### Security, authorization & privacy
