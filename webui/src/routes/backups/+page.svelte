@@ -6,7 +6,7 @@
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
 	import { formatBytes } from '$lib/format';
-	import type { BackupProfile, BackupSnapshot, BackupStatus, BackupJob, SecretsStatus, Subvolume, Filesystem, SecureBootReadinessReport } from '$lib/types';
+	import type { BackupProfile, BackupSnapshot, BackupStatus, BackupJob, BackupScheduleEntry, SecretsStatus, Subvolume, Filesystem, SecureBootReadinessReport } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Input } from '$lib/components/ui/input';
@@ -31,6 +31,7 @@
 			: []),
 	]);
 	let backupStatus: BackupStatus | null = $state(null);
+	let scheduleEntries: Record<string, BackupScheduleEntry> = $state({});
 	let viewRunLogProfile: BackupProfile | null = $state(null);
 	let runLogOutput = $state('');
 	let runLogLoading = $state(false);
@@ -63,7 +64,7 @@
 	 * backend doesn't speak TLS, so the field is irrelevant there. */
 	let newTrustedCacert = $state('');
 	let newPassword = $state('');
-	let newSchedule = $state('');
+	let newSchedule = $state('0 3 * * *');
 	let newKeepLast = $state('7');
 	let newKeepDaily = $state('7');
 	let newKeepWeekly = $state('4');
@@ -110,7 +111,7 @@
 		newB2Key = '';
 		newTrustedCacert = '';
 		newPassword = '';
-		newSchedule = '';
+		newSchedule = '0 3 * * *';
 		newKeepLast = '7';
 		newKeepDaily = '7';
 		newKeepWeekly = '4';
@@ -392,7 +393,7 @@
 			...profileWithoutPassword,
 			name: editName,
 			sources: editSources.split(',').map(s => s.trim()).filter(Boolean),
-			schedule: editSchedule || null,
+			schedule: editSchedule.trim() || null,
 			retention: {
 				keep_last: parseInt(editKeepLast) || null,
 				keep_daily: parseInt(editKeepDaily) || null,
@@ -482,14 +483,16 @@
 	async function refreshBackupState() {
 		const request = ++backupStateRequest;
 		try {
-			const [nextProfiles, nextStatus, jobs] = await Promise.all([
+			const [nextProfiles, nextStatus, jobs, schedules] = await Promise.all([
 				client.call<BackupProfile[]>('backup.profile.list'),
 				client.call<BackupStatus>('backup.status'),
 				client.call<BackupJob[]>('backup.jobs.list'),
+				client.call<BackupScheduleEntry[]>('backup.schedule.list'),
 			]);
 			if (!pageActive || request !== backupStateRequest) return;
 			profiles = nextProfiles;
 			backupStatus = nextStatus;
+			scheduleEntries = Object.fromEntries(schedules.map(entry => [entry.profile_id, entry]));
 			for (const job of jobs) {
 				if ((job.state === 'pending' || job.state === 'running') && !activeJobs[job.profile_id]) {
 					rehydrateJobPolling(job);
@@ -646,13 +649,15 @@
 	async function refresh() {
 		const request = ++backupStateRequest;
 		try {
-			const [nextProfiles, nextStatus] = await Promise.all([
+			const [nextProfiles, nextStatus, schedules] = await Promise.all([
 				client.call<BackupProfile[]>('backup.profile.list'),
 				client.call<BackupStatus>('backup.status'),
+				client.call<BackupScheduleEntry[]>('backup.schedule.list'),
 			]);
 			if (!pageActive || request !== backupStateRequest) return;
 			profiles = nextProfiles;
 			backupStatus = nextStatus;
+			scheduleEntries = Object.fromEntries(schedules.map(entry => [entry.profile_id, entry]));
 			window.dispatchEvent(new Event(RECOVERY_BACKUP_CHANGED_EVENT));
 			// Fetch snapshot counts for initialized repos
 			for (const p of profiles.filter(p => p.repo_initialized)) {
@@ -680,7 +685,7 @@
 			enabled: true,
 			sources: newSources.split(',').map(s => s.trim()).filter(Boolean),
 			target,
-			schedule: newSchedule || null,
+			schedule: newSchedule.trim() || null,
 			retention: {
 				keep_last: parseInt(newKeepLast) || null,
 				keep_daily: parseInt(newKeepDaily) || null,
@@ -695,10 +700,11 @@
 			trusted_cacert: newTrustedCacert.trim() || undefined,
 		};
 
-		await withToast(
+		const created = await withToast(
 			() => client.call('backup.profile.create', profile),
 			'Backup profile created'
 		);
+		if (created === undefined) return;
 		showCreate = false;
 		resetCreateForm();
 		await refresh();
@@ -733,58 +739,38 @@
 
 	function describeSchedule(cron: string): string {
 		const parts = cron.trim().split(/\s+/);
-		if (parts.length < 5) return cron;
+		if (parts.length !== 5) return `Cron: ${cron} (UTC)`;
 		const [min, hour, dom, mon, dow] = parts;
+		const scalar = (value: string) => /^\d+$/.test(value);
 		const time = `${hour.padStart(2, '0')}:${min.padStart(2, '0')}`;
 		const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-		if (dom === '*' && mon === '*' && dow === '*') {
-			if (hour === '*') return `Every hour at :${min.padStart(2, '0')}`;
-			return `Daily at ${time}`;
+		if (dom === '*' && mon === '*' && dow === '*' && scalar(min)) {
+			if (hour === '*') return `Every hour at :${min.padStart(2, '0')} UTC`;
+			if (!scalar(hour)) return `Cron: ${cron} (UTC)`;
+			return `Daily at ${time} UTC`;
 		}
-		if (dom === '*' && mon === '*' && dow !== '*') {
+		if (dom === '*' && mon === '*' && scalar(dow) && scalar(hour) && scalar(min)) {
 			const d = parseInt(dow);
-			return `Weekly on ${days[d] ?? dow} at ${time}`;
+			return `Weekly on ${days[d === 7 ? 0 : d] ?? dow} at ${time} UTC`;
 		}
-		if (dom !== '*' && mon === '*') return `Monthly on day ${dom} at ${time}`;
-		return cron;
+		if (scalar(dom) && mon === '*' && dow === '*' && scalar(hour) && scalar(min)) {
+			return `Monthly on day ${dom} at ${time} UTC`;
+		}
+		return `Cron: ${cron} (UTC)`;
 	}
 
-	function nextRun(cron: string): string | null {
-		const parts = cron.trim().split(/\s+/);
-		if (parts.length < 5) return null;
-		const [minS, hourS, , , dowS] = parts;
-		const now = new Date();
-		const min = parseInt(minS);
-		const hour = parseInt(hourS);
-		if (isNaN(min) || isNaN(hour)) return null;
-
-		const next = new Date(now);
-		next.setSeconds(0, 0);
-
-		if (dowS !== '*') {
-			// Weekly
-			const dow = parseInt(dowS);
-			if (!isNaN(dow)) {
-				next.setHours(hour, min);
-				while (next.getDay() !== dow || next <= now) next.setDate(next.getDate() + 1);
-				next.setHours(hour, min);
-			}
-		} else if (hourS === '*') {
-			// Hourly
-			next.setMinutes(min);
-			if (next <= now) next.setHours(next.getHours() + 1);
-		} else {
-			// Daily
-			next.setHours(hour, min);
-			if (next <= now) next.setDate(next.getDate() + 1);
-		}
-
-		const diff = next.getTime() - now.getTime();
-		const hours = Math.floor(diff / 3600000);
-		const mins = Math.floor((diff % 3600000) / 60000);
-		if (hours > 24) return `in ${Math.floor(hours / 24)}d ${hours % 24}h`;
-		if (hours > 0) return `in ${hours}h ${mins}m`;
-		return `in ${mins}m`;
+	function formatScheduleTimestamp(timestamp: string): string {
+		const date = new Date(timestamp);
+		if (Number.isNaN(date.getTime())) return timestamp;
+		return new Intl.DateTimeFormat(undefined, {
+			year: 'numeric',
+			month: '2-digit',
+			day: '2-digit',
+			hour: '2-digit',
+			minute: '2-digit',
+			timeZone: 'UTC',
+			timeZoneName: 'short',
+		}).format(date);
 	}
 
 	function targetSummary(t: BackupProfile['target']): string {
@@ -1099,7 +1085,7 @@
 				<div>
 					<Label>Schedule</Label>
 					<div class="mt-1 flex w-fit rounded-md border border-border text-xs">
-						{#each [['hourly', 'Hourly'], ['daily', 'Daily (3am)'], ['weekly', 'Weekly (Sun 2am)'], ['custom', 'Custom']] as [val, label]}
+						{#each [['hourly', 'Hourly'], ['daily', 'Daily (03:00 UTC)'], ['weekly', 'Weekly (Sun 02:00 UTC)'], ['custom', 'Custom']] as [val, label]}
 							<button onclick={() => applySchedulePreset(val as typeof schedulePreset)}
 								class="px-3 py-1.5 font-medium transition-colors first:rounded-l-md last:rounded-r-md {schedulePreset === val ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'}"
 							>{label}</button>
@@ -1107,7 +1093,7 @@
 					</div>
 					{#if schedulePreset === 'custom'}
 						<Input bind:value={newSchedule} placeholder="Leave empty for manual only" class="mt-2 max-w-md font-mono" />
-						<p class="mt-1 text-xs text-muted-foreground">Cron format: minute hour day month weekday. Empty = manual only (use "Run Now").</p>
+						<p class="mt-1 text-xs text-muted-foreground">Cron format: minute hour day month weekday, evaluated in UTC. Empty = manual only (use "Run Now").</p>
 					{:else if newSchedule}
 						<p class="mt-2 text-xs text-muted-foreground font-mono">{newSchedule}</p>
 					{/if}
@@ -1143,6 +1129,7 @@
 		<div class="space-y-3">
 			{#each profiles as profile}
 				{@const canManageProfile = canOperateBackups && (isAdmin || !profileHasSystemSources(profile))}
+				{@const profileSchedule = profile.schedule?.trim()}
 				<Card>
 					<CardContent class="pt-4 pb-4">
 						<div class="flex items-start justify-between">
@@ -1163,11 +1150,13 @@
 											</div>
 										{/if}
 									{/if}
-									{#if profile.schedule}
-										<Badge variant="outline" class="text-[0.6rem]">{describeSchedule(profile.schedule)}</Badge>
-										{@const nr = nextRun(profile.schedule)}
-										{#if nr}
-											<span class="text-[0.6rem] text-muted-foreground">Next: {nr}</span>
+									{#if profileSchedule}
+										{@const scheduleEntry = scheduleEntries[profile.id]}
+										<Badge variant="outline" class="text-[0.6rem]">{describeSchedule(profileSchedule)}</Badge>
+										{#if scheduleEntry?.next_run_at}
+											<span class="text-[0.6rem] text-muted-foreground">Next: {formatScheduleTimestamp(scheduleEntry.next_run_at)}</span>
+										{:else if scheduleEntry?.schedule_error}
+											<span class="text-[0.6rem] text-destructive">Invalid schedule</span>
 										{/if}
 									{:else}
 										<Badge variant="secondary" class="text-[0.6rem]">Manual</Badge>
@@ -1313,7 +1302,7 @@
 								<div>
 									<Label>Schedule</Label>
 									<div class="mt-1 flex w-fit rounded-md border border-border text-xs">
-										{#each [['hourly', 'Hourly'], ['daily', 'Daily (3am)'], ['weekly', 'Weekly (Sun 2am)'], ['custom', 'Custom']] as [val, label]}
+									{#each [['hourly', 'Hourly'], ['daily', 'Daily (03:00 UTC)'], ['weekly', 'Weekly (Sun 02:00 UTC)'], ['custom', 'Custom']] as [val, label]}
 											<button onclick={() => applyEditSchedulePreset(val as SchedulePreset)}
 												class="px-3 py-1.5 font-medium transition-colors first:rounded-l-md last:rounded-r-md {editSchedulePreset === val ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'}"
 											>{label}</button>
@@ -1321,7 +1310,7 @@
 									</div>
 									{#if editSchedulePreset === 'custom'}
 										<Input bind:value={editSchedule} placeholder="Leave empty for manual only" class="mt-2 max-w-md font-mono" />
-										<p class="mt-1 text-xs text-muted-foreground">Cron format: minute hour day month weekday. Empty = manual only (use "Run Now").</p>
+										<p class="mt-1 text-xs text-muted-foreground">Cron format: minute hour day month weekday, evaluated in UTC. Empty = manual only (use "Run Now").</p>
 									{:else if editSchedule}
 										<p class="mt-2 text-xs text-muted-foreground font-mono">{editSchedule}</p>
 									{/if}

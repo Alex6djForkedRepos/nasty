@@ -834,10 +834,13 @@ fn schedule_entries(
                 return None;
             }
             let (next_run_at, schedule_error) = match scheduler::parse_cron(expression) {
-                Ok(schedule) => (
-                    schedule.after(&now).next().map(|next| next.to_rfc3339()),
-                    None,
-                ),
+                Ok(schedule) => match schedule.next_after(&now) {
+                    Some(next) => (Some(next.to_rfc3339()), None),
+                    None => (
+                        None,
+                        Some(format!("schedule '{expression}' has no future occurrence")),
+                    ),
+                },
                 Err(error) => (None, Some(error.to_string())),
             };
             Some(BackupScheduleEntry {
@@ -897,6 +900,25 @@ fn validate_sources(sources: &[String]) -> Result<(), BackupError> {
     if sources.is_empty() || sources.iter().any(|source| source.trim().is_empty()) {
         return Err(BackupError::Failed("backup sources cannot be empty".into()));
     }
+    Ok(())
+}
+
+fn normalize_schedule(schedule: &mut Option<String>) -> Result<(), BackupError> {
+    let Some(expression) = schedule.as_deref().map(str::trim) else {
+        return Ok(());
+    };
+    if expression.is_empty() {
+        *schedule = None;
+        return Ok(());
+    }
+    let parsed = scheduler::parse_cron(expression)
+        .map_err(|error| BackupError::Failed(error.to_string()))?;
+    if parsed.next_after(&chrono::Utc::now()).is_none() {
+        return Err(BackupError::Failed(format!(
+            "schedule '{expression}' has no future occurrence"
+        )));
+    }
+    *schedule = Some(expression.to_string());
     Ok(())
 }
 
@@ -1037,6 +1059,10 @@ fn creds(password: &str) -> Credentials {
 
 pub struct BackupService {
     profiles: std::sync::Arc<tokio::sync::Mutex<Vec<BackupProfile>>>,
+    /// Set when the profile file could not be loaded during startup. Keep the
+    /// service read-only until restart so a later repair cannot be overwritten
+    /// from the empty fallback snapshot held in memory.
+    state_load_error: std::sync::Arc<Option<String>>,
     running: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
     /// In-memory registry of long-running backup jobs
     /// (init / run / check). The async start_* methods spawn into
@@ -1053,8 +1079,10 @@ impl Default for BackupService {
 impl BackupService {
     pub fn new() -> Self {
         cleanup_stale_state_temp(std::path::Path::new(STATE_PATH));
+        let (profiles, state_load_error) = load_profiles();
         Self {
-            profiles: std::sync::Arc::new(tokio::sync::Mutex::new(load_profiles())),
+            profiles: std::sync::Arc::new(tokio::sync::Mutex::new(profiles)),
+            state_load_error: std::sync::Arc::new(state_load_error),
             running: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             jobs: JobRegistry::new(),
         }
@@ -1063,6 +1091,7 @@ impl BackupService {
     pub fn clone_for_task(&self) -> Self {
         Self {
             profiles: self.profiles.clone(),
+            state_load_error: self.state_load_error.clone(),
             running: self.running.clone(),
             jobs: self.jobs.clone(),
         }
@@ -1095,9 +1124,29 @@ impl BackupService {
     /// is readable and valid. Destructive dependency checks use this to avoid
     /// treating a corrupt profile file as an empty configuration.
     pub async fn list_profiles_strict(&self) -> Result<Vec<BackupProfile>, BackupError> {
+        self.ensure_state_healthy()?;
         let profiles = self.profiles.lock().await;
         load_profiles_strict()?;
         Ok(profiles.iter().map(|profile| profile.redacted()).collect())
+    }
+
+    fn ensure_state_healthy(&self) -> Result<(), BackupError> {
+        match self.state_load_error.as_ref() {
+            Some(error) => Err(BackupError::Failed(format!(
+                "backup profile state failed to load during engine startup: {error}; repair the state file and restart the engine"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn persist_profiles_checked(
+        &self,
+        profiles: &mut Vec<BackupProfile>,
+        next: Vec<BackupProfile>,
+    ) -> Result<(), StatePersistFailure> {
+        self.ensure_state_healthy()
+            .map_err(StatePersistFailure::BeforeRename)?;
+        persist_profiles(profiles, next)
     }
 
     pub async fn get_profile(&self, id: &str) -> Result<BackupProfile, BackupError> {
@@ -1160,7 +1209,7 @@ impl BackupService {
             }
         }
         if changed {
-            persist_profiles(&mut profiles, next)?;
+            self.persist_profiles_checked(&mut profiles, next)?;
             info!("Migrated backup profile secrets");
         }
         Ok(())
@@ -1171,6 +1220,7 @@ impl BackupService {
         mut profile: BackupProfile,
     ) -> Result<BackupProfile, BackupError> {
         validate_sources(&profile.sources)?;
+        normalize_schedule(&mut profile.schedule)?;
         // Encrypt plaintext secrets before persisting. If the secrets
         // backend is unavailable on this host (no systemd-creds, broken
         // TPM enrollment, etc.) we keep the legacy plaintext field
@@ -1199,7 +1249,7 @@ impl BackupService {
         }
         let mut next = profiles.clone();
         next.push(profile.clone());
-        persist_profiles(&mut profiles, next)?;
+        self.persist_profiles_checked(&mut profiles, next)?;
         info!("Created backup profile '{}' ({})", profile.name, profile.id);
         Ok(profile.redacted())
     }
@@ -1210,6 +1260,7 @@ impl BackupService {
         mut update: BackupProfile,
     ) -> Result<BackupProfile, BackupError> {
         validate_sources(&update.sources)?;
+        normalize_schedule(&mut update.schedule)?;
         // Same encryption-on-save invariant as create. The operator
         // can submit a plaintext password (rotate) or omit it (keep
         // existing); we carry the existing encrypted value forward
@@ -1230,7 +1281,7 @@ impl BackupService {
             .ok_or_else(|| BackupError::NotFound(id.into()))?;
         let mut next = profiles.clone();
         next[idx] = update.clone();
-        let persistence = persist_profiles(&mut profiles, next);
+        let persistence = self.persist_profiles_checked(&mut profiles, next);
         let committed = persistence_committed(&persistence);
         drop(profiles);
         // Operator cleared the textarea ⇒ trusted_cacert is now None
@@ -1256,7 +1307,7 @@ impl BackupService {
             .filter(|profile| profile.id != id)
             .cloned()
             .collect();
-        let persistence = persist_profiles(&mut profiles, next);
+        let persistence = self.persist_profiles_checked(&mut profiles, next);
         let committed = persistence_committed(&persistence);
         drop(profiles);
         // Drop the per-profile cacert file (if any) so the cacerts
@@ -1486,7 +1537,7 @@ impl BackupService {
         }
         let mut next = profiles.clone();
         next[current_index].repo_initialized = true;
-        persist_profiles(&mut profiles, next)?;
+        self.persist_profiles_checked(&mut profiles, next)?;
         info!("Initialized backup repo for profile '{id}'");
         Ok(if already_initialized {
             "Repository already initialized"
@@ -1580,7 +1631,7 @@ impl BackupService {
             if let Some(index) = unchanged {
                 let mut next = profiles.clone();
                 next[index].last_run = Some(result.clone());
-                if let Err(error) = persist_profiles(&mut profiles, next) {
+                if let Err(error) = self.persist_profiles_checked(&mut profiles, next) {
                     let error = BackupError::from(error);
                     let message = if result.success {
                         "backup data was written, but recording its result failed; automatic pruning was skipped"
@@ -1788,8 +1839,17 @@ impl BackupService {
 
 // ── Persistence ────────────────────────────────────────────────
 
-fn load_profiles() -> Vec<BackupProfile> {
-    load_profiles_strict().unwrap_or_default()
+fn load_profiles() -> (Vec<BackupProfile>, Option<String>) {
+    match load_profiles_strict() {
+        Ok(profiles) => (profiles, None),
+        Err(error) => {
+            let message = error.to_string();
+            error!(
+                "Backup profile state is unavailable: {error}; profile writes and dependent destructive operations will remain blocked"
+            );
+            (Vec::new(), Some(message))
+        }
+    }
 }
 
 fn load_profiles_strict() -> Result<Vec<BackupProfile>, BackupError> {
@@ -1923,6 +1983,10 @@ fn save_profiles_to(
     path: &std::path::Path,
     profiles: &[BackupProfile],
 ) -> Result<(), StatePersistFailure> {
+    // Never replace state we could not load. Falling back to an empty
+    // in-memory list is useful for keeping the engine available, but writing
+    // that list would turn a recoverable state-file problem into data loss.
+    load_profiles_from(path).map_err(StatePersistFailure::BeforeRename)?;
     let temp = state_temp_path(path).map_err(StatePersistFailure::BeforeRename)?;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -2003,6 +2067,48 @@ mod tests {
         assert!(validate_sources(&["/".into()]).is_ok());
     }
 
+    #[test]
+    fn backup_schedule_is_validated_before_persistence() {
+        for expression in ["0 3 * * *", "0 2 * * 0"] {
+            let mut schedule = Some(expression.into());
+            assert!(normalize_schedule(&mut schedule).is_ok());
+            assert_eq!(schedule.as_deref(), Some(expression));
+        }
+        for expression in ["not a schedule", "0 3 *", "0 0 3 * * *", "0 3 31 2 *"] {
+            assert!(normalize_schedule(&mut Some(expression.into())).is_err());
+        }
+
+        let mut manual = Some("   ".into());
+        normalize_schedule(&mut manual).unwrap();
+        assert_eq!(manual, None);
+    }
+
+    #[test]
+    fn startup_load_error_keeps_profile_state_read_only_until_restart() {
+        let service = BackupService {
+            profiles: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            state_load_error: std::sync::Arc::new(Some("parse failed".into())),
+            running: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            jobs: JobRegistry::new(),
+        };
+        let mut profiles = Vec::new();
+        let next = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/backup".into(),
+        })];
+
+        let error = service
+            .persist_profiles_checked(&mut profiles, next)
+            .unwrap_err();
+
+        assert!(!error.committed());
+        assert!(
+            BackupError::from(error)
+                .to_string()
+                .contains("restart the engine")
+        );
+        assert!(profiles.is_empty());
+    }
+
     /// Construct an `EncryptedBlob` without going through systemd-creds.
     /// The blob isn't decryptable — that's fine for tests that just
     /// need to assert "an encrypted value is present" or that resolve
@@ -2081,7 +2187,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backups.json");
-        std::fs::write(&path, "old state").unwrap();
+        std::fs::write(&path, "[]").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let profiles = vec![baseline_profile(BackupTarget::Local {
             path: "/srv/backup".into(),
@@ -2105,7 +2211,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("backups.json");
         let temp = state_temp_path(&path).unwrap();
-        let old = b"existing backup state";
+        let old = b"[]";
         std::fs::write(&path, old).unwrap();
         std::fs::create_dir(&temp).unwrap();
         let profiles = vec![baseline_profile(BackupTarget::Local {
@@ -2119,6 +2225,23 @@ mod tests {
             temp.is_dir(),
             "a pre-existing temp path must not be removed"
         );
+    }
+
+    #[test]
+    fn corrupt_profile_state_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backups.json");
+        let corrupt = b"{ definitely not valid JSON";
+        std::fs::write(&path, corrupt).unwrap();
+        let profiles = vec![baseline_profile(BackupTarget::Local {
+            path: "/srv/new-backup".into(),
+        })];
+
+        let error = save_profiles_to(&path, &profiles).unwrap_err();
+
+        assert!(!error.committed());
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+        assert!(!state_temp_path(&path).unwrap().exists());
     }
 
     #[test]
