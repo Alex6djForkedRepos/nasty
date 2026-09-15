@@ -50,26 +50,121 @@ pub enum SchedulerError {
     InvalidCron(String, String),
 }
 
-/// Parse a 5-field (POSIX) or 6-field cron expression. The WebUI
-/// emits 5-field expressions (`min hour dom month dow`) for the
-/// presets it offers; we transparently promote those to the 6-field
-/// form the `cron` crate expects by prepending a `0` seconds column.
-/// 6-field expressions pass through unchanged.
-pub fn parse_cron(expr: &str) -> Result<Schedule, SchedulerError> {
+pub struct CronSchedule {
+    schedules: Vec<Schedule>,
+}
+
+impl CronSchedule {
+    pub fn next_after(&self, timestamp: &DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.schedules
+            .iter()
+            .filter_map(|schedule| schedule.after(timestamp).next())
+            .min()
+    }
+}
+
+/// Parse a 5-field POSIX cron expression (`min hour dom month dow`).
+/// The scheduler polls once per minute, so accepting second-resolution
+/// expressions would promise precision it cannot provide. POSIX numbers
+/// weekdays from Sunday=0 (or 7); the `cron` crate uses Sunday=1, so numeric
+/// weekday values are translated before prepending its seconds column. When
+/// both day-of-month and day-of-week are restricted, POSIX treats them as an
+/// OR; this is represented as the union of two `cron` schedules.
+pub fn parse_cron(expr: &str) -> Result<CronSchedule, SchedulerError> {
     let trimmed = expr.trim();
-    let field_count = trimmed.split_whitespace().count();
-    let normalized = match field_count {
-        5 => format!("0 {trimmed}"),
-        6 | 7 => trimmed.to_string(),
-        _ => {
-            return Err(SchedulerError::InvalidCron(
-                expr.to_string(),
-                format!("expected 5, 6, or 7 fields; got {field_count}"),
-            ));
-        }
+    let mut fields: Vec<_> = trimmed.split_whitespace().map(str::to_string).collect();
+    if fields.len() != 5 {
+        return Err(SchedulerError::InvalidCron(
+            expr.to_string(),
+            format!("expected 5 fields; got {}", fields.len()),
+        ));
+    }
+    if fields.iter().any(|field| field.contains('?')) {
+        return Err(SchedulerError::InvalidCron(
+            expr.to_string(),
+            "'?' is not part of five-field POSIX cron".into(),
+        ));
+    }
+    let month_day_restricted = fields[2] != "*";
+    let weekday_restricted = fields[4] != "*";
+    fields[4] = normalize_posix_weekday(&fields[4]).map_err(|error| {
+        SchedulerError::InvalidCron(expr.to_string(), format!("weekday: {error}"))
+    })?;
+    let expressions = if month_day_restricted && weekday_restricted {
+        let mut by_month_day = fields.clone();
+        by_month_day[4] = "*".into();
+        let mut by_weekday = fields;
+        by_weekday[2] = "*".into();
+        vec![by_month_day, by_weekday]
+    } else {
+        vec![fields]
     };
-    Schedule::from_str(&normalized)
-        .map_err(|e| SchedulerError::InvalidCron(expr.to_string(), e.to_string()))
+    let schedules = expressions
+        .into_iter()
+        .map(|fields| Schedule::from_str(&format!("0 {}", fields.join(" "))))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| SchedulerError::InvalidCron(expr.to_string(), error.to_string()))?;
+    Ok(CronSchedule { schedules })
+}
+
+fn normalize_posix_weekday(field: &str) -> Result<String, String> {
+    if field.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+        let mixes_numeric_values = field.split(',').any(|part| {
+            part.split_once('/')
+                .map_or(part, |(base, _)| base)
+                .split('-')
+                .any(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        });
+        if mixes_numeric_values {
+            return Err("cannot mix named and numeric weekdays".into());
+        }
+        return Ok(field.to_string());
+    }
+
+    let parse_value = |value: &str| -> Result<u8, String> {
+        let value = value
+            .parse::<u8>()
+            .map_err(|_| format!("'{value}' is not a weekday number"))?;
+        if value > 7 {
+            return Err(format!("numeric value '{value}' must be between 0 and 7"));
+        }
+        Ok(value)
+    };
+    let mut selected = [false; 7];
+    for part in field.split(',') {
+        let (base, step) = part.split_once('/').map_or((part, 1), |(base, step)| {
+            let step = step.parse::<usize>().unwrap_or(0);
+            (base, step)
+        });
+        if step == 0 {
+            return Err(format!("'{part}' has an invalid step"));
+        }
+        let values: Vec<u8> = if base == "*" {
+            (0..=6).collect()
+        } else if let Some((start, end)) = base.split_once('-') {
+            let start = parse_value(start)?;
+            let end = parse_value(end)?;
+            if start > end {
+                return Err(format!("range '{base}' must be ascending"));
+            }
+            (start..=end).collect()
+        } else {
+            vec![parse_value(base)?]
+        };
+        for value in values.into_iter().step_by(step) {
+            selected[usize::from(value % 7)] = true;
+        }
+    }
+    if !selected.iter().any(|selected| *selected) {
+        return Err("weekday field selects no days".into());
+    }
+    Ok(selected
+        .iter()
+        .enumerate()
+        .filter(|(_, selected)| **selected)
+        .map(|(weekday, _)| (weekday + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 /// Should the profile fire on this tick? Returns `Some(next_fire)`
@@ -81,13 +176,12 @@ pub fn parse_cron(expr: &str) -> Result<Schedule, SchedulerError> {
 /// `last_attempted_at` is the floor for the cron lookup, so a profile
 /// that has just run won't re-fire on the same tick.
 pub fn should_fire(
-    schedule: &Schedule,
+    schedule: &CronSchedule,
     last_attempted_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
     schedule
-        .after(&last_attempted_at)
-        .next()
+        .next_after(&last_attempted_at)
         .filter(|next| *next <= now)
 }
 
@@ -97,11 +191,12 @@ pub fn should_fire(
 /// tokio tasks or hitting the real `run_backup`.
 pub struct SchedulerTick {
     /// Per-profile timestamp of the last cron-driven attempt. Seeded
-    /// to `started_at` on engine start; updated whenever
-    /// [`should_fire`] returns `Some`. Profiles deleted between ticks
-    /// have their entries cleaned up to keep this map bounded.
+    /// to `started_at` on engine start; updated after a due job is admitted.
+    /// Profiles deleted between ticks have their entries cleaned up to keep
+    /// this map bounded.
     pub last_attempted: HashMap<String, DateTime<Utc>>,
     pub started_at: DateTime<Utc>,
+    schedules: HashMap<String, String>,
 }
 
 impl SchedulerTick {
@@ -109,27 +204,45 @@ impl SchedulerTick {
         Self {
             last_attempted: HashMap::new(),
             started_at,
+            schedules: HashMap::new(),
+        }
+    }
+
+    pub fn seed_profiles(&mut self, profiles: &[BackupProfile]) {
+        for profile in profiles {
+            if let Some(schedule) = active_schedule(profile) {
+                self.last_attempted
+                    .insert(profile.id.clone(), self.started_at);
+                self.schedules.insert(profile.id.clone(), schedule.into());
+            }
         }
     }
 
     /// Walk `profiles` and return the IDs that should fire on this tick.
-    /// Updates `self.last_attempted` for every fired profile and prunes
-    /// entries for profiles that have disappeared.
+    /// Prunes entries for profiles that have disappeared. A due profile is
+    /// committed separately after its job has actually been admitted.
     pub fn evaluate(&mut self, profiles: &[BackupProfile], now: DateTime<Utc>) -> Vec<String> {
         let live_ids: std::collections::HashSet<&str> =
             profiles.iter().map(|p| p.id.as_str()).collect();
         self.last_attempted
             .retain(|id, _| live_ids.contains(id.as_str()));
+        self.schedules
+            .retain(|id, _| live_ids.contains(id.as_str()));
 
         let mut to_fire = Vec::new();
         for profile in profiles {
-            if !profile.enabled {
-                continue;
-            }
-            let Some(expr) = profile.schedule.as_deref() else {
+            let Some(expr) = active_schedule(profile) else {
+                self.last_attempted.remove(&profile.id);
+                self.schedules.remove(&profile.id);
                 continue;
             };
-            if expr.trim().is_empty() {
+            if self.schedules.get(&profile.id).map(String::as_str) != Some(expr) {
+                self.schedules.insert(profile.id.clone(), expr.into());
+                self.last_attempted.insert(profile.id.clone(), now);
+                debug!(
+                    "backup profile '{}' (id {}) schedule is new or changed; next occurrence starts after {now}",
+                    profile.name, profile.id
+                );
                 continue;
             }
             let schedule = match parse_cron(expr) {
@@ -145,10 +258,9 @@ impl SchedulerTick {
                 .or_insert(self.started_at);
             if let Some(fire_at) = should_fire(&schedule, last, now) {
                 info!(
-                    "backup profile '{}' (id {}) firing on cron: scheduled {fire_at}",
+                    "backup profile '{}' (id {}) due on cron: scheduled {fire_at}",
                     profile.name, profile.id
                 );
-                self.last_attempted.insert(profile.id.clone(), now);
                 to_fire.push(profile.id.clone());
             } else {
                 debug!(
@@ -160,9 +272,18 @@ impl SchedulerTick {
         to_fire
     }
 
-    fn retry(&mut self, profile_id: &str) {
-        self.last_attempted.remove(profile_id);
+    fn mark_attempted(&mut self, profile_id: String, attempted_at: DateTime<Utc>) {
+        self.last_attempted.insert(profile_id, attempted_at);
     }
+}
+
+fn active_schedule(profile: &BackupProfile) -> Option<&str> {
+    profile
+        .enabled
+        .then_some(profile.schedule.as_deref())
+        .flatten()
+        .map(str::trim)
+        .filter(|schedule| !schedule.is_empty())
 }
 
 /// Tick interval for the scheduler loop. 60 s is well under any
@@ -179,8 +300,10 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// Never returns. Call once from `main` as a long-lived
 /// `tokio::spawn`.
-pub async fn run_scheduler_loop(service: BackupService) {
-    let mut tick_state = SchedulerTick::new(Utc::now());
+pub async fn run_scheduler_loop(
+    service: BackupService,
+    tick_state: std::sync::Arc<tokio::sync::Mutex<SchedulerTick>>,
+) {
     info!("backup scheduler started (tick interval: {TICK_INTERVAL:?})");
 
     loop {
@@ -191,15 +314,18 @@ pub async fn run_scheduler_loop(service: BackupService) {
         // never secrets — so the redacted output of list_profiles is
         // fine. run_backup() resolves real secrets on its own.
         let profiles = service.list_profiles().await;
-        let due = tick_state.evaluate(&profiles, now);
+        let due = tick_state.lock().await.evaluate(&profiles, now);
 
         for profile_id in due {
             match service.start_run_backup(&profile_id).await {
                 Ok(job) => {
+                    tick_state
+                        .lock()
+                        .await
+                        .mark_attempted(profile_id.clone(), now);
                     info!("scheduled backup job {} started for '{profile_id}'", job.id);
                 }
                 Err(e) => {
-                    tick_state.retry(&profile_id);
                     warn!(
                         "scheduled backup for '{profile_id}' could not start and will retry next tick: {e}"
                     );
@@ -246,21 +372,32 @@ mod tests {
         // unmodified or every existing profile silently stops firing.
         let schedule = parse_cron("0 3 * * *").expect("daily cron parses");
         let next = schedule
-            .after(&ts(2026, 6, 5, 1, 0))
-            .next()
+            .next_after(&ts(2026, 6, 5, 1, 0))
             .expect("daily fires at least once");
         assert_eq!(next, ts(2026, 6, 5, 3, 0));
     }
 
     #[test]
-    fn parse_cron_accepts_six_field_with_seconds() {
-        // A hand-written 6-field expression (operator pastes an
-        // expression from cronitor.io etc.) should also work — pass
-        // through unchanged, don't double-prepend `0`.
-        let schedule = parse_cron("0 0 3 * * *").expect("6-field parses");
+    fn parse_cron_translates_posix_weekdays() {
+        let sunday = parse_cron("0 2 * * 0").expect("POSIX Sunday parses");
         assert_eq!(
-            schedule.after(&ts(2026, 6, 5, 1, 0)).next(),
-            Some(ts(2026, 6, 5, 3, 0))
+            sunday.next_after(&ts(2026, 6, 6, 1, 0)),
+            Some(ts(2026, 6, 7, 2, 0))
+        );
+        assert!(parse_cron("0 2 * * 7").is_ok());
+        assert!(parse_cron("0 2 * * 1-5").is_ok());
+        assert!(parse_cron("0 2 * * 5-7").is_ok());
+        assert!(parse_cron("0 2 * * 0-7").is_ok());
+    }
+
+    #[test]
+    fn parse_cron_uses_posix_union_for_month_day_and_weekday() {
+        let schedule = parse_cron("0 3 1 * 1").unwrap();
+        // Monday June 8 is not the first of the month, but POSIX cron's
+        // day-of-month/day-of-week OR still selects it.
+        assert_eq!(
+            schedule.next_after(&ts(2026, 6, 7, 3, 0)),
+            Some(ts(2026, 6, 8, 3, 0))
         );
     }
 
@@ -270,6 +407,8 @@ mod tests {
         assert!(parse_cron("").is_err());
         // Four fields — neither POSIX cron nor extended.
         assert!(parse_cron("0 3 * *").is_err());
+        // The scheduler has minute granularity and rejects seconds fields.
+        assert!(parse_cron("0 0 3 * * *").is_err());
     }
 
     #[test]
@@ -299,12 +438,14 @@ mod tests {
         // the second tick must not (last_attempted advanced).
         // Without this property the scheduler would re-fire every
         // tick within the same minute and stomp on itself.
-        let mut tick = SchedulerTick::new(ts(2026, 6, 5, 2, 0));
         let profiles = vec![profile_with_schedule("a", "0 3 * * *", true)];
+        let mut tick = SchedulerTick::new(ts(2026, 6, 5, 2, 0));
+        tick.seed_profiles(&profiles);
 
         // First tick at 03:00 — should fire.
         let fired = tick.evaluate(&profiles, ts(2026, 6, 5, 3, 0));
         assert_eq!(fired, vec!["a".to_string()]);
+        tick.mark_attempted("a".into(), ts(2026, 6, 5, 3, 0));
 
         // Second tick at 03:01 — already fired this cycle, must not
         // re-fire.
@@ -313,13 +454,13 @@ mod tests {
     }
 
     #[test]
-    fn rejected_job_is_due_again_after_retry() {
+    fn uncommitted_job_is_due_again_on_the_next_tick() {
         let started = ts(2026, 6, 5, 2, 59);
-        let mut tick = SchedulerTick::new(started);
         let profiles = vec![profile_with_schedule("p", "0 3 * * *", true)];
+        let mut tick = SchedulerTick::new(started);
+        tick.seed_profiles(&profiles);
 
         assert_eq!(tick.evaluate(&profiles, ts(2026, 6, 5, 3, 0)), ["p"]);
-        tick.retry("p");
         assert_eq!(tick.evaluate(&profiles, ts(2026, 6, 5, 3, 1)), ["p"]);
     }
 
@@ -357,11 +498,12 @@ mod tests {
         // Operator pastes a malformed expression. The scheduler must
         // not crash, must not fire anything for that profile, and
         // must still evaluate the other profiles in the same tick.
-        let mut tick = SchedulerTick::new(ts(2026, 6, 5, 2, 0));
         let profiles = vec![
             profile_with_schedule("bad", "not a cron", true),
             profile_with_schedule("good", "0 3 * * *", true),
         ];
+        let mut tick = SchedulerTick::new(ts(2026, 6, 5, 2, 0));
+        tick.seed_profiles(&profiles);
         let fired = tick.evaluate(&profiles, ts(2026, 6, 5, 3, 0));
         assert_eq!(fired, vec!["good".to_string()]);
     }
@@ -374,8 +516,9 @@ mod tests {
         // immediately trigger the 03:00 backup, which is the wrong
         // behavior — operators who want catch-up runs click Run.
         let started_at = ts(2026, 6, 5, 9, 0);
-        let mut tick = SchedulerTick::new(started_at);
         let profiles = vec![profile_with_schedule("a", "0 3 * * *", true)];
+        let mut tick = SchedulerTick::new(started_at);
+        tick.seed_profiles(&profiles);
         let fired = tick.evaluate(&profiles, ts(2026, 6, 5, 9, 0));
         assert!(
             fired.is_empty(),
@@ -388,11 +531,10 @@ mod tests {
         // Profile gets deleted between ticks — the last_attempted
         // map entry must be cleaned up so it doesn't leak memory
         // for the engine's lifetime if profiles churn.
+        let profiles = vec![profile_with_schedule("a", "0 3 * * *", true)];
         let mut tick = SchedulerTick::new(ts(2026, 6, 5, 2, 0));
-        let _ = tick.evaluate(
-            &[profile_with_schedule("a", "0 3 * * *", true)],
-            ts(2026, 6, 5, 3, 0),
-        );
+        tick.seed_profiles(&profiles);
+        let _ = tick.evaluate(&profiles, ts(2026, 6, 5, 3, 0));
         assert!(tick.last_attempted.contains_key("a"));
         let _ = tick.evaluate(&[], ts(2026, 6, 5, 3, 1));
         assert!(
@@ -400,5 +542,21 @@ mod tests {
             "stale profile state not pruned: {:?}",
             tick.last_attempted
         );
+    }
+
+    #[test]
+    fn newly_created_or_rescheduled_profile_starts_from_observation_time() {
+        let mut tick = SchedulerTick::new(ts(2026, 6, 5, 1, 0));
+        let mut profiles = vec![profile_with_schedule("a", "0 3 * * *", true)];
+
+        // Created after today's 03:00 occurrence: do not run it immediately.
+        assert!(tick.evaluate(&profiles, ts(2026, 6, 5, 10, 0)).is_empty());
+        assert!(tick.evaluate(&profiles, ts(2026, 6, 5, 10, 1)).is_empty());
+
+        // A changed schedule gets the same treatment instead of looking back
+        // through the previous schedule's cursor.
+        profiles[0].schedule = Some("0 4 * * *".into());
+        assert!(tick.evaluate(&profiles, ts(2026, 6, 5, 11, 0)).is_empty());
+        assert!(tick.evaluate(&profiles, ts(2026, 6, 5, 11, 1)).is_empty());
     }
 }
