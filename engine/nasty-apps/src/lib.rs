@@ -24,6 +24,7 @@ use bollard::query_parameters::{
     ListNetworksOptions, LogsOptions, RemoveContainerOptions, StatsOptions, StopContainerOptions,
 };
 use bollard::{Docker, auth::DockerCredentials};
+use chrono::{DateTime, TimeDelta, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2330,10 +2331,166 @@ pub struct App {
     pub registry_credential_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposePullPolicy {
+    Missing,
+    Always,
+    Refresh(TimeDelta),
+    Skip,
+}
+
+impl ComposePullPolicy {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Always, _) | (_, Self::Always) => Self::Always,
+            (Self::Refresh(left), Self::Refresh(right)) => Self::Refresh(left.min(right)),
+            (refresh @ Self::Refresh(_), Self::Missing | Self::Skip)
+            | (Self::Missing | Self::Skip, refresh @ Self::Refresh(_)) => refresh,
+            (Self::Missing, _) | (_, Self::Missing) => Self::Missing,
+            (Self::Skip, Self::Skip) => Self::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposeImagePlan {
+    /// All effective service images eligible for registry pulls.
+    pub images: Vec<String>,
+    /// Images due for an automatic pull under their Compose pull policy.
+    pub pull_images: Vec<String>,
+}
+
+type ComposeInventory = (Vec<String>, Vec<String>, HashMap<String, ComposePullPolicy>);
+
+fn parse_compose_duration(value: &str) -> Option<TimeDelta> {
+    let bytes = value.as_bytes();
+    let (negative, mut index) = match bytes.first() {
+        Some(b'-') => (true, 1),
+        Some(b'+') => (false, 1),
+        _ => (false, 0),
+    };
+    if index == bytes.len() {
+        return None;
+    }
+    if &value[index..] == "0" {
+        return Some(TimeDelta::zero());
+    }
+
+    let limit = if negative {
+        i64::MAX as i128 + 1
+    } else {
+        i64::MAX as i128
+    };
+    let mut total = 0i128;
+    while index < bytes.len() {
+        let whole_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let whole_end = index;
+        let mut fraction_start = index;
+        let mut fraction_end = index;
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            fraction_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            fraction_end = index;
+        }
+        if whole_start == whole_end && fraction_start == fraction_end {
+            return None;
+        }
+
+        let unit_start = index;
+        while index < bytes.len() {
+            let ch = value[index..].chars().next()?;
+            if ch == '.' || ch.is_ascii_digit() {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        if unit_start == index {
+            return None;
+        }
+        let unit_nanos = match &value[unit_start..index] {
+            "ns" => 1i128,
+            "us" | "µs" | "μs" => 1_000,
+            "ms" => 1_000_000,
+            "s" => 1_000_000_000,
+            "m" => 60 * 1_000_000_000,
+            "h" => 60 * 60 * 1_000_000_000,
+            "d" => 24 * 60 * 60 * 1_000_000_000,
+            "w" => 7 * 24 * 60 * 60 * 1_000_000_000,
+            _ => return None,
+        };
+
+        let whole = if whole_start == whole_end {
+            0
+        } else {
+            value[whole_start..whole_end].parse::<i128>().ok()?
+        };
+        let mut segment = whole.checked_mul(unit_nanos)?;
+        if fraction_start != fraction_end {
+            let digits = &value[fraction_start..fraction_end];
+            let precision = digits.len().min(18);
+            let fraction = digits[..precision].parse::<i128>().ok()?;
+            let scale = 10i128.checked_pow(u32::try_from(precision).ok()?)?;
+            segment = segment.checked_add(fraction.checked_mul(unit_nanos)? / scale)?;
+        }
+        total = total.checked_add(segment)?;
+        if total > limit {
+            return None;
+        }
+    }
+
+    let nanos = if negative {
+        if total == i64::MAX as i128 + 1 {
+            i64::MIN
+        } else {
+            -i64::try_from(total).ok()?
+        }
+    } else {
+        i64::try_from(total).ok()?
+    };
+    Some(TimeDelta::nanoseconds(nanos))
+}
+
+fn parse_compose_pull_policy(value: Option<&str>) -> Option<ComposePullPolicy> {
+    match value.unwrap_or("missing") {
+        "always" => Some(ComposePullPolicy::Always),
+        "missing" | "if_not_present" => Some(ComposePullPolicy::Missing),
+        "never" | "build" => Some(ComposePullPolicy::Skip),
+        "daily" => Some(ComposePullPolicy::Refresh(TimeDelta::days(1))),
+        "weekly" => Some(ComposePullPolicy::Refresh(TimeDelta::weeks(1))),
+        policy if policy.starts_with("every_") => {
+            parse_compose_duration(&policy[6..]).map(ComposePullPolicy::Refresh)
+        }
+        _ => None,
+    }
+}
+
+fn compose_pull_due(
+    policy: ComposePullPolicy,
+    image_present: bool,
+    last_tag_time: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    match policy {
+        ComposePullPolicy::Always => true,
+        ComposePullPolicy::Missing => !image_present,
+        ComposePullPolicy::Refresh(interval) => {
+            !image_present
+                || last_tag_time.is_none_or(|last_tag_time| now - last_tag_time > interval)
+        }
+        ComposePullPolicy::Skip => false,
+    }
+}
+
 fn parse_compose_inventory(
     content: &str,
     active_services: Option<&std::collections::HashSet<String>>,
-) -> Option<(Vec<String>, Vec<String>, std::collections::HashSet<String>)> {
+) -> Option<ComposeInventory> {
     let parsed: serde_json::Value = serde_yaml_ng::from_str(content).ok()?;
     let services = parsed.get("services")?.as_object()?;
     let is_active = |name: &str, service: &serde_json::Value| {
@@ -2349,15 +2506,12 @@ fn parse_compose_inventory(
     };
     if services.iter().any(|(name, service)| {
         (active_services.is_none() || is_active(name, service))
-            && service
-                .get("pull_policy")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|policy| {
-                    !matches!(
-                        policy,
-                        "always" | "missing" | "if_not_present" | "never" | "build"
-                    )
-                })
+            && parse_compose_pull_policy(
+                service
+                    .get("pull_policy")
+                    .and_then(serde_json::Value::as_str),
+            )
+            .is_none()
     }) {
         return None;
     }
@@ -2393,18 +2547,26 @@ fn parse_compose_inventory(
         .collect();
     images.sort();
     images.dedup();
-    let always_pull_images = services
-        .iter()
-        .filter(|(name, service)| active_services.is_none() || is_active(name, service))
-        .filter(|(_, service)| {
+    let mut pull_policies: HashMap<String, ComposePullPolicy> = HashMap::new();
+    for (name, service) in services {
+        if active_services.is_some() && !is_active(name, service) {
+            continue;
+        }
+        let Some(image) = service.get("image").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let policy = parse_compose_pull_policy(
             service
                 .get("pull_policy")
-                .and_then(serde_json::Value::as_str)
-                == Some("always")
-        })
-        .filter_map(|(_, service)| service.get("image")?.as_str().map(String::from))
-        .collect();
-    Some((names, images, always_pull_images))
+                .and_then(serde_json::Value::as_str),
+        )?;
+        pull_policies
+            .entry(image.to_string())
+            .and_modify(|current| *current = current.merge(policy))
+            .or_insert(policy);
+    }
+    pull_policies.retain(|_, policy| *policy != ComposePullPolicy::Skip);
+    Some((names, images, pull_policies))
 }
 
 async fn compose_config_output(
@@ -2438,7 +2600,7 @@ async fn compose_config_output(
 async fn effective_compose_inventory(
     compose_path: &std::path::Path,
     env_path: Option<&std::path::Path>,
-) -> Result<(Vec<String>, Vec<String>, std::collections::HashSet<String>), AppsError> {
+) -> Result<ComposeInventory, AppsError> {
     let (config, services) = tokio::try_join!(
         compose_config_output(compose_path, env_path, &["--format", "json"]),
         compose_config_output(compose_path, env_path, &["--services"]),
@@ -3731,21 +3893,49 @@ impl AppsService {
             .map(|(_, images, _)| images)
     }
 
-    async fn pull_missing_compose_images(&self, app_name: &str) -> Result<(), AppsError> {
+    pub async fn compose_image_plan_from_path(
+        &self,
+        path: &Path,
+        env_path: Option<&Path>,
+    ) -> Result<ComposeImagePlan, AppsError> {
+        let (_, images, pull_policies) = effective_compose_inventory(path, env_path).await?;
+        let docker = self.docker()?;
+        let now = Utc::now();
+        let mut pull_images = Vec::new();
+        for image in &images {
+            let policy = *pull_policies
+                .get(image)
+                .expect("effective pullable image has a pull policy");
+            let (image_present, last_tag_time) = match policy {
+                ComposePullPolicy::Always => (false, None),
+                _ => match docker.inspect_image(image).await {
+                    Ok(inspect) => (
+                        true,
+                        inspect.metadata.and_then(|metadata| metadata.last_tag_time),
+                    ),
+                    Err(_) => (false, None),
+                },
+            };
+            if compose_pull_due(policy, image_present, last_tag_time, now) {
+                pull_images.push(image.clone());
+            }
+        }
+        Ok(ComposeImagePlan {
+            images,
+            pull_images,
+        })
+    }
+
+    async fn pull_due_compose_images(&self, app_name: &str) -> Result<(), AppsError> {
         let credential_ids = load_registry_credential_ids(app_name).await;
         let path = Path::new(COMPOSE_DIR)
             .join(app_name)
             .join("docker-compose.yml");
-        let (_, images, always_pull_images) = effective_compose_inventory(&path, None).await?;
-        self.validate_registry_bindings(&images, &credential_ids)
+        let plan = self.compose_image_plan_from_path(&path, None).await?;
+        self.validate_registry_bindings(&plan.images, &credential_ids)
             .await?;
-        for image in images {
-            self.pull_image(
-                &image,
-                &credential_ids,
-                !always_pull_images.contains(&image),
-            )
-            .await?;
+        for image in plan.pull_images {
+            self.pull_image(&image, &credential_ids, false).await?;
         }
         Ok(())
     }
@@ -5847,28 +6037,26 @@ impl AppsService {
         // through the explicit "Fix permissions" path.
         self.precreate_compose_binds(&req.compose_file).await;
 
-        let (_, images, always_pull_images) =
-            match effective_compose_inventory(Path::new(&compose_path), None).await {
-                Ok(inventory) => inventory,
-                Err(error) => {
-                    let _ = tokio::fs::remove_dir_all(&project_dir).await;
-                    return Err(error);
-                }
-            };
+        let plan = match self
+            .compose_image_plan_from_path(Path::new(&compose_path), None)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = tokio::fs::remove_dir_all(&project_dir).await;
+                return Err(error);
+            }
+        };
         if let Err(error) = self
-            .validate_registry_bindings(&images, &registry_credential_ids)
+            .validate_registry_bindings(&plan.images, &registry_credential_ids)
             .await
         {
             let _ = tokio::fs::remove_dir_all(&project_dir).await;
             return Err(error);
         }
-        for image in images {
+        for image in plan.pull_images {
             if let Err(error) = self
-                .pull_image(
-                    &image,
-                    &registry_credential_ids,
-                    !always_pull_images.contains(&image),
-                )
+                .pull_image(&image, &registry_credential_ids, false)
                 .await
             {
                 let _ = tokio::fs::remove_dir_all(&project_dir).await;
@@ -6053,26 +6241,25 @@ impl AppsService {
         // are untouched.
         self.precreate_compose_binds(&req.compose_file).await;
 
-        let (_, images, always_pull_images) =
-            match effective_compose_inventory(&compose_path, None).await {
-                Ok(inventory) => inventory,
-                Err(error) => {
-                    self.rollback_compose_update(ComposeUpdateRollback {
-                        name: &req.name,
-                        compose_path: &compose_path,
-                        env_path: &env_path,
-                        previous_compose: &previous_compose,
-                        previous_env: previous_env.as_deref(),
-                        previous_registry_credential_ids: &previous_registry_credential_ids,
-                        registry_guard: &app_registry_guard,
-                        reapply: false,
-                    })
-                    .await;
-                    return Err(error);
-                }
-            };
+        let plan = match self.compose_image_plan_from_path(&compose_path, None).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.rollback_compose_update(ComposeUpdateRollback {
+                    name: &req.name,
+                    compose_path: &compose_path,
+                    env_path: &env_path,
+                    previous_compose: &previous_compose,
+                    previous_env: previous_env.as_deref(),
+                    previous_registry_credential_ids: &previous_registry_credential_ids,
+                    registry_guard: &app_registry_guard,
+                    reapply: false,
+                })
+                .await;
+                return Err(error);
+            }
+        };
         if let Err(error) = self
-            .validate_registry_bindings(&images, &registry_credential_ids)
+            .validate_registry_bindings(&plan.images, &registry_credential_ids)
             .await
         {
             self.rollback_compose_update(ComposeUpdateRollback {
@@ -6088,13 +6275,9 @@ impl AppsService {
             .await;
             return Err(error);
         }
-        for image in images {
+        for image in plan.pull_images {
             if let Err(error) = self
-                .pull_image(
-                    &image,
-                    &registry_credential_ids,
-                    !always_pull_images.contains(&image),
-                )
+                .pull_image(&image, &registry_credential_ids, false)
                 .await
             {
                 self.rollback_compose_update(ComposeUpdateRollback {
@@ -6267,6 +6450,7 @@ impl AppsService {
         order: u32,
         delay_secs: u32,
     ) -> Result<(), AppsError> {
+        let _app_registry_guard = self.app_registry_read_guard().await;
         let _compose_guard = self.compose_mutation_guard().await;
         validate_app_name(name)?;
         self.require_ready().await?;
@@ -6295,6 +6479,7 @@ impl AppsService {
             } else {
                 remove_startup_override(name).await;
             }
+            self.pull_due_compose_images(name).await?;
             let mut up_args = vec!["compose".to_string()];
             up_args.extend(compose_file_args(name));
             up_args.extend([
@@ -7202,7 +7387,7 @@ impl AppsService {
                         "Skipping registry restore pulls for compose app '{name}' after the 60s boot budget; trying locally cached images"
                     );
                 } else {
-                    match tokio::time::timeout(pull_budget, self.pull_missing_compose_images(&name))
+                    match tokio::time::timeout(pull_budget, self.pull_due_compose_images(&name))
                         .await
                     {
                         Ok(Ok(())) => {}
@@ -8823,12 +9008,13 @@ async fn fetch_manifest_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppVolume, InstallAppRequest, StartupConfig, canonical_registry_host, completes_ok_within,
-        compose_file_args, docker_data_root_status, extract_user_env, parse_compose_inventory,
-        parse_image_ref, render_env_file, render_startup_override, validate_app_name,
-        validate_new_app_name, validate_new_app_request, validate_simple_volumes,
-        validate_volume_name,
+        AppVolume, ComposePullPolicy, InstallAppRequest, StartupConfig, canonical_registry_host,
+        completes_ok_within, compose_file_args, compose_pull_due, docker_data_root_status,
+        extract_user_env, parse_compose_duration, parse_compose_inventory, parse_image_ref,
+        render_env_file, render_startup_override, validate_app_name, validate_new_app_name,
+        validate_new_app_request, validate_simple_volumes, validate_volume_name,
     };
+    use chrono::{DateTime, TimeDelta, Utc};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -8993,7 +9179,7 @@ services:
     image: example/local:latest
     pull_policy: never
 "#;
-        let (services, images, always_pull_images) =
+        let (services, images, pull_policies) =
             parse_compose_inventory(compose, None).expect("valid compose inventory");
 
         assert_eq!(
@@ -9019,9 +9205,14 @@ services:
             ]
         );
         assert_eq!(
-            always_pull_images,
-            std::collections::HashSet::from(["example/web:latest".to_string()])
+            pull_policies.get("example/web:latest"),
+            Some(&ComposePullPolicy::Always)
         );
+        assert_eq!(
+            pull_policies.get("postgres:18"),
+            Some(&ComposePullPolicy::Missing)
+        );
+        assert!(!pull_policies.contains_key("example/local:latest"));
 
         let active = std::collections::HashSet::from([
             "built-image".to_string(),
@@ -9043,6 +9234,122 @@ services:
                 "example/web:latest"
             ]
         );
+    }
+
+    #[test]
+    fn compose_inventory_accepts_and_merges_periodic_pull_policies() {
+        let compose = r#"
+services:
+  daily:
+    image: example/daily:latest
+    pull_policy: daily
+  weekly:
+    image: example/weekly:latest
+    pull_policy: weekly
+  slower:
+    image: example/shared:latest
+    pull_policy: every_2h
+  faster:
+    image: example/shared:latest
+    pull_policy: every_30m
+  force-periodic:
+    image: example/forced:latest
+    pull_policy: daily
+  force-always:
+    image: example/forced:latest
+    pull_policy: always
+  optional:
+    image: example/optional:latest
+    pull_policy: missing
+  optional-skip:
+    image: example/optional:latest
+    pull_policy: never
+  skip-only:
+    image: example/local:latest
+    pull_policy: build
+"#;
+        let (_, _, policies) =
+            parse_compose_inventory(compose, None).expect("periodic policies are valid");
+
+        assert_eq!(
+            policies.get("example/daily:latest"),
+            Some(&ComposePullPolicy::Refresh(TimeDelta::days(1)))
+        );
+        assert_eq!(
+            policies.get("example/weekly:latest"),
+            Some(&ComposePullPolicy::Refresh(TimeDelta::weeks(1)))
+        );
+        assert_eq!(
+            policies.get("example/shared:latest"),
+            Some(&ComposePullPolicy::Refresh(TimeDelta::minutes(30)))
+        );
+        assert_eq!(
+            policies.get("example/forced:latest"),
+            Some(&ComposePullPolicy::Always)
+        );
+        assert_eq!(
+            policies.get("example/optional:latest"),
+            Some(&ComposePullPolicy::Missing)
+        );
+        assert!(!policies.contains_key("example/local:latest"));
+        assert!(
+            parse_compose_inventory(
+                "services:\n  web:\n    image: nginx\n    pull_policy: every_sometime\n",
+                None
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn compose_periodic_duration_matches_compose_grammar() {
+        assert_eq!(
+            parse_compose_duration("1w2d3h4m5.5s"),
+            Some(
+                TimeDelta::weeks(1)
+                    + TimeDelta::days(2)
+                    + TimeDelta::hours(3)
+                    + TimeDelta::minutes(4)
+                    + TimeDelta::seconds(5)
+                    + TimeDelta::milliseconds(500)
+            )
+        );
+        assert_eq!(
+            parse_compose_duration("10s1us693ns"),
+            Some(TimeDelta::seconds(10) + TimeDelta::microseconds(1) + TimeDelta::nanoseconds(693))
+        );
+        assert_eq!(parse_compose_duration("-1h"), Some(-TimeDelta::hours(1)));
+        assert!(parse_compose_duration("12hours").is_none());
+        assert!(parse_compose_duration("1h30").is_none());
+    }
+
+    #[test]
+    fn periodic_pull_is_due_from_docker_last_tag_time() {
+        let now = DateTime::parse_from_rfc3339("2026-09-16T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let daily = ComposePullPolicy::Refresh(TimeDelta::days(1));
+
+        assert!(compose_pull_due(daily, false, None, now));
+        assert!(compose_pull_due(daily, true, None, now));
+        assert!(!compose_pull_due(
+            daily,
+            true,
+            Some(now - TimeDelta::hours(23)),
+            now
+        ));
+        assert!(!compose_pull_due(
+            daily,
+            true,
+            Some(now - TimeDelta::days(1)),
+            now
+        ));
+        assert!(compose_pull_due(
+            daily,
+            true,
+            Some(now - TimeDelta::hours(25)),
+            now
+        ));
     }
 
     #[test]

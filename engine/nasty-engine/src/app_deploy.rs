@@ -619,15 +619,15 @@ async fn deploy_compose(
             DeployMessage::log("Pulling images...").into(),
         ))
         .await;
-    let images = match state
+    let image_plan = match state
         .apps
-        .compose_images_from_path(
+        .compose_image_plan_from_path(
             std::path::Path::new(&staged_compose_path),
             Some(std::path::Path::new(&env_path)),
         )
         .await
     {
-        Ok(images) => images,
+        Ok(plan) => plan,
         Err(error) => {
             report_error(
                 socket,
@@ -651,7 +651,7 @@ async fn deploy_compose(
     };
     if let Err(error) = state
         .apps
-        .validate_registry_bindings(&images, &registry_credential_ids)
+        .validate_registry_bindings(&image_plan.images, &registry_credential_ids)
         .await
     {
         report_error(
@@ -673,14 +673,14 @@ async fn deploy_compose(
         rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
         return;
     }
-    if images.is_empty() {
+    if image_plan.pull_images.is_empty() {
         let _ = socket
             .send(Message::Text(
-                DeployMessage::log("No images to pull (all built locally?)").into(),
+                DeployMessage::log("No image pulls are due.").into(),
             ))
             .await;
     } else {
-        for image in &images {
+        for image in &image_plan.pull_images {
             let _ = socket
                 .send(Message::Text(
                     DeployMessage::log(&format!("Pulling: {image}")).into(),
@@ -1507,18 +1507,6 @@ pub(crate) fn validate_compose(
     for (svc_name, svc) in services {
         let scope = |field: &str| format!("services.{svc_name}.{field}");
 
-        if let Some(policy) = svc.get("pull_policy").and_then(|value| value.as_str())
-            && !matches!(
-                policy,
-                "always" | "missing" | "if_not_present" | "never" | "build"
-            )
-        {
-            return Err(format!(
-                "{} uses unsupported periodic policy '{policy}'; use always, missing, never, or build",
-                scope("pull_policy")
-            ));
-        }
-
         if !allow_unsafe {
             if svc.get("privileged").is_some_and(|value| {
                 value.as_bool() == Some(true)
@@ -1999,11 +1987,12 @@ mod tests {
     }
 
     #[test]
-    fn compose_rejects_periodic_pull_policies_we_cannot_preserve() {
-        err_strict(
-            "services:\n  web:\n    image: nginx\n    pull_policy: daily\n",
-            "unsupported periodic policy",
-        );
+    fn compose_accepts_periodic_pull_policies() {
+        for policy in ["daily", "weekly", "every_12h", "every_1h30m"] {
+            ok_strict(&format!(
+                "services:\n  web:\n    image: nginx\n    pull_policy: {policy}\n"
+            ));
+        }
     }
 
     #[test]
