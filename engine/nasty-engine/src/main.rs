@@ -917,8 +917,24 @@ async fn main() -> anyhow::Result<()> {
     // up — see the module docs in nasty_backup::scheduler for why.
     {
         let backups = state.backups.clone_for_task();
+        let mut initial_state = nasty_backup::scheduler::SchedulerTick::new(chrono::Utc::now());
+        initial_state.seed_profiles(&backups.list_profiles().await);
+        let scheduler_state = Arc::new(tokio::sync::Mutex::new(initial_state));
         tokio::spawn(async move {
-            nasty_backup::scheduler::run_scheduler_loop(backups).await;
+            loop {
+                let scheduler = backups.clone_for_task();
+                let scheduler_state = scheduler_state.clone();
+                match tokio::spawn(async move {
+                    nasty_backup::scheduler::run_scheduler_loop(scheduler, scheduler_state).await;
+                })
+                .await
+                {
+                    Ok(()) => error!("backup scheduler exited unexpectedly"),
+                    Err(error) => error!("backup scheduler task failed: {error}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                warn!("restarting backup scheduler");
+            }
         });
     }
 
