@@ -859,6 +859,11 @@ in {
         cargoLock.lockFile = "${netwatchSrc}/Cargo.lock";
         nativeBuildInputs = [ pkgs.pkg-config ];
         buildInputs = [ pkgs.libpcap ];
+        # Requires observing independent child processes through /proc,
+        # which is intentionally unavailable in the Nix build sandbox.
+        checkFlags = [
+          "--skip=collectors::connections::tests::controlled_polling_matrix_matches_independent_processes"
+        ];
         postInstall = ''
           install -Dm644 LICENSE "$out/share/licenses/netwatch/LICENSE"
           install -Dm644 NOTICE "$out/share/licenses/netwatch/NOTICE"
