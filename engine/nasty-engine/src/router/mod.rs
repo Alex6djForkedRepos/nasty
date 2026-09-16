@@ -2176,6 +2176,12 @@ mod tests {
     }
 
     #[test]
+    fn scrub_schedule_role_classification_matches_api_semantics() {
+        assert!(is_read_only("fs.scrub.schedule.get"));
+        assert!(!is_read_only("fs.scrub.schedule.update"));
+    }
+
+    #[test]
     fn network_inspection_methods_are_management_reads() {
         for method in ["system.network.pending", "system.network.nm_preview"] {
             assert!(is_read_only(method));
@@ -2232,6 +2238,7 @@ mod tests {
             "fs.unmount",
             "fs.unlock",
             "fs.lock",
+            "fs.scrub.schedule.update",
             "fs.device.add",
             "fs.device.remove",
             "subvolume.create",

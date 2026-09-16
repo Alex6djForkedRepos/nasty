@@ -954,8 +954,20 @@ fn scrub_process_pattern(mount: &str) -> String {
 }
 
 async fn scrub_process_is_alive(mount: &str) -> bool {
+    scrub_process_running_known(mount).await.unwrap_or(false)
+}
+
+async fn scrub_process_running_known(mount: &str) -> Result<bool, FilesystemError> {
     let pattern = scrub_process_pattern(mount);
-    cmd::run_ok("pgrep", &["-f", &pattern]).await.is_ok()
+    let output = cmd::run("pgrep", &["-f", &pattern]).await?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(FilesystemError::CommandFailed(format!(
+            "cannot determine whether a scrub process is running ({})",
+            output.status
+        ))),
+    }
 }
 
 fn scrub_status_run_id(status: &ScrubStatus, name: &str) -> String {
@@ -2176,10 +2188,14 @@ fn build_create_format_args(req: &CreateFilesystemRequest, devices: &[DeviceSpec
 #[derive(Clone)]
 pub struct FilesystemService {
     list_cache: ListCache,
-    /// Serializes operations that can claim, repartition, or wipe block
-    /// devices. Identity checks still protect against changes made by other
-    /// processes, but this closes the in-process preflight-to-format race.
+    /// Serializes operations that can claim, repartition, wipe, mount, or
+    /// unmount block devices. Identity checks still protect against changes
+    /// made by other processes, but this closes in-process lifecycle races.
     block_mutations: Arc<Mutex<()>>,
+    /// Serializes manual and scheduled scrub admission. Scheduled admission
+    /// performs a global recheck while holding this lock; manual admission
+    /// retains its existing per-filesystem policy.
+    scrub_admission: Arc<Mutex<()>>,
     /// Per-filesystem scrub state, loaded from `SCRUB_STATE_PATH` on
     /// construction. Mutated by `scrub_start` (sets `running` /
     /// `started_at`) and the spawned scrub task (records completion);
@@ -2270,6 +2286,7 @@ impl FilesystemService {
         Self {
             list_cache: Arc::new(Mutex::new(None)),
             block_mutations: Arc::new(Mutex::new(())),
+            scrub_admission: Arc::new(Mutex::new(())),
             scrub_state: Arc::new(Mutex::new(scrub)),
             scrub_persist: Arc::new(Mutex::new(())),
             mount_state: Arc::new(Mutex::new(mount)),
@@ -2943,6 +2960,12 @@ impl FilesystemService {
         let _mutation_guard = self.block_mutations.lock().await;
 
         let fs = self.get(&req.name).await?;
+        if self.scrub_running_known(&req.name).await? {
+            return Err(FilesystemError::CommandFailed(format!(
+                "cannot destroy filesystem '{}' while a scrub is running",
+                req.name
+            )));
+        }
         verify_filesystem_device_identity(&fs).await?;
 
         let mount_dir = format!("{NASTY_MOUNT_BASE}/{}", req.name);
@@ -3579,8 +3602,14 @@ impl FilesystemService {
 
     /// Unmount a filesystem
     pub async fn unmount(&self, name: &str) -> Result<(), FilesystemError> {
+        let _mutation_guard = self.block_mutations.lock().await;
         info!("Unmounting filesystem '{}'", name);
         let fs = self.get(name).await?;
+        if self.scrub_running_known(name).await? {
+            return Err(FilesystemError::CommandFailed(format!(
+                "cannot unmount filesystem '{name}' while a scrub is running"
+            )));
+        }
         if fs.mounted
             && let Some(ref mp) = fs.mount_point
         {
@@ -4433,7 +4462,69 @@ impl FilesystemService {
     /// restart still surfaces "last scrub finished N hours ago,
     /// found X errors" rather than the previous "no scrub running".
     pub async fn scrub_start(&self, name: &str) -> Result<(), FilesystemError> {
+        let _admission = self.scrub_admission.lock().await;
+        let _mutation = self.block_mutations.lock().await;
         let fs = self.get(name).await?;
+        self.scrub_start_admitted(name, fs).await
+    }
+
+    /// Admit a scheduled scrub only if the name still resolves to the UUID
+    /// selected by the scheduler and no scrub is running (or uncertain)
+    /// anywhere. Manual starts use [`Self::scrub_start`] and remain subject only
+    /// to their established per-filesystem exclusion.
+    pub async fn scrub_start_scheduled(
+        &self,
+        name: &str,
+        expected_uuid: &str,
+    ) -> Result<(), FilesystemError> {
+        let _admission = self.scrub_admission.lock().await;
+        let _mutation = self.block_mutations.lock().await;
+        let fs = self.get(name).await?;
+        validate_expected_scrub_uuid(name, expected_uuid, &fs.uuid)?;
+
+        let filesystems = self.list().await.map_err(|error| {
+            FilesystemError::CommandFailed(format!(
+                "cannot establish global scrub state for scheduled admission: {error}"
+            ))
+        })?;
+        for candidate in filesystems {
+            let running = self
+                .scrub_running_known(&candidate.name)
+                .await
+                .map_err(|error| {
+                    FilesystemError::CommandFailed(format!(
+                        "cannot establish scrub state for filesystem '{}': {error}",
+                        candidate.name
+                    ))
+                })?;
+            if running {
+                return Err(FilesystemError::CommandFailed(format!(
+                    "a scrub is already running on filesystem '{}'",
+                    candidate.name
+                )));
+            }
+        }
+
+        self.scrub_start_admitted(name, fs).await
+    }
+
+    pub(crate) async fn scrub_running_known(&self, name: &str) -> Result<bool, FilesystemError> {
+        let filesystem = self.get(name).await?;
+        let status = self.scrub_status(name).await?;
+        if status.running {
+            return Ok(true);
+        }
+        match filesystem.mount_point.as_deref() {
+            Some(mount_point) => scrub_process_running_known(mount_point).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn scrub_start_admitted(
+        &self,
+        name: &str,
+        fs: Filesystem,
+    ) -> Result<(), FilesystemError> {
         if !fs.mounted {
             return Err(FilesystemError::CommandFailed(
                 "filesystem must be mounted to start scrub".to_string(),
@@ -7832,6 +7923,19 @@ async fn verify_mountpoint_identity(
     Ok(())
 }
 
+fn validate_expected_scrub_uuid(
+    name: &str,
+    expected_uuid: &str,
+    actual_uuid: &str,
+) -> Result<(), FilesystemError> {
+    if actual_uuid != expected_uuid {
+        return Err(FilesystemError::CommandFailed(format!(
+            "filesystem '{name}' now resolves to UUID {actual_uuid}, not scheduled UUID {expected_uuid}; refusing scrub"
+        )));
+    }
+    Ok(())
+}
+
 async fn verify_device_paths_uuid(
     paths: Vec<String>,
     expected_uuid: &str,
@@ -7873,6 +7977,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_file(&path);
         path
+    }
+
+    #[test]
+    fn scheduled_scrub_uuid_must_still_match_name() {
+        assert!(validate_expected_scrub_uuid("tank", "uuid-a", "uuid-a").is_ok());
+        let error = validate_expected_scrub_uuid("tank", "uuid-a", "uuid-b").unwrap_err();
+        assert!(error.to_string().contains("not scheduled UUID uuid-a"));
     }
 
     fn create_request(paths: &[&str]) -> CreateFilesystemRequest {

@@ -200,6 +200,15 @@ pub struct Operation {
     /// "ok" | "errors" | "failed" | "cancelled"; scrub rows only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<String>,
+    /// Normalized five-field POSIX cron schedule; scrub rows only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
+    /// Next nominal scrub cron occurrence in RFC3339 UTC; scrub rows only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    /// Schedule persistence/validation error; scrub rows only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_error: Option<String>,
     /// Short operator-facing line, e.g. "Evacuating sdc" or "Scrub 42%".
     pub detail: String,
     /// Action the UI offers: "start" (idle scrub) | "cancel"

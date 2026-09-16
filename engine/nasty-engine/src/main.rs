@@ -75,6 +75,7 @@ pub struct AppState {
     pub tailscale: nasty_system::tailscale::TailscaleService,
     pub metrics_client: reqwest::Client,
     pub filesystems: nasty_storage::FilesystemService,
+    pub scrub_schedules: nasty_storage::ScrubScheduleService,
     /// Filesystems that failed to mount on startup (persistent alert source).
     pub mount_failures: tokio::sync::Mutex<Vec<String>>,
     pub subvolumes: Arc<nasty_storage::SubvolumeService>,
@@ -252,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
         tailscale: nasty_system::tailscale::TailscaleService::new().await,
         metrics_client: reqwest::Client::new(),
         filesystems: nasty_storage::FilesystemService::new(),
+        scrub_schedules: nasty_storage::ScrubScheduleService::new(),
         mount_failures: tokio::sync::Mutex::new(Vec::new()),
         snapshots: nasty_snapshot::SnapshotService::new(subvolumes.clone()),
         subvolumes,
@@ -908,6 +910,33 @@ async fn main() -> anyhow::Result<()> {
 
     // Background alert evaluation + notifications
     spawn_alert_notifier(state.clone());
+
+    // Periodic scrub scheduler. Its cursor lives outside the worker task so an
+    // unexpected panic can be supervised without replaying an occurrence.
+    {
+        let schedules = state.scrub_schedules.clone();
+        let filesystems = state.filesystems.clone();
+        let events = state.events.clone();
+        let cursor = Arc::new(tokio::sync::Mutex::new(
+            nasty_storage::scrub_scheduler::SchedulerCursor::new(chrono::Utc::now()),
+        ));
+        tokio::spawn(async move {
+            loop {
+                let worker = tokio::spawn(nasty_storage::scrub_scheduler::run_scheduler_loop(
+                    schedules.clone(),
+                    filesystems.clone(),
+                    events.clone(),
+                    cursor.clone(),
+                ));
+                match worker.await {
+                    Ok(()) => warn!("Scrub scheduler exited unexpectedly; restarting"),
+                    Err(error) => warn!("Scrub scheduler task failed: {error}; restarting"),
+                }
+                cursor.lock().await.resume_after_restart(chrono::Utc::now());
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
 
     // Cron-driven backup scheduler. Polls profile list every 60s;
     // when an enabled profile's cron expression elapses since its

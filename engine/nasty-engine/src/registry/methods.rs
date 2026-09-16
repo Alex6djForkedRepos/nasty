@@ -44,6 +44,7 @@ use nasty_storage::filesystem::{
     ScrubStatus, TpmBindStatus, UnavailableFilesystem, UpdateFilesystemOptionsRequest,
 };
 use nasty_storage::io_scheduler::{IoSchedulerResult, IoSchedulerUpdate};
+use nasty_storage::scrub_scheduler::{ScrubScheduleStatus, ScrubScheduleUpdate};
 use nasty_storage::subvolume::{
     CloneSnapshotRequest, CloneSubvolumeRequest, CreateSnapshotRequest, CreateSubvolumeRequest,
     DeleteSnapshotRequest, DeleteSubvolumeRequest, FindByPropertyRequest, RemovePropertiesRequest,
@@ -639,6 +640,20 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<ScrubCancelRequest>(generator)),
                     result: None,
+                },
+                Method {
+                    name: "fs.scrub.schedule.get",
+                    desc: "Return the optional five-field POSIX scrub schedule and next nominal UTC cron occurrence. Filesystem-scoped sessions may read only their assigned filesystem; owner-scoped sessions are denied.",
+                    role: MethodRole::Any,
+                    params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
+                    result: Some(gen_schema::<ScrubScheduleStatus>(generator)),
+                },
+                Method {
+                    name: "fs.scrub.schedule.update",
+                    desc: "Set a filesystem's required, nullable five-field POSIX scrub schedule in UTC, or disable periodic scrubs with null/whitespace. Missed occurrences are not caught up.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<ScrubScheduleUpdate>(generator)),
+                    result: Some(gen_schema::<ScrubScheduleStatus>(generator)),
                 },
                 Method {
                     name: "fs.fsck.start",
