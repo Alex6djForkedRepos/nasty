@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.1.1 — 2026-09-16
+
+> **This release improves dashboard control, authorization boundaries, and
+> operational reliability.** Dashboards can be arranged into named views with
+> denser, configurable widgets. Backup and application recovery paths are more
+> resilient, security checks cover additional API surfaces, and bundled system
+> and diagnostics packages receive current fixes.
+
+### Dashboard and WebUI
+
+- Dashboards support named views, edit mode, free placement, configurable grid
+  density, and compact compute, health, and resource widgets (#810, #812,
+  #818–#829).
+- Update availability is visible in the sidebar and emphasized consistently,
+  while release polling and status handling are more reliable (#817, #822,
+  #836, #858).
+- Dashboard clock, memory severity, chip layout, and removal interactions are
+  polished across screen sizes (#830–#834, #837).
+- Login waits for the engine startup result, reports progress, and fails closed
+  instead of briefly exposing authentication controls (#890).
+
+### Security and access control
+
+- API authorization and response filtering are tightened for apps, audits,
+  backups, firmware, logs, networking, notifications, sharing, storage, and
+  update operations (#846–#875).
+- Application volume permission changes remain within the managed storage
+  boundary, and sensitive settings no longer leak through API responses
+  (#864, #848).
+- The `suppaftp` advisory is resolved and Argon2, WebAuthn, Vitest, Rust, and
+  WebUI dependencies receive compatible updates (#808, #841–#844).
+
+### Reliability and operations
+
+- Backup scheduling recovers cleanly from interrupted jobs, persists state
+  correctly, exposes failures, and handles retries more reliably (#838–#840,
+  #885).
+- Missing application storage is recovered safely, and private container
+  registry credentials can be managed without losing periodic pull policies
+  (#879, #889).
+- Periodic bcachefs scrub schedules and richer scrub outcomes improve ongoing
+  maintenance visibility (#856, #888).
+- A watchdog service improves recovery from engine failures (#800).
+
+### Platform and tools
+
+- bcachefs-tools moves to **1.39.6**, Linux to **6.18.52**, and Tailscale to
+  **1.102.4** (#803, #806, #850, #877, #884, #891).
+- DiskWatch moves to **0.5.8**, NetWatch to **0.31.4**, SysWatch to **0.14.2**,
+  and nasty-top to **0.0.11** (#870, #876, #891).
+
 ## v0.1.0 — 2026-08-25
 
 > **This is the storage resilience, control & observability release.**
