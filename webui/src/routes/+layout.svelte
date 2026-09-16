@@ -2,7 +2,8 @@
 	import { onMount, setContext } from 'svelte';
 	import { page } from '$app/stores';
 	import { getClient, resetClient } from '$lib/client';
-	import { login as doLogin, logout as doLogout, loginWebauthn as doLoginWebauthn } from '$lib/auth';
+	import { EngineUnavailableError, login as doLogin, logout as doLogout, loginWebauthn as doLoginWebauthn } from '$lib/auth';
+	import { pollEngineUntilReady, waitingBootStatus } from '$lib/engine-startup';
 	import { error as showError, isBusy, withToast } from '$lib/toast.svelte';
 	import Toasts from '$lib/components/Toasts.svelte';
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -92,7 +93,9 @@
 	let loginUser = $state('admin');
 	let loginPass = $state('');
 	let loginError = $state('');
+	let loginPending = $state(false);
 	let ssoEnabled = $state(false);
+	let ssoAvailabilityKnown = $state(false);
 	// Whether the engine reports at least one user has registered a
 	// WebAuthn credential. Gates the "Sign in with security key"
 	// button on top of the browser-capability check — on a fresh
@@ -109,7 +112,8 @@
 	// us surface `ready_with_errors` as a persistent banner so the
 	// operator knows a phase failed at boot and can act on it.
 	// See engine PRs #300 + #301 (#299 design issue).
-	let bootStatus = $state<BootStatus | null>(null);
+	let bootStatus = $state<BootStatus | null>(waitingBootStatus());
+	let startupAbortController: AbortController | null = null;
 	/// Dismiss flag for the post-login "boot had errors" banner so
 	/// it doesn't reappear every page load until manually fixed.
 	const BOOT_BANNER_DISMISSED_KEY = 'nasty:boot_errors_dismissed';
@@ -120,56 +124,6 @@
 	function dismissBootBanner() {
 		bootBannerDismissed = true;
 		localStorage.setItem(BOOT_BANNER_DISMISSED_KEY, '1');
-	}
-
-	/**
-	 * Fetch the engine's boot snapshot. Returns null on network
-	 * error (engine not even listening yet) so the caller can
-	 * decide whether to keep polling or give up.
-	 */
-	async function fetchBootStatus(): Promise<BootStatus | null> {
-		try {
-			const res = await fetch('/api/boot_status');
-			if (!res.ok) return null;
-			return (await res.json()) as BootStatus;
-		} catch {
-			return null;
-		}
-	}
-
-	/**
-	 * Poll /api/boot_status until the engine reports a non-booting
-	 * overall state, then stop. Updates the `bootStatus` $state
-	 * after every poll so the overlay UI stays current. Resolves
-	 * with the final snapshot (so callers waiting for "engine is
-	 * ready" have something to inspect).
-	 */
-	async function pollUntilReady(): Promise<BootStatus | null> {
-		// 600ms is a fast-enough cadence that phase transitions
-		// feel live without hammering the engine. The overlay also
-		// renders incremental progress (which phases are Ok vs
-		// still Running) so the user sees motion even between
-		// polls.
-		for (;;) {
-			const snap = await fetchBootStatus();
-			if (snap) {
-				bootStatus = snap;
-				if (snap.overall !== 'booting') return snap;
-			} else {
-				// Couldn't reach the engine. Show a placeholder
-				// state so the overlay can render "waiting for
-				// engine…" rather than flashing the login form.
-				if (!bootStatus) {
-					bootStatus = {
-						overall: 'booting',
-						phases: [],
-						process_started_at_unix: Math.floor(Date.now() / 1000),
-						ready_at_ms: null,
-					};
-				}
-			}
-			await new Promise((r) => setTimeout(r, 600));
-		}
 	}
 
 	// Consume an OIDC redirect's URL fragment. The fragment used to carry
@@ -194,15 +148,19 @@
 	}
 
 	async function refreshSsoAvailability() {
+		ssoEnabled = false;
+		ssoAvailabilityKnown = false;
 		try {
-			const res = await fetch('/api/auth/oidc/available');
+			const res = await fetch('/api/auth/oidc/available', { cache: 'no-store' });
 			if (res.ok) {
 				const body = await res.json();
 				ssoEnabled = !!body.enabled;
-			} else {
+				ssoAvailabilityKnown = true;
+			} else if (res.status < 500) {
 				ssoEnabled = false;
+				ssoAvailabilityKnown = true;
 			}
-		} catch { ssoEnabled = false; }
+		} catch { /* Keep the disabled placeholder until capability detection succeeds. */ }
 	}
 
 	async function refreshWebauthnAvailability() {
@@ -218,6 +176,7 @@
 	}
 
 	function startSso() {
+		if (!ssoEnabled || !engineReady) return;
 		window.location.assign('/api/auth/oidc/start');
 	}
 
@@ -684,6 +643,8 @@
 		const backupPoll = setInterval(checkConfigBackup, 30_000);
 		return () => {
 			releaseUpdatePolling = false;
+			startupAbortController?.abort();
+			startupAbortController = null;
 			stopBcachefsSwitchPolling();
 			if (reconnectingTimer) clearTimeout(reconnectingTimer);
 			if (releaseUpdatePoll) clearTimeout(releaseUpdatePoll);
@@ -705,38 +666,46 @@
 
 	async function tryConnect() {
 		consumeSsoFragment();
-		// Check engine boot state before anything else. If the engine
-		// is still walking its startup phases (Type=notify + 17-step
-		// restoration sequence — see #299), there's no point hitting
-		// /api/auth/check yet: at best it'd 502 through Caddy, at
-		// worst it'd race a half-initialized auth service. The boot
-		// overlay shows live progress instead. Once the engine reports
-		// `ready` or `ready_with_errors` we fall through to the normal
-		// connect flow.
-		const initial = await fetchBootStatus();
-		if (initial) {
-			bootStatus = initial;
-			if (initial.overall === 'booting') {
-				await pollUntilReady();
+		startupAbortController?.abort();
+		const controller = new AbortController();
+		startupAbortController = controller;
+
+		// Caddy serves the WebUI before nasty-engine binds its API port.
+		// Treat an initial gateway/network failure as "still waiting" and
+		// keep the login controls disabled until boot status is reachable.
+		for (;;) {
+			const ready = await pollEngineUntilReady({
+				onStatus: (status) => { bootStatus = status; },
+				signal: controller.signal,
+			});
+			if (!ready || controller.signal.aborted) return;
+
+			try {
+				const probe = await fetch('/api/auth/check', {
+					cache: 'no-store',
+					signal: controller.signal,
+				});
+				if (probe.status === 200) break;
+				if (probe.status >= 500) {
+					bootStatus = waitingBootStatus();
+					await new Promise((resolve) => setTimeout(resolve, 600));
+					continue;
+				}
+				void refreshSsoAvailability();
+				void refreshWebauthnAvailability();
+				showLogin = true;
+				startupAbortController = null;
+				return;
+			} catch {
+				if (controller.signal.aborted) return;
+				bootStatus = waitingBootStatus();
+				await new Promise((resolve) => setTimeout(resolve, 600));
 			}
 		}
+		startupAbortController = null;
+
 		// Probe the cookie before opening a WS — saves us from the WS auth
 		// timeout when the user isn't logged in yet.
-		try {
-			const probe = await fetch('/api/auth/check');
-			if (probe.status !== 200) {
-				refreshSsoAvailability();
-				refreshWebauthnAvailability();
-				showLogin = true;
-				return;
-			}
-		} catch {
-			// Engine offline — let the reconnect machinery surface that, but
-			// don't block the login form.
-			refreshSsoAvailability();
-			showLogin = true;
-			return;
-		}
 		try {
 			const client = getClient();
 			bindClientLifecycle(client);
@@ -774,13 +743,22 @@
 	}
 
 	async function handleLogin() {
+		if (loginDisabled) return;
 		loginError = '';
+		loginPending = true;
 		try {
 			await doLogin(loginUser, loginPass);
 			loginPass = '';
 			await tryConnect();
 		} catch (e) {
-			loginError = e instanceof Error ? e.message : 'Login failed';
+			if (e instanceof EngineUnavailableError) {
+				bootStatus = waitingBootStatus();
+				await tryConnect();
+			} else {
+				loginError = e instanceof Error ? e.message : 'Login failed';
+			}
+		} finally {
+			loginPending = false;
 		}
 	}
 
@@ -795,6 +773,17 @@
 			&& 'PublicKeyCredential' in window
 			&& typeof navigator !== 'undefined'
 			&& !!navigator.credentials?.get,
+	);
+	const engineReady = $derived(bootStatus !== null && bootStatus.overall !== 'booting');
+	const loginDisabled = $derived(!engineReady || loginPending || webauthnPending);
+	const showSsoLogin = $derived(!engineReady || !ssoAvailabilityKnown || ssoEnabled);
+	const completedBootPhases = $derived(
+		bootStatus?.phases.filter((phase) => phase.state === 'ok' || phase.state === 'failed').length ?? 0,
+	);
+	const bootProgressPercent = $derived(
+		bootStatus?.phases.length
+			? Math.round(completedBootPhases / bootStatus.phases.length * 100)
+			: undefined,
 	);
 
 	async function handleWebauthnLogin() {
@@ -871,6 +860,8 @@
 		profileOpen = false;
 		powerOpen = false;
 		showLogin = true;
+		void refreshSsoAvailability();
+		void refreshWebauthnAvailability();
 	}
 
 	async function handleRestart() {
@@ -995,70 +986,61 @@
 		The page owns its own chrome and uses only public endpoints.
 	-->
 	{@render children()}
-{:else if bootStatus && bootStatus.overall === 'booting'}
-	<!--
-		Engine is mid-startup. Show the per-phase checklist so the
-		operator sees motion and can spot whether a specific phase
-		is stuck rather than staring at a generic spinner. This is
-		also the only thing rendered while the engine isn't yet
-		accepting auth — login is meaningless here.
-	-->
+{:else if (bootStatus && bootStatus.overall === 'booting') || showLogin}
+	{@const engineStarting = bootStatus?.overall === 'booting'}
 	<div class="flex min-h-screen items-center justify-center bg-background p-6">
-		<div class="w-full max-w-lg rounded-xl border border-border bg-card p-8">
-			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mb-4 h-32 mx-auto" />
-			<h1 class="text-center text-lg font-semibold">NASty is starting up…</h1>
-			<p class="mt-1 text-center text-sm text-muted-foreground">
-				Waiting for the engine to finish restoring system state. Login will appear automatically once it's ready.
-			</p>
-			<ul class="mt-6 divide-y divide-border/40">
-				{#each bootStatus.phases as phase (phase.name)}
-					<li class="flex items-center justify-between gap-3 py-2 text-sm">
-						<span class="flex items-center gap-2 min-w-0">
-							{#if phase.state === 'pending'}
-								<span class="inline-block h-2 w-2 shrink-0 rounded-full bg-muted-foreground/40" aria-label="pending"></span>
-							{:else if phase.state === 'running'}
-								<span class="inline-block h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-400" aria-label="running"></span>
-							{:else if phase.state === 'ok'}
-								<span class="inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500" aria-label="ok"></span>
-							{:else}
-								<span class="inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500" aria-label="failed"></span>
-							{/if}
-							<code class="truncate font-mono text-xs text-muted-foreground">{phase.name}</code>
-						</span>
-						<span class="text-xs text-muted-foreground tabular-nums">
-							{#if phase.state === 'pending'}—{/if}
-							{#if phase.state === 'running'}…{/if}
-							{#if phase.duration_ms != null}
-								{(phase.duration_ms / 1000).toFixed(1)}s
-							{/if}
-						</span>
-					</li>
-				{:else}
-					<li class="py-2 text-center text-sm text-muted-foreground">Connecting to engine…</li>
-				{/each}
-			</ul>
-		</div>
-	</div>
-{:else if showLogin}
-	<div class="flex min-h-screen items-center justify-center">
-		<div class="w-[340px] rounded-xl border border-border bg-card p-8">
-			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mb-4 h-48 mx-auto" />
-			<p class="mb-6 text-sm text-muted-foreground">Sign in to manage your storage</p>
-			{#if loginError}
+		<div class="w-full max-w-[380px] rounded-xl border border-border bg-card p-8" aria-busy={loginDisabled}>
+			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mb-4 h-40 mx-auto" />
+			{#if engineStarting}
+				<h1 class="text-center text-lg font-semibold">NASty is starting up…</h1>
+				<p class="mt-1 text-center text-sm text-muted-foreground" aria-live="polite">
+					{bootStatus?.phases.length
+						? 'Restoring system state. Sign-in will unlock automatically when the engine is ready.'
+						: 'Web interface ready. Waiting for the engine before enabling sign-in.'}
+				</p>
+				<div class="my-5">
+					<div
+						class="h-1.5 overflow-hidden rounded-full bg-muted"
+						role="progressbar"
+						aria-label="Engine startup progress"
+						aria-valuemin="0"
+						aria-valuemax="100"
+						aria-valuenow={bootProgressPercent}
+					>
+						{#if bootProgressPercent == null}
+							<div class="h-full w-2/5 animate-pulse rounded-full bg-primary"></div>
+						{:else}
+							<div class="h-full rounded-full bg-primary transition-[width] duration-500" style={`width: ${bootProgressPercent}%`}></div>
+						{/if}
+					</div>
+					<p class="mt-2 text-center text-xs text-muted-foreground">
+						{#if bootProgressPercent == null}
+							Connecting to engine…
+						{:else}
+							{completedBootPhases} of {bootStatus?.phases.length ?? 0} startup phases complete
+						{/if}
+					</p>
+				</div>
+			{:else}
+				<p class="mb-6 text-sm text-muted-foreground">Sign in to manage your storage</p>
+			{/if}
+			{#if loginError && !engineStarting}
 				<p class="mb-4 text-sm text-destructive">{loginError}</p>
 			{/if}
-			<form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
+			<form aria-busy={loginPending} onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
 				<div class="mb-4">
 					<Label for="username">Username</Label>
-					<Input id="username" bind:value={loginUser} autocomplete="username" class="mt-1" />
+					<Input id="username" bind:value={loginUser} autocomplete="username" class="mt-1" disabled={loginDisabled} />
 				</div>
 				<div class="mb-4">
 					<Label for="password">Password</Label>
-					<Input id="password" type="password" bind:value={loginPass} autocomplete="current-password" class="mt-1" />
+					<Input id="password" type="password" bind:value={loginPass} autocomplete="current-password" class="mt-1" disabled={loginDisabled} />
 				</div>
-				<Button type="submit" class="w-full" disabled={webauthnPending}>Sign In</Button>
+				<Button type="submit" class="w-full" disabled={loginDisabled}>
+					{loginPending ? 'Signing in…' : 'Sign In'}
+				</Button>
 			</form>
-			{#if (webauthnLoginSupported && webauthnHasCredentials) || ssoEnabled}
+			{#if (webauthnLoginSupported && webauthnHasCredentials) || showSsoLogin}
 				<div class="my-4 flex items-center gap-3 text-xs text-muted-foreground">
 					<div class="h-px flex-1 bg-border"></div>
 					<span>or</span>
@@ -1069,15 +1051,33 @@
 				<Button
 					type="button"
 					variant="outline"
-					class="w-full {ssoEnabled ? 'mb-2' : ''}"
-					disabled={webauthnPending}
+					class="w-full {showSsoLogin ? 'mb-2' : ''}"
+					disabled={loginDisabled}
 					onclick={handleWebauthnLogin}
 				>
 					{#if webauthnPending}Tap your security key…{:else}Sign in with security key{/if}
 				</Button>
 			{/if}
-			{#if ssoEnabled}
-				<Button type="button" variant="outline" class="w-full" onclick={startSso}>Sign in with SSO</Button>
+			{#if showSsoLogin}
+				<Button type="button" variant="outline" class="w-full" disabled={loginDisabled || !ssoEnabled} onclick={startSso}>
+					Sign in with SSO
+				</Button>
+			{/if}
+			{#if engineStarting && bootStatus?.phases.length}
+				<ul class="mt-5 max-h-36 divide-y divide-border/40 overflow-y-auto border-t border-border/60">
+					{#each bootStatus.phases as phase (phase.name)}
+						<li class="flex items-center justify-between gap-3 py-2 text-xs">
+							<span class="flex min-w-0 items-center gap-2">
+								<span aria-hidden="true" class:animate-pulse={phase.state === 'running'} class="inline-block h-2 w-2 shrink-0 rounded-full" class:bg-muted-foreground={phase.state === 'pending'} class:bg-blue-400={phase.state === 'running'} class:bg-emerald-500={phase.state === 'ok'} class:bg-amber-500={phase.state === 'failed'}></span>
+								<span class="sr-only">{phase.state}: </span>
+								<code class="truncate font-mono text-muted-foreground">{phase.name}</code>
+							</span>
+							<span class="tabular-nums text-muted-foreground">
+								{phase.duration_ms != null ? `${(phase.duration_ms / 1000).toFixed(1)}s` : phase.state === 'running' ? '…' : '—'}
+							</span>
+						</li>
+					{/each}
+				</ul>
 			{/if}
 		</div>
 	</div>
