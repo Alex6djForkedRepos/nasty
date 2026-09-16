@@ -12,17 +12,40 @@ use crate::AppState;
 use crate::auth::{Role, Session};
 
 fn simple_requires_admin(req: &nasty_apps::InstallAppRequest) -> bool {
-    req.allow_unsafe || req.network.as_deref() == Some("host")
+    req.allow_unsafe
+        || req.network.as_deref() == Some("host")
+        || req
+            .registry_credential_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty())
 }
 
 fn app_requires_admin(app: &nasty_apps::App) -> bool {
-    app.kind == "compose" || app.unsafe_mode || app.network.as_deref() == Some("host")
+    app.kind == "compose"
+        || app.unsafe_mode
+        || app.network.as_deref() == Some("host")
+        || !app.registry_credential_ids.is_empty()
 }
 
 fn preflight_access_error(req: &Request, session: &Session) -> Option<Response> {
-    (req.method == "apps.fix_volume_perms")
-        .then(|| require_root_equivalent(req, session, "host_volume_ownership_change"))
-        .flatten()
+    if req.method == "apps.fix_volume_perms" {
+        return require_root_equivalent(req, session, "host_volume_ownership_change");
+    }
+    if req.method.starts_with("apps.registry_credentials.") {
+        return if req.method.ends_with(".list") {
+            require_root_equivalent_read(req, session, "registry_credentials_read")
+        } else {
+            require_root_equivalent(req, session, "registry_credentials_mutation")
+        };
+    }
+    None
+}
+
+#[derive(Deserialize)]
+struct InspectImageParams {
+    image: String,
+    #[serde(default)]
+    registry_credential_id: Option<String>,
 }
 
 async fn existing_app_requires_admin(state: &AppState, name: &str) -> Result<bool, String> {
@@ -82,6 +105,23 @@ async fn authorize_app_paths(
         }
     }
     Ok(())
+}
+
+async fn simple_registry_access_error(
+    req: &Request,
+    state: &AppState,
+    session: &Session,
+    image: &str,
+) -> Option<Response> {
+    match state
+        .apps
+        .image_has_matching_registry_credentials(image)
+        .await
+    {
+        Ok(true) => require_root_equivalent(req, session, "authenticated_registry_pull"),
+        Ok(false) => None,
+        Err(error) => Some(err(req, error)),
+    }
 }
 
 pub(crate) async fn published_firewall_ports(
@@ -177,9 +217,16 @@ pub(super) async fn try_route(
         },
         "apps.install" => match parse_params::<nasty_apps::InstallAppRequest>(req) {
             Ok(p) => {
+                let app_registry_guard = state.apps.app_registry_read_guard().await;
                 if simple_requires_admin(&p)
                     && let Some(response) =
                         require_root_equivalent(req, session, "unsafe_app_payload")
+                {
+                    return Some(response);
+                }
+                if p.registry_credential_ids.as_ref().is_none_or(Vec::is_empty)
+                    && let Some(response) =
+                        simple_registry_access_error(req, state, session, &p.image).await
                 {
                     return Some(response);
                 }
@@ -204,7 +251,11 @@ pub(super) async fn try_route(
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|s| !s.is_empty());
-                match state.apps.install(p).await {
+                match state
+                    .apps
+                    .install_with_app_registry_guard(p, app_registry_guard)
+                    .await
+                {
                     Ok(v) => {
                         if chose_subdomain {
                             tokio::spawn(nasty_system::settings::reapply_tls_from_disk());
@@ -218,6 +269,7 @@ pub(super) async fn try_route(
         },
         "apps.update" => match parse_params::<nasty_apps::InstallAppRequest>(req) {
             Ok(p) => {
+                let app_registry_guard = state.apps.app_registry_read_guard().await;
                 if let Some(response) =
                     existing_app_access_error(req, state, session, &p.name).await
                 {
@@ -226,6 +278,12 @@ pub(super) async fn try_route(
                 if simple_requires_admin(&p)
                     && let Some(response) =
                         require_root_equivalent(req, session, "unsafe_app_payload")
+                {
+                    return Some(response);
+                }
+                if p.registry_credential_ids.as_ref().is_none_or(Vec::is_empty)
+                    && let Some(response) =
+                        simple_registry_access_error(req, state, session, &p.image).await
                 {
                     return Some(response);
                 }
@@ -241,19 +299,71 @@ pub(super) async fn try_route(
                 {
                     return Some(err(req, error));
                 }
-                match state.apps.update(p).await {
+                match state
+                    .apps
+                    .update_with_app_registry_guard(p, app_registry_guard)
+                    .await
+                {
                     Ok(v) => ok(req, v),
                     Err(e) => err(req, e),
                 }
             }
             Err(e) => invalid(req, e),
         },
-        "apps.inspect_image" => match require_str(req, "image") {
-            Ok(image) => match state.apps.inspect_image(image).await {
-                Ok(v) => ok(req, v),
-                Err(e) => err(req, e),
+        "apps.inspect_image" => match parse_params::<InspectImageParams>(req) {
+            Ok(params) => {
+                let _registry_guard = state.apps.registry_credentials_read_guard().await;
+                if params.registry_credential_id.is_some()
+                    && let Some(response) =
+                        require_root_equivalent_read(req, session, "authenticated_image_inspect")
+                {
+                    return Some(response);
+                }
+                if params.registry_credential_id.is_none()
+                    && let Some(response) =
+                        simple_registry_access_error(req, state, session, &params.image).await
+                {
+                    return Some(response);
+                }
+                match state
+                    .apps
+                    .inspect_image(&params.image, params.registry_credential_id.as_deref())
+                    .await
+                {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                }
+            }
+            Err(e) => invalid(req, e),
+        },
+        "apps.registry_credentials.list" => match state.apps.registry_credentials_list().await {
+            Ok(credentials) => ok(req, credentials),
+            Err(error) => err(req, error),
+        },
+        "apps.registry_credentials.create" => {
+            match parse_params::<nasty_apps::CreateRegistryCredentialRequest>(req) {
+                Ok(params) => match state.apps.registry_credentials_create(params).await {
+                    Ok(credential) => ok(req, credential),
+                    Err(error) => err(req, error),
+                },
+                Err(error) => invalid(req, error),
+            }
+        }
+        "apps.registry_credentials.update" => {
+            match parse_params::<nasty_apps::UpdateRegistryCredentialRequest>(req) {
+                Ok(params) => match state.apps.registry_credentials_update(params).await {
+                    Ok(credential) => ok(req, credential),
+                    Err(error) => err(req, error),
+                },
+                Err(error) => invalid(req, error),
+            }
+        }
+        "apps.registry_credentials.delete" => match require_str(req, "id") {
+            Ok(id) => match state.apps.registry_credentials_delete(id).await {
+                Ok(()) => ok(req, "ok"),
+                Err(error) => err(req, error),
             },
-            Err(r) => r,
+            Err(response) => response,
         },
         "apps.check_ports" => match parse_params(req) {
             Ok(p) => ok(req, state.apps.check_ports(p).await),
@@ -361,10 +471,26 @@ pub(super) async fn try_route(
         },
         "apps.pull" => match require_str(req, "name") {
             Ok(name) => {
+                let app_registry_guard = state.apps.app_registry_read_guard().await;
                 if let Some(response) = existing_app_access_error(req, state, session, name).await {
                     return Some(response);
                 }
-                match state.apps.pull(name).await {
+                match state.apps.get(name).await {
+                    Ok(app) if app.kind == "simple" && app.registry_credential_ids.is_empty() => {
+                        if let Some(response) =
+                            simple_registry_access_error(req, state, session, &app.image).await
+                        {
+                            return Some(response);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Some(err(req, error)),
+                }
+                match state
+                    .apps
+                    .pull_with_app_registry_guard(name, app_registry_guard)
+                    .await
+                {
                     Ok(v) => ok(req, v),
                     Err(e) => err(req, e),
                 }
@@ -755,7 +881,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_admin_gate_covers_unsafe_mounts_and_host_networking() {
+    fn simple_admin_gate_covers_unsafe_mounts_host_networking_and_registry_credentials() {
         assert!(!simple_requires_admin(&simple_request(serde_json::json!(
             {}
         ))));
@@ -764,6 +890,9 @@ mod tests {
         }))));
         assert!(simple_requires_admin(&simple_request(serde_json::json!({
             "network": "host"
+        }))));
+        assert!(simple_requires_admin(&simple_request(serde_json::json!({
+            "registry_credential_ids": ["credential-id"]
         }))));
     }
 
@@ -779,6 +908,44 @@ mod tests {
         assert!(app_requires_admin(&existing_app(serde_json::json!({
             "network": "host"
         }))));
+        assert!(app_requires_admin(&existing_app(serde_json::json!({
+            "registry_credential_ids": ["credential-id"]
+        }))));
+    }
+
+    #[test]
+    fn registry_credentials_require_an_unscoped_admin() {
+        fn session(role: Role, scoped: bool) -> Session {
+            Session {
+                token: "token".into(),
+                username: "user".into(),
+                role,
+                file_principal: None,
+                filesystem: scoped.then(|| "tank".into()),
+                owner: None,
+                created_at: 0,
+                must_change_password: false,
+                client_ip: None,
+            }
+        }
+
+        for method in [
+            "apps.registry_credentials.list",
+            "apps.registry_credentials.create",
+            "apps.registry_credentials.update",
+            "apps.registry_credentials.delete",
+        ] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": {}
+            }))
+            .unwrap();
+            assert!(preflight_access_error(&request, &session(Role::Admin, false)).is_none());
+            assert!(preflight_access_error(&request, &session(Role::Admin, true)).is_some());
+            assert!(preflight_access_error(&request, &session(Role::Operator, false)).is_some());
+        }
     }
 
     #[test]

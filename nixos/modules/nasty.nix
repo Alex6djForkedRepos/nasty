@@ -1832,6 +1832,9 @@ in {
         # in-kernel RM. Setting TPM2TOOLS_TCTI cuts straight to /dev/tpmrm0
         # and keeps the journal readable.
         TPM2TOOLS_TCTI = "device:/dev/tpmrm0";
+        # Never inherit root's Docker auth/config. Registry credentials are
+        # decrypted per pull and sent only through Docker's X-Registry-Auth.
+        DOCKER_CONFIG = "/run/nasty-docker-config";
       };
 
       # Cap restart attempts so a deterministic panic (corrupt state
@@ -1863,6 +1866,8 @@ in {
         # an unclean filesystem finishes recovery.
         TimeoutStartSec = "infinity";
         StateDirectory = "nasty";
+        RuntimeDirectory = "nasty-docker-config";
+        RuntimeDirectoryMode = "0700";
 
         # Keep authentication, RPC dispatch, and status polling responsive
         # during CPU-saturating migrations. Reset-on-fork also resets pthreads,

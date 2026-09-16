@@ -243,6 +243,9 @@ fn is_read_only(method: &str) -> bool {
             // the central gate agrees with the impl and the declared
             // role, instead of relying on the inline check alone.
             | "auth.token.list"
+            // Registry metadata is Admin-only and its `.list` suffix must not
+            // bypass the registry role plus the unscoped-session gate.
+            | "apps.registry_credentials.list"
             // Guest-share management is not a general authenticated read.
             // The router also requires an unscoped Operator/Admin session.
             | "guestshare.list"
@@ -2249,6 +2252,12 @@ mod tests {
         ] {
             assert!(!is_read_only(m), "expected {m} to be a write");
         }
+    }
+
+    #[test]
+    fn registry_credential_metadata_is_not_a_suffix_based_public_read() {
+        assert!(!is_read_only("apps.registry_credentials.list"));
+        assert!(!is_operator_allowed("apps.registry_credentials.list"));
     }
 
     /// Domain principal enumeration is Admin-gated in the registry, so it

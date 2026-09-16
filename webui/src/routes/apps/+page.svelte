@@ -5,13 +5,14 @@
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
-	import type { AppsStatus, App, AppIngress, AppConfig, ImageInspectResult, AppContainer, AppStats, MappedPort, PruneResult, SubPathRecipe, NetworkSummary, ManagedNetwork, NetworkState, ComposeStartupEntry } from '$lib/types';
+	import type { AppsStatus, App, AppIngress, AppConfig, ImageInspectResult, AppContainer, AppStats, MappedPort, PruneResult, SubPathRecipe, NetworkSummary, ManagedNetwork, NetworkState, ComposeStartupEntry, RegistryCredential } from '$lib/types';
 	import { formatBytes } from '$lib/format';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { Card, CardContent } from '$lib/components/ui/card';
+	import * as Dialog from '$lib/components/ui/dialog';
 	import SortTh from '$lib/components/SortTh.svelte';
 	import CodeEditor from '$lib/components/CodeEditor.svelte';
 	import PathPicker from '$lib/components/PathPicker.svelte';
@@ -132,7 +133,6 @@
 			});
 		}
 	});
-
 	let status: AppsStatus | null = $state(null);
 	let apps: App[] = $state([]);
 	// Compose stack startup config (#437), for the Startup-order card.
@@ -377,6 +377,146 @@
 	let newAllowUnsafe = $state(false);
 	/** Same flag, separate state for the compose dialog. */
 	let composeAllowUnsafe = $state(false);
+	let registryCredentials = $state<RegistryCredential[]>([]);
+	let registryCredentialsLoaded = $state(false);
+	let canManageRegistryCredentials = $state(false);
+	let newRegistryCredentialId = $state('');
+	let composeRegistryCredentialIds = $state<string[]>([]);
+	let showRegistryCredentialForm = $state(false);
+	let editingRegistryCredentialId = $state<string | null>(null);
+	let registryLabel = $state('');
+	let registryHost = $state('');
+	let registryUsername = $state('');
+	let registrySecret = $state('');
+	let registrySaving = $state(false);
+	let registryError = $state('');
+
+	async function loadRegistryCredentials() {
+		try {
+			const credentials = await client.call<RegistryCredential[]>('apps.registry_credentials.list');
+			registryCredentials = credentials;
+			registryCredentialsLoaded = true;
+			canManageRegistryCredentials = true;
+			const validIds = new Set(credentials.map((credential) => credential.id));
+			composeRegistryCredentialIds = composeRegistryCredentialIds.filter((id) => validIds.has(id));
+		} catch { /* keep the last known state on transient failures */ }
+	}
+
+	function closeRegistryCredentialForm() {
+		showRegistryCredentialForm = false;
+		registrySecret = '';
+		registryError = '';
+	}
+
+	function openRegistryCredentialForm(credential?: RegistryCredential) {
+		editingRegistryCredentialId = credential?.id ?? null;
+		registryLabel = credential?.label ?? '';
+		registryHost = credential?.registry ?? '';
+		registryUsername = credential?.username ?? '';
+		registrySecret = '';
+		registryError = '';
+		showRegistryCredentialForm = true;
+	}
+
+	async function saveRegistryCredential() {
+		registrySaving = true;
+		registryError = '';
+		try {
+			if (editingRegistryCredentialId) {
+				await client.call('apps.registry_credentials.update', {
+					id: editingRegistryCredentialId,
+					label: registryLabel,
+					username: registryUsername,
+					...(registrySecret ? { secret: registrySecret } : {}),
+				});
+			} else {
+				await client.call('apps.registry_credentials.create', {
+					label: registryLabel,
+					registry: registryHost,
+					username: registryUsername,
+					secret: registrySecret,
+				});
+			}
+			closeRegistryCredentialForm();
+			await loadRegistryCredentials();
+		} catch (error) {
+			registryError = error instanceof Error ? error.message : String(error);
+		} finally {
+			registrySaving = false;
+		}
+	}
+
+	async function removeRegistryCredential(credential: RegistryCredential) {
+		if (!await confirm(`Remove registry login "${credential.label}"?`, 'Apps that reference it must be rebound first.')) return;
+		const result = await withToast(
+			() => client.call('apps.registry_credentials.delete', { id: credential.id }),
+			'Registry login removed',
+		);
+		if (result !== undefined) await loadRegistryCredentials();
+	}
+
+	function toggleComposeRegistryCredential(id: string, checked: boolean) {
+		if (!checked) {
+			composeRegistryCredentialIds = composeRegistryCredentialIds.filter((value) => value !== id);
+			return;
+		}
+		const selected = registryCredentials.find((credential) => credential.id === id);
+		composeRegistryCredentialIds = [
+			...composeRegistryCredentialIds.filter((value) => {
+				const credential = registryCredentials.find((candidate) => candidate.id === value);
+				return credential?.registry !== selected?.registry;
+			}),
+			id,
+		];
+	}
+
+	function imageRegistry(image: string): string {
+		const name = image.trim().split('@', 1)[0] ?? '';
+		const slash = name.indexOf('/');
+		if (slash < 0) return 'docker.io';
+		const first = name.slice(0, slash);
+		const explicit = first === 'localhost' || first.includes('.') || first.includes(':');
+		if (!explicit) return 'docker.io';
+		try {
+			const parsed = new URL(`https://${first}`);
+			let host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+			if (['docker.io', 'index.docker.io', 'registry-1.docker.io'].includes(host)) host = 'docker.io';
+			if (host.includes(':')) host = `[${host}]`;
+			return parsed.port ? `${host}:${parsed.port}` : host;
+		} catch {
+			return first.toLowerCase();
+		}
+	}
+
+	function credentialMatchesImage(credential: RegistryCredential, image: string): boolean {
+		return !image.trim() || credential.registry === imageRegistry(image);
+	}
+
+	function appRegistryCredentials(app: App): RegistryCredential[] {
+		const pinned = new Set(app.registry_credential_ids ?? []);
+		if (pinned.size > 0) return registryCredentials.filter((credential) => pinned.has(credential.id));
+		const images = app.containers?.map((container) => container.image) ?? [app.image];
+		const registries = new Set(images.map(imageRegistry));
+		return registryCredentials.filter((credential) =>
+			registries.has(credential.registry)
+			&& registryCredentials.filter((candidate) => candidate.registry === credential.registry).length === 1
+		);
+	}
+
+	$effect(() => {
+		if (registryCredentialsLoaded && newRegistryCredentialId) {
+			const selected = registryCredentials.find((credential) => credential.id === newRegistryCredentialId);
+			if (!selected || !credentialMatchesImage(selected, newImage)) newRegistryCredentialId = '';
+		}
+	});
+	let matchingRegistryCredentials = $derived(
+		newImage.trim()
+			? registryCredentials.filter((credential) => credentialMatchesImage(credential, newImage))
+			: [],
+	);
+	let registryCredentialRequired = $derived(
+		matchingRegistryCredentials.length > 1 && !newRegistryCredentialId,
+	);
 
 	// ── Docker networks (#435 / #438) ─────────────────────────
 	/** Managed-network attachment in the simple-app install/edit form. */
@@ -517,6 +657,8 @@
 	let composeTried = $state(false);
 	let inspecting = $state(false);
 	let lastInspectedImage = '';
+	let inspectingImage = '';
+	let inspectSequence = 0;
 	/** Inline status from the last apps.inspect_image call so the user sees
 	 *  why ports weren't auto-detected (image unreachable, no EXPOSE, etc.). */
 	let inspectMsg: string | null = $state(null);
@@ -671,12 +813,22 @@
 
 	async function inspectImage() {
 		const image = newImage.trim();
-		if (!image || image === lastInspectedImage) return;
-		lastInspectedImage = image;
+		const inspectKey = `${image}\0${newRegistryCredentialId}`;
+		if (!image || inspectKey === lastInspectedImage || inspectKey === inspectingImage) return;
+		const sequence = ++inspectSequence;
+		inspectingImage = inspectKey;
 		inspecting = true;
 		inspectMsg = null;
 		try {
-			const result = await client.call<ImageInspectResult>('apps.inspect_image', { image });
+			const result = await client.call<ImageInspectResult>('apps.inspect_image', {
+				image,
+				registry_credential_id: newRegistryCredentialId || null,
+			});
+			if (sequence !== inspectSequence || inspectKey !== `${newImage.trim()}\0${newRegistryCredentialId}`) {
+				if (sequence === inspectSequence) { inspecting = false; inspectingImage = ''; }
+				return;
+			}
+			lastInspectedImage = inspectKey;
 			if (result.ports.length > 0) {
 				// Collapse contiguous exposed ports (e.g. a game server's
 				// EXPOSE 2300-2399) into a single range row instead of one
@@ -716,13 +868,20 @@
 			// the user opts in so they see what's being added.
 			subpathRecipe = result.subpath_recipe ?? null;
 		} catch (e) {
+			if (sequence !== inspectSequence || inspectKey !== `${newImage.trim()}\0${newRegistryCredentialId}`) {
+				if (sequence === inspectSequence) { inspecting = false; inspectingImage = ''; }
+				return;
+			}
 			// Registry unreachable / image not found / private without auth.
 			// Surface inline so the user knows to fall back to manual entry.
 			const msg = e instanceof Error ? e.message : typeof e === 'object' && e !== null && 'message' in e ? String((e as { message: unknown }).message) : String(e);
 			inspectMsg = `Could not inspect image (${msg}) — set ports manually.`;
 		}
-		inspecting = false;
-		checkPortConflicts();
+		if (sequence === inspectSequence) {
+			inspecting = false;
+			inspectingImage = '';
+			checkPortConflicts();
+		}
 	}
 
 	/** Apply the engine-supplied sub-path recipe to the install form.
@@ -920,7 +1079,7 @@
 	}
 
 	onMount(async () => {
-		await Promise.all([refresh(), loadFilesystems(), refreshAppdataStatus()]);
+		await Promise.all([refresh(), loadFilesystems(), refreshAppdataStatus(), loadRegistryCredentials()]);
 		loading = false;
 		if (shouldPollForStartup()) startStartupPolling();
 		if (status?.enabled && status?.running) {
@@ -936,6 +1095,7 @@
 		stopListPolling();
 		stopAppdataPolling();
 		document.removeEventListener('visibilitychange', onVisibilityChange);
+		registrySecret = '';
 	});
 
 	// ── Appdata location (#436) ──
@@ -1107,6 +1267,7 @@
 			stopStatsPolling();
 			stopListPolling();
 		} else {
+			void loadRegistryCredentials();
 			const generation = ++startupPollGeneration;
 			void refreshStartupStatus(generation).then((updated) => {
 				if (!updated) return;
@@ -1323,6 +1484,7 @@
 		// Managed-network attachment (+ optional static IP).
 		if (newNetwork) params.network = newNetwork;
 		if (newStaticIp.trim()) params.static_ip = newStaticIp.trim();
+		if (newRegistryCredentialId) params.registry_credential_ids = [newRegistryCredentialId];
 
 		const ok = await streamDeploy({
 			kind: 'simple',
@@ -1330,6 +1492,7 @@
 			image: newImage,
 			install_params: params,
 			allow_unsafe: newAllowUnsafe,
+			registry_credential_ids: newRegistryCredentialId ? [newRegistryCredentialId] : [],
 		});
 		if (ok) {
 			showInstall = false;
@@ -1365,6 +1528,10 @@
 		newAllowUnsafe = config.allow_unsafe ?? false;
 		newNetwork = config.network ?? '';
 		newStaticIp = config.static_ip ?? '';
+		newRegistryCredentialId = config.registry_credential_ids?.[0] ?? '';
+		inspectSequence++;
+		inspecting = false;
+		inspectingImage = '';
 		// Pre-fill the existing subdomain so it's visible and round-trips on
 		// Save — otherwise an empty field would drop the ingress.
 		newSubdomain = config.subdomain ?? '';
@@ -1405,6 +1572,7 @@
 		// Round-trip the managed-network attachment so Edit doesn't detach it.
 		if (newNetwork) params.network = newNetwork;
 		if (newStaticIp.trim()) params.static_ip = newStaticIp.trim();
+		params.registry_credential_ids = newRegistryCredentialId ? [newRegistryCredentialId] : [];
 		// Round-trip (or change) the subdomain ingress. A blank field is left
 		// to the engine, which preserves the existing subdomain rather than
 		// dropping it; clear a subdomain via the dedicated Subdomain dialog.
@@ -1439,8 +1607,12 @@
 		newSubdomainConflict = '';
 		newNetwork = '';
 		newStaticIp = '';
+		newRegistryCredentialId = '';
 		installTried = false;
 		lastInspectedImage = '';
+		inspectSequence++;
+		inspecting = false;
+		inspectingImage = '';
 		subpathRecipe = null;
 	}
 
@@ -1616,19 +1788,21 @@
 			env_file: composeEnv.trim() ? composeEnv : null,
 			allow_unsafe: composeAllowUnsafe,
 			ingress_host_port: newIngressPort,
+			registry_credential_ids: composeRegistryCredentialIds,
 		});
 		if (ok) {
 			showCompose = false;
 			editingCompose = null;
 			composeName = ''; composeContent = ''; composeEnv = ''; composeTried = false;
 			composeAllowUnsafe = false;
+			composeRegistryCredentialIds = [];
 		}
 		await refresh();
 	}
 
 	async function editCompose(name: string) {
 		const content = await withToast(
-			() => client.call<{ compose_file: string; env_file: string | null }>('apps.compose.get', { name }),
+			() => client.call<{ compose_file: string; env_file: string | null; registry_credential_ids?: string[] }>('apps.compose.get', { name }),
 			''
 		);
 		if (content === undefined) return;
@@ -1636,6 +1810,7 @@
 		composeName = name;
 		composeContent = content.compose_file;
 		composeEnv = content.env_file ?? '';
+		composeRegistryCredentialIds = content.registry_credential_ids ?? [];
 		await loadIngresses();
 		newIngressPort = getIngress(name)?.host_port ?? null;
 		checkComposePortConflicts();
@@ -1662,6 +1837,7 @@
 		newIngressPort = null;
 		composeName = ''; composeContent = ''; composeEnv = ''; composeTried = false;
 		composeAllowUnsafe = false;
+		composeRegistryCredentialIds = [];
 	}
 
 	// Ingress
@@ -2108,6 +2284,19 @@
 						<span class="mt-1 block text-xs text-amber-500">{inspectMsg}</span>
 					{/if}
 				</div>
+				{#if canManageRegistryCredentials && registryCredentials.length > 0}
+					<div class="mb-4">
+						<Label for="app-registry-credential">Registry login <span class="font-normal text-muted-foreground">(optional)</span></Label>
+						<select id="app-registry-credential" bind:value={newRegistryCredentialId} onchange={inspectImage} class="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
+						<option value="">Automatic</option>
+							{#each registryCredentials.filter((credential) => credentialMatchesImage(credential, newImage)) as credential}
+								<option value={credential.id}>{credential.label} — {credential.registry} ({credential.username})</option>
+							{/each}
+						</select>
+					<p class="mt-1 text-xs text-muted-foreground">A sole matching login is used automatically. With multiple matching logins, select the exact account to use.</p>
+					{#if registryCredentialRequired}<p class="mt-1 text-xs text-amber-500">Select a registry login because multiple accounts match this image.</p>{/if}
+					</div>
+				{/if}
 
 				<!-- Network attachment (#435 / #438) -->
 				<div class="mb-4">
@@ -2308,14 +2497,14 @@
 
 				<div class="flex gap-2">
 					{#if editingApp}
-						<Button onclick={updateApp} disabled={!newImage}>Save</Button>
+						<Button onclick={updateApp} disabled={!newImage || registryCredentialRequired}>Save</Button>
 					{:else}
 						<!-- Install stays enabled even when required fields are empty
 						     so clicking it triggers the amber decoration. Real
 						     blockers (invalid name format, subdomain conflict) keep
 						     it disabled — those are user-correctable but should never
 						     reach the server. -->
-						<Button onclick={install} disabled={(!!newName && !isValidAppName(newName)) || !!newSubdomainConflict}>Install</Button>
+						<Button onclick={install} disabled={(!!newName && !isValidAppName(newName)) || !!newSubdomainConflict || registryCredentialRequired}>Install</Button>
 					{/if}
 					<Button variant="secondary" onclick={cancelEdit}>Cancel</Button>
 				</div>
@@ -2375,6 +2564,20 @@
 							</p>
 						</div>
 						<!-- Allow unsafe — opt out of strict compose sandbox -->
+						{#if canManageRegistryCredentials && registryCredentials.length > 0}
+							<div class="mb-4 rounded-md border border-border p-3">
+								<p class="mb-2 text-sm font-medium">Registry logins</p>
+								<div class="space-y-2">
+									{#each registryCredentials as credential}
+										<label class="flex min-w-0 items-center gap-2 text-xs">
+											<input type="checkbox" checked={composeRegistryCredentialIds.includes(credential.id)} onchange={(event) => toggleComposeRegistryCredential(credential.id, (event.currentTarget as HTMLInputElement).checked)} />
+											<span class="min-w-0 break-all"><strong>{credential.label}</strong> · <code>{credential.registry}</code> · {credential.username}</span>
+										</label>
+									{/each}
+								</div>
+								<p class="mt-2 text-xs text-muted-foreground">Select at most one login per registry. Unselected registries use their sole matching login automatically, or pull anonymously when none exists.</p>
+							</div>
+						{/if}
 						<div class="mb-4 rounded-md border border-border p-3">
 							<label class="flex items-start gap-2 cursor-pointer">
 								<input type="checkbox" bind:checked={composeAllowUnsafe} class="mt-0.5" />
@@ -2582,7 +2785,36 @@
 	{/if}
 	{/snippet}
 
-	<!-- Startup order (#437): NASty-managed boot ordering for compose stacks -->
+	<!-- Named registry credentials are Admin-only; non-admins never see this section. -->
+	{#if canManageRegistryCredentials}
+		<div class="mt-6 mb-2 flex items-center justify-between">
+			<div>
+				<h3 class="text-lg font-semibold">Registry Logins</h3>
+				<p class="text-xs text-muted-foreground">Encrypted passwords and tokens used only for image pulls.</p>
+			</div>
+			<Button size="sm" variant="outline" onclick={() => openRegistryCredentialForm()}>+ Add login</Button>
+		</div>
+		{#if registryCredentials.length === 0}
+			<p class="mb-4 text-sm text-muted-foreground">No authenticated registries configured.</p>
+		{:else}
+			<div class="mb-6 max-w-3xl overflow-x-auto">
+			<table class="w-full min-w-[560px] text-sm">
+				<thead><tr class="text-left text-xs uppercase text-muted-foreground"><th class="p-2">Label</th><th class="p-2">Registry</th><th class="p-2">Username</th><th class="p-2"></th></tr></thead>
+				<tbody>
+					{#each registryCredentials as credential}
+						<tr class="border-t border-border/40">
+							<td class="p-2 font-medium">{credential.label}</td>
+							<td class="p-2 font-mono">{credential.registry}</td>
+							<td class="p-2">{credential.username}</td>
+							<td class="p-2 text-right"><Button size="xs" variant="ghost" onclick={() => openRegistryCredentialForm(credential)}>Edit</Button><Button size="xs" variant="ghost" onclick={() => removeRegistryCredential(credential)}>Remove</Button></td>
+						</tr>
+					{/each}
+				</tbody>
+			</table>
+			</div>
+		{/if}
+	{/if}
+
 	{#if composeStacks.length > 0}
 		<h3 class="text-lg font-semibold mt-6 mb-1">Compose Startup Order</h3>
 		<p class="mb-3 max-w-3xl text-xs text-muted-foreground">
@@ -2669,6 +2901,12 @@
 										unsafe
 									</Badge>
 								{/if}
+								{#each appRegistryCredentials(app) as credential}
+									{@const pinned = (app.registry_credential_ids ?? []).includes(credential.id)}
+									<Badge variant="outline" class="max-w-48 truncate border-cyan-500/40 bg-cyan-500/10 text-[0.6rem] text-cyan-300" title={`${pinned ? 'Pinned' : 'Automatic on next pull'}: ${credential.label} · ${credential.registry}`}>
+										{pinned ? '' : 'auto · '}{credential.label} · {credential.registry}
+									</Badge>
+								{/each}
 								{#if lockedFsByApp.get(app.name)}
 									{@const blockingFs = lockedFsByApp.get(app.name)!}
 									<button
@@ -2842,6 +3080,35 @@
 	<!-- Networks render below the apps table — apps are the primary actors. -->
 	{@render networksSection()}
 {/if}
+
+<Dialog.Root open={showRegistryCredentialForm} onOpenChange={(open) => { if (!open && !registrySaving) closeRegistryCredentialForm(); }}>
+	<Dialog.Content class="max-h-[90dvh] max-w-md overflow-y-auto" showCloseButton={!registrySaving}>
+		<form onsubmit={(event) => { event.preventDefault(); void saveRegistryCredential(); }}>
+			<Dialog.Header>
+				<Dialog.Title>{editingRegistryCredentialId ? 'Edit registry login' : 'Add registry login'}</Dialog.Title>
+				<Dialog.Description>The password or token is encrypted on the NAS and is never returned to the browser.</Dialog.Description>
+			</Dialog.Header>
+			<div class="space-y-3">
+				<div><Label for="registry-label">Label</Label><Input id="registry-label" bind:value={registryLabel} placeholder="Production GHCR" class="mt-1" /></div>
+				<div>
+					<Label for="registry-host">Registry host</Label>
+					<Input id="registry-host" bind:value={registryHost} placeholder="ghcr.io or registry.example.com:5000" disabled={!!editingRegistryCredentialId} class="mt-1 font-mono" />
+					{#if editingRegistryCredentialId}<p class="mt-1 text-xs text-muted-foreground">Registry hosts are immutable. Create a new login to change it.</p>{/if}
+				</div>
+				<div><Label for="registry-username">Username</Label><Input id="registry-username" bind:value={registryUsername} autocomplete="username" class="mt-1" /></div>
+				<div>
+					<Label for="registry-secret">Password or token {#if editingRegistryCredentialId}<span class="font-normal text-muted-foreground">(leave blank to retain)</span>{/if}</Label>
+					<Input id="registry-secret" type="password" bind:value={registrySecret} autocomplete="new-password" class="mt-1" />
+				</div>
+			</div>
+			{#if registryError}<p class="mt-3 text-xs text-destructive" aria-live="polite">{registryError}</p>{/if}
+			<Dialog.Footer class="mt-5">
+				<Button type="button" variant="secondary" onclick={closeRegistryCredentialForm} disabled={registrySaving}>Cancel</Button>
+				<Button type="submit" disabled={registrySaving || !registryLabel.trim() || !registryUsername.trim() || (!editingRegistryCredentialId && (!registryHost.trim() || !registrySecret))}>{registrySaving ? 'Saving…' : 'Save'}</Button>
+			</Dialog.Footer>
+		</form>
+	</Dialog.Content>
+</Dialog.Root>
 
 <!-- Subdomain ingress dialog (per-app "···" → "Subdomain…") -->
 {#if subdomainDialog}

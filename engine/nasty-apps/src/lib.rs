@@ -15,7 +15,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bollard::Docker;
 use bollard::models::{
     ContainerCreateBody, EndpointIpamConfig, EndpointSettings, HostConfig, Ipam, IpamConfig,
     NetworkCreateRequest, NetworkingConfig, PortBinding, RestartPolicy, RestartPolicyNameEnum,
@@ -24,10 +23,12 @@ use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectNetworkOptions, ListContainersOptions,
     ListNetworksOptions, LogsOptions, RemoveContainerOptions, StatsOptions, StopContainerOptions,
 };
+use bollard::{Docker, auth::DockerCredentials};
 use futures_util::{StreamExt, TryStreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
@@ -49,6 +50,9 @@ const DOCKER_PING_TIMEOUT: Duration = Duration::from_secs(3);
 pub const APPDATA_LINK: &str = "/appdata";
 /// Persisted definitions of NASty-managed Docker networks.
 const NETWORKS_PATH: &str = "/var/lib/nasty/apps-networks.json";
+const REGISTRY_CREDENTIALS_PATH: &str = "/var/lib/nasty/apps-registry-credentials.json";
+const COMPOSE_TRANSACTION_FILE: &str = ".nasty-deployment-transaction.json";
+static APP_MANIFEST_MUTATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Label applied to all NASty-managed containers.
 const LABEL_MANAGED: &str = "nasty.managed";
@@ -93,6 +97,8 @@ pub enum AppsError {
     InvalidNetwork(String),
     #[error("invalid app name: {0}")]
     InvalidName(String),
+    #[error("invalid registry credential: {0}")]
+    InvalidRegistryCredential(String),
 }
 
 impl AppsError {
@@ -109,12 +115,274 @@ impl AppsError {
             Self::ForbiddenBind(_) => -33009,
             Self::InvalidNetwork(_) => -33010,
             Self::InvalidName(_) => -33011,
+            Self::InvalidRegistryCredential(_) => -33012,
         }
     }
 }
 
 fn invalid_name(msg: impl Into<String>) -> AppsError {
     AppsError::InvalidName(msg.into())
+}
+
+fn invalid_registry_credential(msg: impl Into<String>) -> AppsError {
+    AppsError::InvalidRegistryCredential(msg.into())
+}
+
+// ── Registry credentials ────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct RegistryCredential {
+    pub id: String,
+    pub label: String,
+    pub registry: String,
+    pub username: String,
+    pub has_secret: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CreateRegistryCredentialRequest {
+    pub label: String,
+    /// Registry host and optional port. Schemes and paths are not accepted.
+    pub registry: String,
+    pub username: String,
+    /// Password or personal access token. Never returned by the API.
+    pub secret: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct UpdateRegistryCredentialRequest {
+    pub id: String,
+    pub label: String,
+    pub username: String,
+    /// Omit to retain the current password/token.
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredRegistryCredential {
+    id: String,
+    label: String,
+    registry: String,
+    username: String,
+    secret_encrypted: nasty_common::secrets::EncryptedBlob,
+}
+
+impl StoredRegistryCredential {
+    fn redacted(&self) -> RegistryCredential {
+        RegistryCredential {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            registry: self.registry.clone(),
+            username: self.username.clone(),
+            has_secret: true,
+        }
+    }
+
+    fn secret_name(&self) -> String {
+        format!("nasty.apps.registry.{}.secret", self.id)
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RegistryCredentialsFile {
+    #[serde(default)]
+    credentials: Vec<StoredRegistryCredential>,
+}
+
+fn validate_registry_field(value: &str, field: &str) -> Result<String, AppsError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+        return Err(invalid_registry_credential(format!(
+            "{field} must be 1-255 printable characters"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+/// Normalize a registry endpoint for both stored credentials and image matching.
+/// Docker Hub's three commonly seen hostnames are one authentication domain.
+pub fn canonical_registry_host(value: &str) -> Result<String, AppsError> {
+    let raw = value.trim();
+    if raw.is_empty()
+        || raw.chars().any(char::is_whitespace)
+        || raw.contains('/')
+        || raw.contains('@')
+        || raw.contains('?')
+        || raw.contains('#')
+    {
+        return Err(invalid_registry_credential(
+            "registry must be a host with an optional port, without a scheme or path",
+        ));
+    }
+
+    let parsed = reqwest::Url::parse(&format!("https://{raw}"))
+        .map_err(|_| invalid_registry_credential("registry is not a valid host[:port]"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| invalid_registry_credential("registry host is missing"))?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return Err(invalid_registry_credential("registry host is missing"));
+    }
+    let host = match host.as_str() {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => "docker.io".to_string(),
+        _ if host.contains(':') => format!("[{host}]"),
+        _ => host,
+    };
+    Ok(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedImageRef {
+    pub registry: String,
+    pub repository: String,
+    pub from_image: String,
+    pub reference: String,
+}
+
+pub fn parse_image_ref(image: &str) -> Result<ParsedImageRef, AppsError> {
+    let image = image.trim();
+    if image.is_empty() || image.chars().any(char::is_whitespace) {
+        return Err(invalid_registry_credential(
+            "image reference is empty or invalid",
+        ));
+    }
+
+    let (name, reference) = if let Some((name, digest)) = image.rsplit_once('@') {
+        if name.is_empty() || name.contains('@') || digest.is_empty() || !digest.contains(':') {
+            return Err(invalid_registry_credential("image digest is invalid"));
+        }
+        // `repo:tag@sha256:...` is valid, but Docker's image-create API takes
+        // the digest in its `tag` query parameter, so do not also retain the tag.
+        let last_slash = name.rfind('/');
+        let last_colon = name.rfind(':');
+        let name = last_colon
+            .filter(|colon| last_slash.is_none_or(|slash| *colon > slash))
+            .map_or(name, |colon| &name[..colon]);
+        (name, digest)
+    } else {
+        let last_slash = image.rfind('/');
+        let last_colon = image.rfind(':');
+        if let Some(colon) =
+            last_colon.filter(|colon| last_slash.is_none_or(|slash| *colon > slash))
+        {
+            let (name, tag) = image.split_at(colon);
+            let tag = &tag[1..];
+            if name.is_empty() || tag.is_empty() {
+                return Err(invalid_registry_credential("image tag is invalid"));
+            }
+            (name, tag)
+        } else {
+            (image, "latest")
+        }
+    };
+
+    let (registry, repository) = match name.split_once('/') {
+        Some((first, rest))
+            if first == "localhost" || first.contains('.') || first.contains(':') =>
+        {
+            if rest.is_empty() {
+                return Err(invalid_registry_credential("image repository is missing"));
+            }
+            (canonical_registry_host(first)?, rest.to_string())
+        }
+        Some(_) => ("docker.io".to_string(), name.to_string()),
+        None => ("docker.io".to_string(), format!("library/{name}")),
+    };
+
+    Ok(ParsedImageRef {
+        registry,
+        repository,
+        from_image: name.to_string(),
+        reference: reference.to_string(),
+    })
+}
+
+async fn load_registry_credentials() -> Result<RegistryCredentialsFile, AppsError> {
+    let content = match tokio::fs::read_to_string(REGISTRY_CREDENTIALS_PATH).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RegistryCredentialsFile::default());
+        }
+        Err(error) => {
+            return Err(AppsError::CommandFailed(format!(
+                "read registry credentials: {error}"
+            )));
+        }
+    };
+    serde_json::from_str(&content)
+        .map_err(|error| AppsError::CommandFailed(format!("parse registry credentials: {error}")))
+}
+
+async fn save_registry_credentials(state: &RegistryCredentialsFile) -> Result<(), AppsError> {
+    let path = Path::new(REGISTRY_CREDENTIALS_PATH);
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppsError::CommandFailed("credential state has no parent".into()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temp = parent.join(format!(
+        ".apps-registry-credentials.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let json = serde_json::to_vec_pretty(state)
+        .map_err(|error| AppsError::CommandFailed(format!("serialize credentials: {error}")))?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    let result = async {
+        let mut file = options.open(&temp).await?;
+        file.write_all(&json).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp, path).await?;
+        let directory = tokio::fs::File::open(parent).await?;
+        directory.sync_all().await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    result.map_err(AppsError::Io)
+}
+
+async fn apps_referencing_registry_credential(id: &str) -> Result<Vec<String>, AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
+    let mut references = Vec::new();
+    let mut entries = match tokio::fs::read_dir(COMPOSE_DIR).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(references),
+        Err(error) => return Err(AppsError::Io(error)),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await?;
+        let manifest: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+            AppsError::CommandFailed(format!("parse app metadata {}: {error}", path.display()))
+        })?;
+        let is_referenced = manifest
+            .get("registry_credential_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|value| value.as_str() == Some(id)));
+        if is_referenced {
+            references.push(
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("<unknown>")
+                    .to_string(),
+            );
+        }
+    }
+    references.sort();
+    Ok(references)
 }
 
 /// Validate an app name that may already exist on disk. Older releases allowed
@@ -1281,6 +1549,7 @@ fn find_absolute_asset_path(html: &str, prefix: &str) -> Option<String> {
 /// already written at install time with the rest of the manifest, so
 /// we re-read, splice in the new field, and re-write.
 async fn save_proxy_disabled_reason(app_name: &str, reason: &str) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
     let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
     let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s)
@@ -1311,6 +1580,7 @@ async fn save_proxy_disabled_reason(app_name: &str, reason: &str) -> Result<(), 
 /// apply to subdomain mode, so the verdict is stale. Idempotent: if
 /// the manifest doesn't exist or the field isn't set, returns Ok.
 async fn clear_proxy_disabled_reason(app_name: &str) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
     let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
     let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s)
@@ -1361,6 +1631,7 @@ fn splice_manifest_base(
     name: &str,
     image: &str,
     allow_unsafe: bool,
+    registry_credential_ids: &[String],
 ) -> serde_json::Value {
     let mut map = match manifest {
         serde_json::Value::Object(m) => m,
@@ -1372,6 +1643,14 @@ fn splice_manifest_base(
     map.insert("image".into(), image.into());
     map.insert("kind".into(), "simple".into());
     map.insert("allow_unsafe".into(), allow_unsafe.into());
+    if registry_credential_ids.is_empty() {
+        map.remove("registry_credential_ids");
+    } else {
+        map.insert(
+            "registry_credential_ids".into(),
+            serde_json::to_value(registry_credential_ids).expect("string array serializes"),
+        );
+    }
     map.remove("proxy_disabled_reason");
     serde_json::Value::Object(map)
 }
@@ -1382,24 +1661,27 @@ fn splice_manifest_base(
 /// longer clobbers `ingress_subdomain` or `startup_*`. Best-effort: the
 /// manifest only exists so the app is listable while Docker is down, so a
 /// write failure is logged, not fatal to the install.
-async fn save_app_manifest_base(name: &str, image: &str, allow_unsafe: bool) {
+async fn save_app_manifest_base(
+    name: &str,
+    image: &str,
+    allow_unsafe: bool,
+    registry_credential_ids: &[String],
+) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
     let manifest_path = format!("{}/{}.json", COMPOSE_DIR, name);
     let existing = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s).unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     };
-    let manifest = splice_manifest_base(existing, name, image, allow_unsafe);
-    if let Err(e) = tokio::fs::create_dir_all(COMPOSE_DIR).await {
-        warn!("create_dir_all({COMPOSE_DIR}) failed: {e}");
-    }
-    if let Err(e) = tokio::fs::write(
+    let manifest =
+        splice_manifest_base(existing, name, image, allow_unsafe, registry_credential_ids);
+    tokio::fs::create_dir_all(COMPOSE_DIR).await?;
+    tokio::fs::write(
         &manifest_path,
-        serde_json::to_string_pretty(&manifest).unwrap(),
+        serde_json::to_string_pretty(&manifest).expect("JSON value serializes"),
     )
     .await
-    {
-        warn!("Failed to save app manifest: {e}");
-    }
+    .map_err(|error| AppsError::CommandFailed(format!("manifest write: {error}")))
 }
 
 /// Persist (or clear) the per-app `ingress_subdomain` in the manifest.
@@ -1408,6 +1690,7 @@ async fn save_app_manifest_base(name: &str, image: &str, allow_unsafe: bool) {
 /// name doesn't inherit a stale subdomain). Mirrors
 /// `save_proxy_disabled_reason` — read-modify-write of the same JSON.
 async fn save_ingress_subdomain(app_name: &str, subdomain: Option<&str>) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
     let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
     let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s)
@@ -1473,6 +1756,7 @@ async fn load_ingress_subdomain(app_name: &str) -> Option<String> {
 /// exposing 2300-2399 + 8080 would otherwise have its ingress proxy 2300
 /// instead of the 8080 HTTP port).
 async fn save_ingress_host_port(app_name: &str, host_port: Option<u16>) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
     let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
     let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s)
@@ -1510,6 +1794,81 @@ async fn load_ingress_host_port(app_name: &str) -> Option<u16> {
         .get("ingress_host_port")?
         .as_u64()
         .and_then(|n| u16::try_from(n).ok())
+}
+
+async fn save_registry_credential_ids(
+    app_name: &str,
+    credential_ids: &[String],
+) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
+    let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
+    let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|error| AppsError::CommandFailed(format!("manifest parse: {error}")))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => {
+            return Err(AppsError::CommandFailed(format!("manifest read: {error}")));
+        }
+    };
+    let map = manifest
+        .as_object_mut()
+        .ok_or_else(|| AppsError::CommandFailed("manifest not an object".into()))?;
+    if credential_ids.is_empty() {
+        map.remove("registry_credential_ids");
+    } else {
+        map.insert(
+            "registry_credential_ids".into(),
+            serde_json::to_value(credential_ids).expect("string array serializes"),
+        );
+    }
+    let directory = Path::new(COMPOSE_DIR);
+    tokio::fs::create_dir_all(directory).await?;
+    let temp = directory.join(format!(
+        ".{app_name}.registry-credentials.{}.tmp",
+        uuid::Uuid::new_v4()
+    ));
+    let content = serde_json::to_vec_pretty(&manifest).expect("JSON value serializes");
+    let result = async {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&temp).await?;
+        file.write_all(&content).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp, &manifest_path).await?;
+        tokio::fs::File::open(directory).await?.sync_all().await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    result.map_err(AppsError::Io)
+}
+
+async fn load_registry_credential_ids(app_name: &str) -> Vec<String> {
+    load_registry_credential_ids_strict(app_name)
+        .await
+        .unwrap_or_default()
+}
+
+async fn load_registry_credential_ids_strict(app_name: &str) -> Result<Vec<String>, AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
+    let path = format!("{}/{}.json", COMPOSE_DIR, app_name);
+    let content = match tokio::fs::read_to_string(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(AppsError::Io(error)),
+    };
+    let manifest = serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|error| AppsError::CommandFailed(format!("parse app metadata {path}: {error}")))?;
+    Ok(manifest
+        .get("registry_credential_ids")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect())
 }
 
 fn parse_ingress_preferences(
@@ -1629,6 +1988,7 @@ struct StartupConfig {
 /// write, splicing only our keys — mirrors `save_ingress_subdomain` so other
 /// fields (ingress_subdomain, proxy_disabled_reason) survive untouched.
 async fn save_startup_config(app_name: &str, cfg: StartupConfig) -> Result<(), AppsError> {
+    let _guard = APP_MANIFEST_MUTATIONS.lock().await;
     let manifest_path = format!("{}/{}.json", COMPOSE_DIR, app_name);
     let mut manifest: serde_json::Value = match tokio::fs::read_to_string(&manifest_path).await {
         Ok(s) => serde_json::from_str(&s)
@@ -1787,7 +2147,7 @@ fn extract_user_env(env_file: &str) -> Option<String> {
 /// The `-f` args for a `docker compose` invocation: always the user's
 /// compose file, plus the startup override when it exists (managed stacks).
 /// Single source of truth so install/update/restore/set_startup agree.
-fn compose_file_args(app_name: &str) -> Vec<String> {
+pub fn compose_file_args(app_name: &str) -> Vec<String> {
     let yml = format!("{COMPOSE_DIR}/{app_name}/docker-compose.yml");
     let mut args = vec!["-f".to_string(), yml];
     let override_path = startup_override_path(app_name);
@@ -1798,7 +2158,7 @@ fn compose_file_args(app_name: &str) -> Vec<String> {
     args
 }
 
-/// `docker compose up -d --no-build` for one stack, with the right `-f` set
+/// `docker compose up -d` for one stack, with the right `-f` set
 /// (override included for managed stacks). Returns whether it succeeded;
 /// `cmd::run` logs the underlying failure (program/args/stderr) so a stack
 /// that won't come up is debuggable from the journal.
@@ -1810,7 +2170,10 @@ async fn compose_up_stack(app_name: &str) -> bool {
         app_name.to_string(),
         "up".to_string(),
         "-d".to_string(),
+        "--pull".to_string(),
+        "never".to_string(),
         "--no-build".to_string(),
+        "--remove-orphans".to_string(),
     ]);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     matches!(nasty_common::cmd::run("docker", &arg_refs).await, Ok(o) if o.status.success())
@@ -1961,17 +2324,20 @@ pub struct App {
     /// The app's IP on that network, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_ip: Option<String>,
+    /// Named registry credentials pinned to this app. IDs are opaque; secret
+    /// material remains encrypted server-side and is never included here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_credential_ids: Vec<String>,
 }
 
 fn parse_compose_inventory(
     content: &str,
     active_services: Option<&std::collections::HashSet<String>>,
-) -> Option<(Vec<String>, Vec<String>)> {
+) -> Option<(Vec<String>, Vec<String>, std::collections::HashSet<String>)> {
     let parsed: serde_json::Value = serde_yaml_ng::from_str(content).ok()?;
     let services = parsed.get("services")?.as_object()?;
-    let mut names = Vec::new();
-    for (name, service) in services {
-        let active = active_services.map_or_else(
+    let is_active = |name: &str, service: &serde_json::Value| {
+        active_services.map_or_else(
             || {
                 !service
                     .get("profiles")
@@ -1979,8 +2345,25 @@ fn parse_compose_inventory(
                     .is_some_and(|profiles| !profiles.is_empty())
             },
             |active| active.contains(name),
-        );
-        if !active {
+        )
+    };
+    if services.iter().any(|(name, service)| {
+        (active_services.is_none() || is_active(name, service))
+            && service
+                .get("pull_policy")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|policy| {
+                    !matches!(
+                        policy,
+                        "always" | "missing" | "if_not_present" | "never" | "build"
+                    )
+                })
+    }) {
+        return None;
+    }
+    let mut names = Vec::new();
+    for (name, service) in services {
+        if !is_active(name, service) {
             continue;
         }
         let replicas = service
@@ -1994,20 +2377,48 @@ fn parse_compose_inventory(
     }
     names.sort();
     let mut images: Vec<String> = services
-        .values()
-        .filter_map(|service| service.get("image")?.as_str().map(String::from))
+        .iter()
+        // Static inventory retains profile-gated images for app metadata;
+        // effective inventory receives Compose's active-service set and pulls
+        // only what `compose up` can start.
+        .filter(|(name, service)| active_services.is_none() || is_active(name, service))
+        .filter(|(_, service)| {
+            active_services.is_none()
+                || service
+                    .get("pull_policy")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|policy| !matches!(policy, "never" | "build"))
+        })
+        .filter_map(|(_, service)| service.get("image")?.as_str().map(String::from))
         .collect();
     images.sort();
-    Some((names, images))
+    images.dedup();
+    let always_pull_images = services
+        .iter()
+        .filter(|(name, service)| active_services.is_none() || is_active(name, service))
+        .filter(|(_, service)| {
+            service
+                .get("pull_policy")
+                .and_then(serde_json::Value::as_str)
+                == Some("always")
+        })
+        .filter_map(|(_, service)| service.get("image")?.as_str().map(String::from))
+        .collect();
+    Some((names, images, always_pull_images))
 }
 
 async fn compose_config_output(
     compose_path: &std::path::Path,
+    env_path: Option<&std::path::Path>,
     args: &[&str],
 ) -> Result<String, AppsError> {
     let path = compose_path.to_string_lossy();
     let mut command = Command::new("docker");
-    command.args(["compose", "-f", path.as_ref(), "config"]);
+    command.arg("compose");
+    if let Some(env_path) = env_path {
+        command.arg("--env-file").arg(env_path);
+    }
+    command.args(["-f", path.as_ref(), "config"]);
     command.args(args);
     if let Some(parent) = compose_path.parent() {
         command.current_dir(parent);
@@ -2026,10 +2437,11 @@ async fn compose_config_output(
 
 async fn effective_compose_inventory(
     compose_path: &std::path::Path,
-) -> Result<(Vec<String>, Vec<String>), AppsError> {
+    env_path: Option<&std::path::Path>,
+) -> Result<(Vec<String>, Vec<String>, std::collections::HashSet<String>), AppsError> {
     let (config, services) = tokio::try_join!(
-        compose_config_output(compose_path, &["--format", "json"]),
-        compose_config_output(compose_path, &["--services"]),
+        compose_config_output(compose_path, env_path, &["--format", "json"]),
+        compose_config_output(compose_path, env_path, &["--services"]),
     )?;
     let active_services = services
         .lines()
@@ -2120,6 +2532,8 @@ pub struct AppConfig {
     /// preserves the ingress instead of silently dropping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subdomain: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_credential_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -2223,6 +2637,10 @@ pub struct InstallAppRequest {
     /// Optional static IPv4 within the chosen network's subnet.
     #[serde(default)]
     pub static_ip: Option<String>,
+    /// Optional named credential pin(s). A simple app normally has at most one;
+    /// the vector shape is shared with Compose apps that can span registries.
+    #[serde(default)]
+    pub registry_credential_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2284,6 +2702,8 @@ pub struct InstallComposeRequest {
     /// separately and prepended automatically.
     #[serde(default)]
     pub env_file: Option<String>,
+    #[serde(default)]
+    pub registry_credential_ids: Option<Vec<String>>,
 }
 
 /// Compose app source returned by `apps.compose.get` for the editor.
@@ -2294,6 +2714,8 @@ pub struct ComposeContent {
     /// Operator-provided `.env` text, or null when none was stored.
     /// NASty's managed `COMPOSE_PROJECT_NAME` header is stripped.
     pub env_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registry_credential_ids: Vec<String>,
 }
 
 /// Set NASty-managed startup ordering for a compose stack (#437).
@@ -2511,6 +2933,13 @@ pub struct AppsService {
     /// Serializes enabled/storage configuration changes with appdata relocation
     /// so Disable cannot race a stale writer or restart.
     config_mutations: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Serializes read-modify-write updates to encrypted registry state.
+    registry_mutations: std::sync::Arc<tokio::sync::RwLock<()>>,
+    /// Serializes app lifecycle decisions that must remain stable through
+    /// authorization and execution.
+    app_mutations: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Serializes Compose source swaps and lifecycle operations.
+    compose_mutations: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Previous-sample cache for `apps.stats`, keyed by container ID.
     /// The Docker stats endpoint needs *two* samples to compute deltas
     /// (CPU %, network rate, etc.); the natural API for that
@@ -2525,6 +2954,35 @@ pub struct AppsService {
     /// Live/last state of the appdata relocation job (#436). Arc so the
     /// spawned move task can update it without holding `self`.
     appdata_relocate: std::sync::Arc<tokio::sync::Mutex<Option<AppdataRelocateStatus>>>,
+}
+
+pub struct RegistryCredentialsReadGuard {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+pub struct AppRegistryReadGuard {
+    _app_guard: tokio::sync::OwnedMutexGuard<()>,
+    _registry_guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+struct ComposeUpdateRollback<'a> {
+    name: &'a str,
+    compose_path: &'a Path,
+    env_path: &'a Path,
+    previous_compose: &'a [u8],
+    previous_env: Option<&'a [u8]>,
+    previous_registry_credential_ids: &'a [String],
+    registry_guard: &'a AppRegistryReadGuard,
+    reapply: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ComposeDeploymentTransaction {
+    previous_compose: Option<Vec<u8>>,
+    previous_env: Option<Vec<u8>>,
+    previous_meta: Option<Vec<u8>>,
+    previous_registry_credential_ids: Vec<String>,
+    previous_images: HashMap<String, String>,
 }
 
 /// Progress/outcome of an `apps.appdata.relocate` run. One at a time;
@@ -2568,6 +3026,9 @@ impl AppsService {
         Self {
             docker: std::sync::Mutex::new(docker),
             config_mutations: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            registry_mutations: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            app_mutations: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            compose_mutations: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             prev_stats: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             appdata_relocate: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -2599,6 +3060,764 @@ impl AppsService {
 
     fn docker(&self) -> Result<Docker, AppsError> {
         self.docker_conn()
+    }
+
+    pub async fn registry_credentials_list(&self) -> Result<Vec<RegistryCredential>, AppsError> {
+        let mut credentials: Vec<_> = load_registry_credentials()
+            .await?
+            .credentials
+            .iter()
+            .map(StoredRegistryCredential::redacted)
+            .collect();
+        credentials.sort_by(|a, b| {
+            a.registry
+                .cmp(&b.registry)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        Ok(credentials)
+    }
+
+    pub async fn registry_credentials_create(
+        &self,
+        request: CreateRegistryCredentialRequest,
+    ) -> Result<RegistryCredential, AppsError> {
+        let label = validate_registry_field(&request.label, "label")?;
+        let username = validate_registry_field(&request.username, "username")?;
+        let registry = canonical_registry_host(&request.registry)?;
+        if request.secret.is_empty() {
+            return Err(invalid_registry_credential("secret must not be empty"));
+        }
+
+        let _guard = self.registry_mutations.write().await;
+        let mut state = load_registry_credentials().await?;
+        if state.credentials.iter().any(|credential| {
+            credential.registry == registry && credential.label.eq_ignore_ascii_case(&label)
+        }) {
+            return Err(invalid_registry_credential(format!(
+                "label '{label}' is already in use for registry '{registry}'"
+            )));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let secret_name = format!("nasty.apps.registry.{id}.secret");
+        let secret_encrypted = nasty_common::secrets::encrypt(&secret_name, &request.secret)
+            .await
+            .map_err(|error| {
+                AppsError::CommandFailed(format!(
+                    "encrypt registry credential (plaintext was not stored): {error}"
+                ))
+            })?;
+        let stored = StoredRegistryCredential {
+            id,
+            label,
+            registry,
+            username,
+            secret_encrypted,
+        };
+        let result = stored.redacted();
+        state.credentials.push(stored);
+        save_registry_credentials(&state).await?;
+        Ok(result)
+    }
+
+    pub async fn registry_credentials_update(
+        &self,
+        request: UpdateRegistryCredentialRequest,
+    ) -> Result<RegistryCredential, AppsError> {
+        let label = validate_registry_field(&request.label, "label")?;
+        let username = validate_registry_field(&request.username, "username")?;
+        if request.secret.as_deref() == Some("") {
+            return Err(invalid_registry_credential(
+                "secret must be omitted or non-empty",
+            ));
+        }
+
+        let _guard = self.registry_mutations.write().await;
+        let mut state = load_registry_credentials().await?;
+        let registry = state
+            .credentials
+            .iter()
+            .find(|credential| credential.id == request.id)
+            .map(|credential| credential.registry.clone())
+            .ok_or_else(|| invalid_registry_credential("credential not found"))?;
+        if state.credentials.iter().any(|credential| {
+            credential.id != request.id
+                && credential.registry == registry
+                && credential.label.eq_ignore_ascii_case(&label)
+        }) {
+            return Err(invalid_registry_credential(format!(
+                "label '{label}' is already in use for registry '{registry}'"
+            )));
+        }
+        let credential = state
+            .credentials
+            .iter_mut()
+            .find(|credential| credential.id == request.id)
+            .expect("credential existence checked above");
+        credential.label = label;
+        credential.username = username;
+        if let Some(secret) = request.secret {
+            credential.secret_encrypted =
+                nasty_common::secrets::encrypt(&credential.secret_name(), &secret)
+                    .await
+                    .map_err(|error| {
+                        AppsError::CommandFailed(format!(
+                            "encrypt registry credential (old secret retained): {error}"
+                        ))
+                    })?;
+        }
+        let result = credential.redacted();
+        save_registry_credentials(&state).await?;
+        Ok(result)
+    }
+
+    pub async fn registry_credentials_delete(&self, id: &str) -> Result<(), AppsError> {
+        let _guard = self.registry_mutations.write().await;
+        let mut state = load_registry_credentials().await?;
+        if !state
+            .credentials
+            .iter()
+            .any(|credential| credential.id == id)
+        {
+            return Err(invalid_registry_credential("credential not found"));
+        }
+        let references = apps_referencing_registry_credential(id).await?;
+        if !references.is_empty() {
+            return Err(invalid_registry_credential(format!(
+                "credential is used by app(s): {}",
+                references.join(", ")
+            )));
+        }
+        state.credentials.retain(|credential| credential.id != id);
+        save_registry_credentials(&state).await
+    }
+
+    pub async fn validate_registry_credential_ids(&self, ids: &[String]) -> Result<(), AppsError> {
+        let state = load_registry_credentials().await?;
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if !seen.insert(id) {
+                return Err(invalid_registry_credential(format!(
+                    "credential '{id}' was selected more than once"
+                )));
+            }
+            if !state
+                .credentials
+                .iter()
+                .any(|credential| &credential.id == id)
+            {
+                return Err(invalid_registry_credential(format!(
+                    "credential '{id}' does not exist"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn validate_registry_bindings(
+        &self,
+        images: &[String],
+        ids: &[String],
+    ) -> Result<(), AppsError> {
+        self.validate_registry_credential_ids(ids).await?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let registries = images
+            .iter()
+            .map(|image| parse_image_ref(image).map(|parsed| parsed.registry))
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        let state = load_registry_credentials().await?;
+        let mut pinned_registries = std::collections::HashSet::new();
+        for credential in state
+            .credentials
+            .iter()
+            .filter(|credential| ids.contains(&credential.id))
+        {
+            if !registries.contains(&credential.registry) {
+                return Err(invalid_registry_credential(format!(
+                    "credential '{}' does not match any app image registry",
+                    credential.label
+                )));
+            }
+            if !pinned_registries.insert(&credential.registry) {
+                return Err(invalid_registry_credential(format!(
+                    "more than one credential is pinned for registry '{}'",
+                    credential.registry
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn app_registry_credential_ids(&self, app_name: &str) -> Vec<String> {
+        load_registry_credential_ids(app_name).await
+    }
+
+    pub async fn registry_credentials_read_guard(&self) -> RegistryCredentialsReadGuard {
+        RegistryCredentialsReadGuard {
+            _guard: self.registry_mutations.clone().read_owned().await,
+        }
+    }
+
+    pub async fn app_registry_read_guard(&self) -> AppRegistryReadGuard {
+        let app_guard = self.app_mutations.clone().lock_owned().await;
+        let registry_guard = self.registry_mutations.clone().read_owned().await;
+        AppRegistryReadGuard {
+            _app_guard: app_guard,
+            _registry_guard: registry_guard,
+        }
+    }
+
+    pub async fn compose_mutation_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.compose_mutations.clone().lock_owned().await
+    }
+
+    pub async fn ensure_new_app_name_available(&self, app_name: &str) -> Result<(), AppsError> {
+        validate_new_app_name(app_name)?;
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={app_name}")],
+        );
+        let compose_containers = self
+            .docker()?
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await?;
+        if Path::new(COMPOSE_DIR).join(app_name).exists()
+            || Path::new(COMPOSE_DIR)
+                .join(format!("{app_name}.json"))
+                .exists()
+            || self.container_exists(&container_name(app_name)).await
+            || !compose_containers.is_empty()
+        {
+            return Err(AppsError::AppAlreadyExists(app_name.to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn begin_compose_deployment_transaction(
+        &self,
+        app_name: &str,
+        guard: &AppRegistryReadGuard,
+    ) -> Result<(), AppsError> {
+        validate_app_name(app_name)?;
+        let project_dir = Path::new(COMPOSE_DIR).join(app_name);
+        tokio::fs::create_dir_all(&project_dir).await?;
+        let marker = project_dir.join(COMPOSE_TRANSACTION_FILE);
+        if marker.exists() {
+            self.rollback_compose_deployment_transaction(app_name, guard, true)
+                .await?;
+            tokio::fs::create_dir_all(&project_dir).await?;
+        }
+
+        let read_optional = |path: PathBuf| async move {
+            match tokio::fs::read(path).await {
+                Ok(content) => Ok(Some(content)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(AppsError::Io(error)),
+            }
+        };
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={app_name}")],
+        );
+        let previous_images = self
+            .docker()?
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await?
+            .into_iter()
+            .filter_map(|container| Some((container.image?, container.image_id?)))
+            .filter(|(image, _)| !image.contains('@'))
+            .collect();
+        let transaction = ComposeDeploymentTransaction {
+            previous_compose: read_optional(project_dir.join("docker-compose.yml")).await?,
+            previous_env: read_optional(project_dir.join(".env")).await?,
+            previous_meta: read_optional(project_dir.join(".nasty-meta.json")).await?,
+            previous_registry_credential_ids: load_registry_credential_ids_strict(app_name).await?,
+            previous_images,
+        };
+        let content = serde_json::to_vec(&transaction).map_err(|error| {
+            AppsError::CommandFailed(format!("serialize compose transaction: {error}"))
+        })?;
+        let temp = project_dir.join(format!(
+            ".nasty-deployment-transaction.{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        let result = async {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            let mut file = options.open(&temp).await?;
+            file.write_all(&content).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&temp, &marker).await?;
+            tokio::fs::File::open(&project_dir).await?.sync_all().await
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+        result.map_err(AppsError::Io)
+    }
+
+    pub async fn sync_compose_deployment_files(&self, app_name: &str) -> Result<(), AppsError> {
+        validate_app_name(app_name)?;
+        let project_dir = Path::new(COMPOSE_DIR).join(app_name);
+        for path in [
+            project_dir.join("docker-compose.yml"),
+            project_dir.join(".env"),
+            project_dir.join(".nasty-meta.json"),
+            Path::new(COMPOSE_DIR).join(format!("{app_name}.json")),
+        ] {
+            if path.exists() {
+                tokio::fs::File::open(path).await?.sync_all().await?;
+            }
+        }
+        tokio::fs::File::open(&project_dir)
+            .await?
+            .sync_all()
+            .await?;
+        tokio::fs::File::open(COMPOSE_DIR).await?.sync_all().await?;
+        Ok(())
+    }
+
+    pub async fn finish_compose_deployment_transaction(
+        &self,
+        app_name: &str,
+    ) -> Result<(), AppsError> {
+        validate_app_name(app_name)?;
+        let project_dir = Path::new(COMPOSE_DIR).join(app_name);
+        let marker = project_dir.join(COMPOSE_TRANSACTION_FILE);
+        self.sync_compose_deployment_files(app_name).await?;
+        let mut entries = tokio::fs::read_dir(&project_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if (name.starts_with(".nasty-compose-")
+                || name.starts_with(".nasty-env-")
+                || name.starts_with(".nasty-deployment-transaction."))
+                && name != COMPOSE_TRANSACTION_FILE
+            {
+                tokio::fs::remove_file(entry.path()).await?;
+            }
+        }
+        tokio::fs::File::open(&project_dir)
+            .await?
+            .sync_all()
+            .await?;
+        tokio::fs::File::open(COMPOSE_DIR).await?.sync_all().await?;
+        match tokio::fs::remove_file(&marker).await {
+            Ok(()) => {
+                tokio::fs::File::open(&project_dir)
+                    .await?
+                    .sync_all()
+                    .await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AppsError::Io(error)),
+        }
+        Ok(())
+    }
+
+    pub async fn rollback_compose_deployment_transaction(
+        &self,
+        app_name: &str,
+        guard: &AppRegistryReadGuard,
+        reconcile_docker: bool,
+    ) -> Result<(), AppsError> {
+        let project_dir = Path::new(COMPOSE_DIR).join(app_name);
+        let marker = project_dir.join(COMPOSE_TRANSACTION_FILE);
+        let content = match tokio::fs::read(&marker).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(AppsError::Io(error)),
+        };
+        let transaction: ComposeDeploymentTransaction =
+            serde_json::from_slice(&content).map_err(|error| {
+                AppsError::CommandFailed(format!("parse compose transaction: {error}"))
+            })?;
+
+        let compose_path = project_dir.join("docker-compose.yml");
+        let env_path = project_dir.join(".env");
+        let meta_path = project_dir.join(".nasty-meta.json");
+        let had_previous_compose = transaction.previous_compose.is_some();
+        if reconcile_docker && !had_previous_compose {
+            self.remove_compose_project_runtime(app_name).await?;
+        }
+        match transaction.previous_compose {
+            Some(content) => tokio::fs::write(&compose_path, content).await?,
+            None => {
+                let _ = tokio::fs::remove_file(&compose_path).await;
+            }
+        }
+        match transaction.previous_env {
+            Some(content) => tokio::fs::write(&env_path, content).await?,
+            None => {
+                let _ = tokio::fs::remove_file(&env_path).await;
+            }
+        }
+        match transaction.previous_meta {
+            Some(content) => tokio::fs::write(&meta_path, content).await?,
+            None => {
+                let _ = tokio::fs::remove_file(&meta_path).await;
+            }
+        }
+        self.set_app_registry_credential_ids_with_guard(
+            app_name,
+            &transaction.previous_registry_credential_ids,
+            guard,
+        )
+        .await?;
+
+        if !compose_path.exists() {
+            let sidecar = Path::new(COMPOSE_DIR).join(format!("{app_name}.json"));
+            if let Err(error) = tokio::fs::remove_file(&sidecar).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(AppsError::Io(error));
+            }
+            tokio::fs::remove_dir_all(&project_dir).await?;
+            tokio::fs::File::open(COMPOSE_DIR).await?.sync_all().await?;
+            return Ok(());
+        }
+        for (image, image_id) in transaction.previous_images {
+            let output = Command::new("docker")
+                .args(["image", "tag", &image_id, &image])
+                .output()
+                .await
+                .map_err(|error| AppsError::CommandFailed(error.to_string()))?;
+            if !output.status.success() {
+                return Err(AppsError::DockerFailed(format!(
+                    "restore image tag '{image}': {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
+        if reconcile_docker {
+            let mut args = vec!["compose".to_string()];
+            args.extend(compose_file_args(app_name));
+            args.extend([
+                "--project-name".to_string(),
+                app_name.to_string(),
+                "up".to_string(),
+                "-d".to_string(),
+                "--pull".to_string(),
+                "never".to_string(),
+                "--no-build".to_string(),
+                "--remove-orphans".to_string(),
+            ]);
+            let output = Command::new("docker").args(&args).output().await?;
+            if !output.status.success() {
+                return Err(AppsError::DockerFailed(
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ));
+            }
+        }
+        self.finish_compose_deployment_transaction(app_name).await
+    }
+
+    async fn remove_compose_project_runtime(&self, app_name: &str) -> Result<(), AppsError> {
+        let docker = self.docker()?;
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={app_name}")],
+        );
+        let containers = docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters.clone()),
+                ..Default::default()
+            }))
+            .await?;
+        for container in containers {
+            if let Some(id) = container.id {
+                docker
+                    .remove_container(
+                        &id,
+                        Some(RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await?;
+            }
+        }
+        let networks = docker
+            .list_networks(Some(ListNetworksOptions {
+                filters: Some(filters),
+            }))
+            .await?;
+        for network in networks {
+            if let Some(id) = network.id {
+                docker.remove_network(&id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn recover_compose_deployment_transactions(&self) {
+        let app_registry_guard = self.app_registry_read_guard().await;
+        let _compose_guard = self.compose_mutation_guard().await;
+        let mut entries = match tokio::fs::read_dir(COMPOSE_DIR).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn!(%error, "could not scan for interrupted compose deployments");
+                return;
+            }
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let marker = entry.path().join(COMPOSE_TRANSACTION_FILE);
+            if !marker.exists() {
+                if !entry.path().join("docker-compose.yml").exists() {
+                    let mut children = match tokio::fs::read_dir(entry.path()).await {
+                        Ok(children) => children,
+                        Err(_) => continue,
+                    };
+                    let mut staging_only = true;
+                    while let Ok(Some(child)) = children.next_entry().await {
+                        let name = child.file_name();
+                        let name = name.to_string_lossy();
+                        if !name.starts_with(".nasty-compose-")
+                            && !name.starts_with(".nasty-env-")
+                            && !name.starts_with(".nasty-deployment-transaction.")
+                        {
+                            staging_only = false;
+                            break;
+                        }
+                    }
+                    if staging_only
+                        && let Err(error) = tokio::fs::remove_dir_all(entry.path()).await
+                    {
+                        warn!(%error, path = %entry.path().display(), "failed to remove abandoned compose staging directory");
+                    }
+                }
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Err(error) = validate_app_name(&name) {
+                warn!(%error, app = name, "refusing to recover invalid compose app name");
+                continue;
+            }
+            if let Err(error) = self
+                .rollback_compose_deployment_transaction(&name, &app_registry_guard, true)
+                .await
+            {
+                error!(%error, app = name, "failed to recover interrupted compose deployment");
+                self.stop_compose_project_containers(&name).await;
+            } else {
+                warn!(app = name, "recovered interrupted compose deployment");
+            }
+        }
+    }
+
+    async fn stop_compose_project_containers(&self, app_name: &str) {
+        let docker = match self.docker() {
+            Ok(docker) => docker,
+            Err(error) => {
+                error!(%error, app = app_name, "could not stop unresolved compose project");
+                return;
+            }
+        };
+        let mut filters = HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={app_name}")],
+        );
+        let containers = match docker
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(containers) => containers,
+            Err(error) => {
+                error!(%error, app = app_name, "could not list unresolved compose project containers");
+                return;
+            }
+        };
+        for container in containers {
+            let Some(id) = container.id else {
+                continue;
+            };
+            if let Err(error) = docker
+                .stop_container(
+                    &id,
+                    Some(StopContainerOptions {
+                        t: Some(0),
+                        signal: None,
+                    }),
+                )
+                .await
+            {
+                error!(%error, app = app_name, container = id, "could not stop unresolved compose container");
+            }
+        }
+    }
+
+    pub async fn image_has_matching_registry_credentials(
+        &self,
+        image: &str,
+    ) -> Result<bool, AppsError> {
+        let registry = parse_image_ref(image)?.registry;
+        Ok(load_registry_credentials()
+            .await?
+            .credentials
+            .iter()
+            .any(|credential| credential.registry == registry))
+    }
+
+    pub async fn set_app_registry_credential_ids(
+        &self,
+        app_name: &str,
+        ids: &[String],
+    ) -> Result<(), AppsError> {
+        validate_app_name(app_name)?;
+        let _guard = self.registry_mutations.read().await;
+        self.set_app_registry_credential_ids_inner(app_name, ids)
+            .await
+    }
+
+    pub async fn set_app_registry_credential_ids_with_guard(
+        &self,
+        app_name: &str,
+        ids: &[String],
+        _guard: &AppRegistryReadGuard,
+    ) -> Result<(), AppsError> {
+        validate_app_name(app_name)?;
+        self.set_app_registry_credential_ids_inner(app_name, ids)
+            .await
+    }
+
+    async fn set_app_registry_credential_ids_inner(
+        &self,
+        app_name: &str,
+        ids: &[String],
+    ) -> Result<(), AppsError> {
+        self.validate_registry_credential_ids(ids).await?;
+        save_registry_credential_ids(app_name, ids).await
+    }
+
+    pub async fn compose_images(&self, app_name: &str) -> Result<Vec<String>, AppsError> {
+        validate_app_name(app_name)?;
+        let path = Path::new(COMPOSE_DIR)
+            .join(app_name)
+            .join("docker-compose.yml");
+        self.compose_images_from_path(&path, None).await
+    }
+
+    pub async fn compose_images_from_path(
+        &self,
+        path: &Path,
+        env_path: Option<&Path>,
+    ) -> Result<Vec<String>, AppsError> {
+        effective_compose_inventory(path, env_path)
+            .await
+            .map(|(_, images, _)| images)
+    }
+
+    async fn pull_missing_compose_images(&self, app_name: &str) -> Result<(), AppsError> {
+        let credential_ids = load_registry_credential_ids(app_name).await;
+        let path = Path::new(COMPOSE_DIR)
+            .join(app_name)
+            .join("docker-compose.yml");
+        let (_, images, always_pull_images) = effective_compose_inventory(&path, None).await?;
+        self.validate_registry_bindings(&images, &credential_ids)
+            .await?;
+        for image in images {
+            self.pull_image(
+                &image,
+                &credential_ids,
+                !always_pull_images.contains(&image),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Resolve exactly one credential for an image. Explicit matching pins win;
+    /// otherwise one host match is automatic, zero is anonymous, and multiple
+    /// matches are rejected rather than choosing credentials unpredictably.
+    pub async fn registry_credentials_for_image(
+        &self,
+        image: &str,
+        pinned_ids: &[String],
+    ) -> Result<Option<DockerCredentials>, AppsError> {
+        let parsed = parse_image_ref(image)?;
+        let state = load_registry_credentials().await?;
+        for id in pinned_ids {
+            if !state
+                .credentials
+                .iter()
+                .any(|credential| &credential.id == id)
+            {
+                return Err(invalid_registry_credential(format!(
+                    "credential '{id}' does not exist"
+                )));
+            }
+        }
+
+        let mut pinned_matches = state.credentials.iter().filter(|credential| {
+            pinned_ids.contains(&credential.id) && credential.registry == parsed.registry
+        });
+        let pinned = pinned_matches.next();
+        if pinned.is_some() && pinned_matches.next().is_some() {
+            return Err(invalid_registry_credential(format!(
+                "multiple pinned credentials match registry '{}'",
+                parsed.registry
+            )));
+        }
+
+        let credential = if let Some(credential) = pinned {
+            Some(credential)
+        } else {
+            let mut matches = state
+                .credentials
+                .iter()
+                .filter(|credential| credential.registry == parsed.registry);
+            let first = matches.next();
+            if first.is_some() && matches.next().is_some() {
+                return Err(invalid_registry_credential(format!(
+                    "multiple credentials match registry '{}'; pin one on the app",
+                    parsed.registry
+                )));
+            }
+            first
+        };
+
+        let Some(credential) = credential else {
+            return Ok(None);
+        };
+        let password =
+            nasty_common::secrets::decrypt(&credential.secret_name(), &credential.secret_encrypted)
+                .await
+                .map_err(|error| {
+                    AppsError::CommandFailed(format!(
+                        "decrypt registry credential '{}': {error}",
+                        credential.label
+                    ))
+                })?;
+        Ok(Some(DockerCredentials {
+            username: Some(credential.username.clone()),
+            password: Some(password),
+            serveraddress: Some(credential.registry.clone()),
+            ..Default::default()
+        }))
     }
 
     // ── Managed Docker networks ─────────────────────────────
@@ -3202,19 +4421,41 @@ impl AppsService {
     // ── Simple app management ───────────────────────────────
 
     pub async fn install(&self, req: InstallAppRequest) -> Result<App, AppsError> {
+        let guard = self.app_registry_read_guard().await;
+        self.install_with_app_registry_guard(req, guard).await
+    }
+
+    pub async fn install_with_app_registry_guard(
+        &self,
+        req: InstallAppRequest,
+        _guard: AppRegistryReadGuard,
+    ) -> Result<App, AppsError> {
         self.install_inner(req, true).await
     }
 
     async fn install_inner(
         &self,
-        req: InstallAppRequest,
+        mut req: InstallAppRequest,
         require_new_name: bool,
     ) -> Result<App, AppsError> {
+        if req.registry_credential_ids.is_none() {
+            req.registry_credential_ids = Some(if require_new_name {
+                Vec::new()
+            } else {
+                load_registry_credential_ids(&req.name).await
+            });
+        }
+        let registry_credential_ids = req
+            .registry_credential_ids
+            .as_deref()
+            .expect("credential IDs resolved above");
         if require_new_name {
             validate_new_app_request(&req)?;
         } else {
             validate_existing_app_request(&req)?;
         }
+        self.validate_registry_bindings(std::slice::from_ref(&req.image), registry_credential_ids)
+            .await?;
         self.require_ready().await?;
 
         let cname = container_name(&req.name);
@@ -3285,7 +4526,8 @@ impl AppsService {
         validate_simple_volumes(&req.name, &storage_base, &req.volumes, req.allow_unsafe)?;
 
         // Pull the image first
-        self.pull_image(&req.image).await?;
+        self.pull_image(&req.image, registry_credential_ids, true)
+            .await?;
 
         // Resolve the image's runtime user → numeric uid/gid for chowning
         // auto-created volume dirs. Without this, dirs we mkdir below are
@@ -3504,7 +4746,34 @@ impl AppsService {
         // running. Read-modify-write (not a full overwrite) so a reinstall
         // via apps.update / pull preserves engine-managed keys —
         // ingress_subdomain, startup_* — instead of dropping them.
-        save_app_manifest_base(&req.name, &req.image, req.allow_unsafe).await;
+        let manifest_result = match self
+            .validate_registry_credential_ids(registry_credential_ids)
+            .await
+        {
+            Ok(()) => {
+                save_app_manifest_base(
+                    &req.name,
+                    &req.image,
+                    req.allow_unsafe,
+                    registry_credential_ids,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = manifest_result {
+            let _ = self
+                .docker()?
+                .remove_container(
+                    &cname,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(error);
+        }
 
         // Auto-create ingress for the first TCP port. UDP can't serve
         // HTTP (Caddy's `reverse_proxy`, like every other HTTP proxy,
@@ -3593,7 +4862,25 @@ impl AppsService {
     }
 
     pub async fn update(&self, req: InstallAppRequest) -> Result<App, AppsError> {
+        let guard = self.app_registry_read_guard().await;
+        self.update_with_app_registry_guard(req, guard).await
+    }
+
+    pub async fn update_with_app_registry_guard(
+        &self,
+        mut req: InstallAppRequest,
+        _guard: AppRegistryReadGuard,
+    ) -> Result<App, AppsError> {
+        if req.registry_credential_ids.is_none() {
+            req.registry_credential_ids = Some(load_registry_credential_ids(&req.name).await);
+        }
+        let registry_credential_ids = req
+            .registry_credential_ids
+            .as_deref()
+            .expect("credential IDs resolved above");
         validate_existing_app_request(&req)?;
+        self.validate_registry_bindings(std::slice::from_ref(&req.image), registry_credential_ids)
+            .await?;
         self.require_ready().await?;
 
         let cname = container_name(&req.name);
@@ -3835,15 +5122,17 @@ impl AppsService {
                         .ok()
                         .and_then(|content| parse_compose_inventory(&content, None));
                     let (expected_containers, images) =
-                        match effective_compose_inventory(&compose_path).await {
-                            Ok((expected, images)) => (Some(expected), images),
+                        match effective_compose_inventory(&compose_path, None).await {
+                            Ok((expected, images, _)) => (Some(expected), images),
                             Err(error) => {
                                 warn!(
                                     "apps: effective compose inventory for '{name}' failed: {error}"
                                 );
                                 (
                                     None,
-                                    raw_inventory.map(|(_, images)| images).unwrap_or_default(),
+                                    raw_inventory
+                                        .map(|(_, images, _)| images)
+                                        .unwrap_or_default(),
                                 )
                             }
                         };
@@ -3860,7 +5149,7 @@ impl AppsService {
                         .unwrap_or(false);
                     let proxy_disabled_reason = load_proxy_disabled_reason(&name).await;
                     apps.push(App {
-                        name,
+                        name: name.clone(),
                         image,
                         status: "stopped".to_string(),
                         created: String::new(),
@@ -3872,6 +5161,7 @@ impl AppsService {
                         proxy_disabled_reason,
                         network: None,
                         network_ip: None,
+                        registry_credential_ids: load_registry_credential_ids(&name).await,
                     });
                 }
             } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -3930,6 +5220,7 @@ impl AppsService {
                         proxy_disabled_reason,
                         network: None,
                         network_ip: None,
+                        registry_credential_ids: load_registry_credential_ids(&app_name).await,
                     });
                 }
             }
@@ -4009,6 +5300,7 @@ impl AppsService {
                 proxy_disabled_reason,
                 network,
                 network_ip,
+                registry_credential_ids: load_registry_credential_ids(&app_name).await,
             });
         }
 
@@ -4045,7 +5337,8 @@ impl AppsService {
                 if !compose_path.exists() {
                     continue;
                 }
-                let (expected_containers, _) = effective_compose_inventory(&compose_path).await?;
+                let (expected_containers, _, _) =
+                    effective_compose_inventory(&compose_path, None).await?;
 
                 // Find all containers from this compose project
                 let mut pf = HashMap::new();
@@ -4122,7 +5415,7 @@ impl AppsService {
                 seen_names.insert(name.clone());
                 let proxy_disabled_reason = load_proxy_disabled_reason(&name).await;
                 apps.push(App {
-                    name,
+                    name: name.clone(),
                     image: primary_image,
                     status: overall_status,
                     created,
@@ -4134,6 +5427,7 @@ impl AppsService {
                     proxy_disabled_reason,
                     network: None,
                     network_ip: None,
+                    registry_credential_ids: load_registry_credential_ids(&name).await,
                 });
             }
         }
@@ -4342,6 +5636,7 @@ impl AppsService {
             network,
             static_ip,
             subdomain: load_ingress_subdomain(name).await,
+            registry_credential_ids: load_registry_credential_ids(name).await,
         })
     }
 
@@ -4416,6 +5711,7 @@ impl AppsService {
         // Check if it's a compose app
         let compose_file = format!("{}/{}/docker-compose.yml", COMPOSE_DIR, name);
         if Path::new(&compose_file).exists() {
+            let _compose_guard = self.compose_mutation_guard().await;
             let output = Command::new("docker")
                 .args([
                     "compose",
@@ -4459,6 +5755,7 @@ impl AppsService {
         // Check if it's a compose app
         let compose_file = format!("{}/{}/docker-compose.yml", COMPOSE_DIR, name);
         if Path::new(&compose_file).exists() {
+            let _compose_guard = self.compose_mutation_guard().await;
             let output = Command::new("docker")
                 .args([
                     "compose",
@@ -4495,32 +5792,48 @@ impl AppsService {
     // ── Compose app management ──────────────────────────────
 
     pub async fn compose_install(&self, req: InstallComposeRequest) -> Result<App, AppsError> {
+        let app_registry_guard = self.app_registry_read_guard().await;
+        let _compose_guard = self.compose_mutation_guard().await;
         validate_new_app_name(&req.name)?;
+        let registry_credential_ids = req.registry_credential_ids.clone().unwrap_or_default();
+        self.validate_registry_credential_ids(&registry_credential_ids)
+            .await?;
         self.require_ready().await?;
+        self.ensure_new_app_name_available(&req.name).await?;
 
         let project_dir = format!("{}/{}", COMPOSE_DIR, req.name);
 
-        // Check if already exists
-        if Path::new(&project_dir).exists() {
-            return Err(AppsError::AppAlreadyExists(req.name));
-        }
-
         // Write compose file
         tokio::fs::create_dir_all(&project_dir).await?;
-        tokio::fs::write(
+        if let Err(error) = self
+            .begin_compose_deployment_transaction(&req.name, &app_registry_guard)
+            .await
+        {
+            let _ = tokio::fs::remove_dir_all(&project_dir).await;
+            return Err(error);
+        }
+        if let Err(error) = tokio::fs::write(
             format!("{}/docker-compose.yml", project_dir),
             &req.compose_file,
         )
-        .await?;
+        .await
+        {
+            let _ = tokio::fs::remove_dir_all(&project_dir).await;
+            return Err(error.into());
+        }
 
         // Write the project .env: managed COMPOSE_PROJECT_NAME plus the
         // operator's pasted dotenv (if any). Compose reads it from the
         // project directory automatically.
-        tokio::fs::write(
+        if let Err(error) = tokio::fs::write(
             format!("{}/.env", project_dir),
             render_env_file(&req.name, req.env_file.as_deref()),
         )
-        .await?;
+        .await
+        {
+            let _ = tokio::fs::remove_dir_all(&project_dir).await;
+            return Err(error.into());
+        }
 
         // Validate compose file before deploying
         let compose_path = format!("{}/docker-compose.yml", project_dir);
@@ -4534,58 +5847,105 @@ impl AppsService {
         // through the explicit "Fix permissions" path.
         self.precreate_compose_binds(&req.compose_file).await;
 
-        // Run docker compose up — pull only, no building from source
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            Command::new("docker")
-                .args([
-                    "compose",
-                    "-f",
-                    &format!("{}/docker-compose.yml", project_dir),
-                    "--project-name",
-                    &req.name,
-                    "up",
-                    "-d",
-                    "--no-build",
-                    "--pull",
-                    "missing",
-                ])
-                .output(),
-        )
-        .await;
-
-        let compose_path = format!("{}/docker-compose.yml", project_dir);
-        let cleanup = |project_dir: String, name: String, compose_path: String| async move {
-            // Tear down any partially created containers before removing the dir.
-            // `try_run` logs failures so a stuck container that prevents the
-            // dir-removal from completing is debuggable.
-            nasty_common::cmd::try_run(
-                "docker",
-                &[
-                    "compose",
-                    "-f",
-                    &compose_path,
-                    "--project-name",
-                    &name,
-                    "down",
-                    "-v",
-                    "--remove-orphans",
-                ],
-            )
-            .await;
-            if let Err(e) = tokio::fs::remove_dir_all(&project_dir).await {
-                tracing::warn!("cleanup: remove_dir_all({project_dir}) failed: {e}");
+        let (_, images, always_pull_images) =
+            match effective_compose_inventory(Path::new(&compose_path), None).await {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    let _ = tokio::fs::remove_dir_all(&project_dir).await;
+                    return Err(error);
+                }
+            };
+        if let Err(error) = self
+            .validate_registry_bindings(&images, &registry_credential_ids)
+            .await
+        {
+            let _ = tokio::fs::remove_dir_all(&project_dir).await;
+            return Err(error);
+        }
+        for image in images {
+            if let Err(error) = self
+                .pull_image(
+                    &image,
+                    &registry_credential_ids,
+                    !always_pull_images.contains(&image),
+                )
+                .await
+            {
+                let _ = tokio::fs::remove_dir_all(&project_dir).await;
+                return Err(error);
             }
-        };
+        }
+        if let Err(error) = self
+            .set_app_registry_credential_ids_with_guard(
+                &req.name,
+                &registry_credential_ids,
+                &app_registry_guard,
+            )
+            .await
+        {
+            if let Err(rollback_error) = self
+                .rollback_compose_deployment_transaction(&req.name, &app_registry_guard, false)
+                .await
+            {
+                return Err(AppsError::CommandFailed(format!(
+                    "persist registry bindings: {error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.sync_compose_deployment_files(&req.name).await {
+            if let Err(rollback_error) = self
+                .rollback_compose_deployment_transaction(&req.name, &app_registry_guard, false)
+                .await
+            {
+                return Err(AppsError::CommandFailed(format!(
+                    "sync compose transaction: {error}; rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+
+        // Images were pulled above with per-request auth. Compose must never
+        // perform an implicit second pull through CLI-global credentials.
+        let compose_path = format!("{}/docker-compose.yml", project_dir);
+        let mut command = Command::new("docker");
+        command.kill_on_drop(true).args([
+            "compose",
+            "-f",
+            &compose_path,
+            "--project-name",
+            &req.name,
+            "up",
+            "-d",
+            "--pull",
+            "never",
+            "--no-build",
+        ]);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(300), command.output()).await;
 
         let output = match result {
             Ok(Ok(output)) => output,
             Ok(Err(e)) => {
-                cleanup(project_dir, req.name, compose_path).await;
+                if let Err(rollback_error) = self
+                    .rollback_compose_deployment_transaction(&req.name, &app_registry_guard, true)
+                    .await
+                {
+                    return Err(AppsError::CommandFailed(format!(
+                        "start compose: {e}; rollback failed: {rollback_error}"
+                    )));
+                }
                 return Err(AppsError::CommandFailed(e.to_string()));
             }
             Err(_) => {
-                cleanup(project_dir, req.name, compose_path).await;
+                if let Err(rollback_error) = self
+                    .rollback_compose_deployment_transaction(&req.name, &app_registry_guard, true)
+                    .await
+                {
+                    return Err(AppsError::DockerFailed(format!(
+                        "docker compose timed out after 5 minutes; rollback failed: {rollback_error}"
+                    )));
+                }
                 return Err(AppsError::DockerFailed(
                     "docker compose timed out after 5 minutes".to_string(),
                 ));
@@ -4594,9 +5954,19 @@ impl AppsService {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            cleanup(project_dir, req.name, compose_path).await;
+            if let Err(rollback_error) = self
+                .rollback_compose_deployment_transaction(&req.name, &app_registry_guard, true)
+                .await
+            {
+                return Err(AppsError::DockerFailed(format!(
+                    "{stderr}; rollback failed: {rollback_error}"
+                )));
+            }
             return Err(AppsError::DockerFailed(stderr.to_string()));
         }
+
+        self.finish_compose_deployment_transaction(&req.name)
+            .await?;
 
         if let Err(error) = self
             .refresh_compose_ingress_after_deploy(&req.name, None, false)
@@ -4613,35 +5983,171 @@ impl AppsService {
     }
 
     pub async fn compose_update(&self, req: InstallComposeRequest) -> Result<App, AppsError> {
+        let app_registry_guard = self.app_registry_read_guard().await;
+        let _compose_guard = self.compose_mutation_guard().await;
         validate_app_name(&req.name)?;
+        let registry_credential_ids = match req.registry_credential_ids.clone() {
+            Some(ids) => ids,
+            None => load_registry_credential_ids(&req.name).await,
+        };
+        self.validate_registry_credential_ids(&registry_credential_ids)
+            .await?;
         self.require_ready().await?;
 
         let project_dir = format!("{}/{}", COMPOSE_DIR, req.name);
-        if !Path::new(&project_dir).join("docker-compose.yml").exists() {
+        let compose_path = Path::new(&project_dir).join("docker-compose.yml");
+        let env_path = Path::new(&project_dir).join(".env");
+        if !compose_path.exists() {
             return Err(AppsError::AppNotFound(req.name));
         }
+        let previous_compose = tokio::fs::read(&compose_path).await?;
+        let previous_env = match tokio::fs::read(&env_path).await {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(AppsError::Io(error)),
+        };
+        let previous_registry_credential_ids =
+            load_registry_credential_ids_strict(&req.name).await?;
+        self.begin_compose_deployment_transaction(&req.name, &app_registry_guard)
+            .await?;
 
-        // Overwrite compose file
-        tokio::fs::write(
-            format!("{}/docker-compose.yml", project_dir),
-            &req.compose_file,
-        )
-        .await?;
+        if let Err(error) = tokio::fs::write(&compose_path, &req.compose_file).await {
+            self.rollback_compose_update(ComposeUpdateRollback {
+                name: &req.name,
+                compose_path: &compose_path,
+                env_path: &env_path,
+                previous_compose: &previous_compose,
+                previous_env: previous_env.as_deref(),
+                previous_registry_credential_ids: &previous_registry_credential_ids,
+                registry_guard: &app_registry_guard,
+                reapply: false,
+            })
+            .await;
+            return Err(error.into());
+        }
 
         // Re-render the .env so edits to the operator's dotenv take effect
         // (and clearing it drops back to the managed project-name only).
-        tokio::fs::write(
-            format!("{}/.env", project_dir),
+        if let Err(error) = tokio::fs::write(
+            &env_path,
             render_env_file(&req.name, req.env_file.as_deref()),
         )
-        .await?;
+        .await
+        {
+            self.rollback_compose_update(ComposeUpdateRollback {
+                name: &req.name,
+                compose_path: &compose_path,
+                env_path: &env_path,
+                previous_compose: &previous_compose,
+                previous_env: previous_env.as_deref(),
+                previous_registry_credential_ids: &previous_registry_credential_ids,
+                registry_guard: &app_registry_guard,
+                reapply: false,
+            })
+            .await;
+            return Err(error.into());
+        }
 
         // Same pre-create pass as install: any newly added bind-mount
         // sources get created with the right ownership. Existing dirs
         // are untouched.
         self.precreate_compose_binds(&req.compose_file).await;
 
-        // Bring up with new config — pull only, no building from source.
+        let (_, images, always_pull_images) =
+            match effective_compose_inventory(&compose_path, None).await {
+                Ok(inventory) => inventory,
+                Err(error) => {
+                    self.rollback_compose_update(ComposeUpdateRollback {
+                        name: &req.name,
+                        compose_path: &compose_path,
+                        env_path: &env_path,
+                        previous_compose: &previous_compose,
+                        previous_env: previous_env.as_deref(),
+                        previous_registry_credential_ids: &previous_registry_credential_ids,
+                        registry_guard: &app_registry_guard,
+                        reapply: false,
+                    })
+                    .await;
+                    return Err(error);
+                }
+            };
+        if let Err(error) = self
+            .validate_registry_bindings(&images, &registry_credential_ids)
+            .await
+        {
+            self.rollback_compose_update(ComposeUpdateRollback {
+                name: &req.name,
+                compose_path: &compose_path,
+                env_path: &env_path,
+                previous_compose: &previous_compose,
+                previous_env: previous_env.as_deref(),
+                previous_registry_credential_ids: &previous_registry_credential_ids,
+                registry_guard: &app_registry_guard,
+                reapply: false,
+            })
+            .await;
+            return Err(error);
+        }
+        for image in images {
+            if let Err(error) = self
+                .pull_image(
+                    &image,
+                    &registry_credential_ids,
+                    !always_pull_images.contains(&image),
+                )
+                .await
+            {
+                self.rollback_compose_update(ComposeUpdateRollback {
+                    name: &req.name,
+                    compose_path: &compose_path,
+                    env_path: &env_path,
+                    previous_compose: &previous_compose,
+                    previous_env: previous_env.as_deref(),
+                    previous_registry_credential_ids: &previous_registry_credential_ids,
+                    registry_guard: &app_registry_guard,
+                    reapply: false,
+                })
+                .await;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self
+            .set_app_registry_credential_ids_with_guard(
+                &req.name,
+                &registry_credential_ids,
+                &app_registry_guard,
+            )
+            .await
+        {
+            self.rollback_compose_update(ComposeUpdateRollback {
+                name: &req.name,
+                compose_path: &compose_path,
+                env_path: &env_path,
+                previous_compose: &previous_compose,
+                previous_env: previous_env.as_deref(),
+                previous_registry_credential_ids: &previous_registry_credential_ids,
+                registry_guard: &app_registry_guard,
+                reapply: false,
+            })
+            .await;
+            return Err(error);
+        }
+        if let Err(error) = self.sync_compose_deployment_files(&req.name).await {
+            self.rollback_compose_update(ComposeUpdateRollback {
+                name: &req.name,
+                compose_path: &compose_path,
+                env_path: &env_path,
+                previous_compose: &previous_compose,
+                previous_env: previous_env.as_deref(),
+                previous_registry_credential_ids: &previous_registry_credential_ids,
+                registry_guard: &app_registry_guard,
+                reapply: false,
+            })
+            .await;
+            return Err(error);
+        }
+
+        // Bring up only from the images authenticated and pulled above.
         // `compose_file_args` layers on the startup override when this stack
         // is NASty-managed, so `restart: "no"` is preserved across updates.
         let mut up_args = vec!["compose".to_string()];
@@ -4651,21 +6157,44 @@ impl AppsService {
             req.name.clone(),
             "up".to_string(),
             "-d".to_string(),
-            "--no-build".to_string(),
             "--pull".to_string(),
-            "missing".to_string(),
+            "never".to_string(),
+            "--no-build".to_string(),
             "--remove-orphans".to_string(),
         ]);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            Command::new("docker").args(&up_args).output(),
-        )
-        .await;
+        let mut command = Command::new("docker");
+        command.kill_on_drop(true).args(&up_args);
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(300), command.output()).await;
 
         let output = match result {
             Ok(Ok(output)) => output,
-            Ok(Err(e)) => return Err(AppsError::CommandFailed(e.to_string())),
+            Ok(Err(e)) => {
+                self.rollback_compose_update(ComposeUpdateRollback {
+                    name: &req.name,
+                    compose_path: &compose_path,
+                    env_path: &env_path,
+                    previous_compose: &previous_compose,
+                    previous_env: previous_env.as_deref(),
+                    previous_registry_credential_ids: &previous_registry_credential_ids,
+                    registry_guard: &app_registry_guard,
+                    reapply: true,
+                })
+                .await;
+                return Err(AppsError::CommandFailed(e.to_string()));
+            }
             Err(_) => {
+                self.rollback_compose_update(ComposeUpdateRollback {
+                    name: &req.name,
+                    compose_path: &compose_path,
+                    env_path: &env_path,
+                    previous_compose: &previous_compose,
+                    previous_env: previous_env.as_deref(),
+                    previous_registry_credential_ids: &previous_registry_credential_ids,
+                    registry_guard: &app_registry_guard,
+                    reapply: true,
+                })
+                .await;
                 return Err(AppsError::DockerFailed(
                     "docker compose timed out after 5 minutes".to_string(),
                 ));
@@ -4674,8 +6203,22 @@ impl AppsService {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            self.rollback_compose_update(ComposeUpdateRollback {
+                name: &req.name,
+                compose_path: &compose_path,
+                env_path: &env_path,
+                previous_compose: &previous_compose,
+                previous_env: previous_env.as_deref(),
+                previous_registry_credential_ids: &previous_registry_credential_ids,
+                registry_guard: &app_registry_guard,
+                reapply: true,
+            })
+            .await;
             return Err(AppsError::DockerFailed(stderr.to_string()));
         }
+
+        self.finish_compose_deployment_transaction(&req.name)
+            .await?;
 
         if let Err(error) = self
             .refresh_compose_ingress_after_deploy(&req.name, None, true)
@@ -4691,6 +6234,26 @@ impl AppsService {
         self.get(&req.name).await
     }
 
+    async fn rollback_compose_update(&self, rollback: ComposeUpdateRollback<'_>) {
+        let _ = (
+            rollback.compose_path,
+            rollback.env_path,
+            rollback.previous_compose,
+            rollback.previous_env,
+            rollback.previous_registry_credential_ids,
+        );
+        if let Err(error) = self
+            .rollback_compose_deployment_transaction(
+                rollback.name,
+                rollback.registry_guard,
+                rollback.reapply,
+            )
+            .await
+        {
+            warn!(%error, app = rollback.name, "failed to roll back compose update; recovery marker retained");
+        }
+    }
+
     /// Set (or clear) NASty-managed startup ordering for a compose stack.
     /// Persists `startup_*` to the sidecar manifest; when the managed flag
     /// flips, (re)generates or removes the `restart: "no"` override and
@@ -4704,6 +6267,7 @@ impl AppsService {
         order: u32,
         delay_secs: u32,
     ) -> Result<(), AppsError> {
+        let _compose_guard = self.compose_mutation_guard().await;
         validate_app_name(name)?;
         self.require_ready().await?;
         let project_dir = format!("{}/{}", COMPOSE_DIR, name);
@@ -4738,6 +6302,8 @@ impl AppsService {
                 name.to_string(),
                 "up".to_string(),
                 "-d".to_string(),
+                "--pull".to_string(),
+                "never".to_string(),
                 "--no-build".to_string(),
             ]);
             let output = Command::new("docker")
@@ -4786,6 +6352,7 @@ impl AppsService {
     }
 
     pub async fn compose_remove(&self, name: &str) -> Result<(), AppsError> {
+        let _compose_guard = self.compose_mutation_guard().await;
         validate_app_name(name)?;
         self.require_ready().await?;
 
@@ -4853,6 +6420,7 @@ impl AppsService {
         Ok(ComposeContent {
             compose_file,
             env_file,
+            registry_credential_ids: load_registry_credential_ids(name).await,
         })
     }
 
@@ -5438,10 +7006,90 @@ impl AppsService {
 
     // ── Image inspection ────────────────────────────────────
 
-    pub async fn inspect_image(&self, image: &str) -> Result<ImageInspectResult, AppsError> {
-        let meta = inspect_image_metadata(image)
-            .await
-            .map_err(|e| AppsError::CommandFailed(format!("image inspect failed: {e}")))?;
+    pub async fn inspect_image(
+        &self,
+        image: &str,
+        registry_credential_id: Option<&str>,
+    ) -> Result<ImageInspectResult, AppsError> {
+        let ids = registry_credential_id
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default();
+        let use_registry_credentials = if registry_credential_id.is_some() {
+            let images = [image.to_string()];
+            self.validate_registry_bindings(&images, &ids).await?;
+            true
+        } else {
+            self.registry_credentials_for_image(image, &[])
+                .await?
+                .is_some()
+        };
+        let meta = if use_registry_credentials {
+            self.require_ready().await?;
+            self.pull_image(image, &ids, true).await?;
+            let inspected = self
+                .docker()?
+                .inspect_image(image)
+                .await
+                .map_err(|error| AppsError::DockerFailed(format!("inspect image: {error}")))?;
+            let config = inspected.config.unwrap_or_default();
+            let mut ports = config
+                .exposed_ports
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| {
+                    let (port, protocol) = value.split_once('/').unwrap_or((&value, "tcp"));
+                    Some((port.parse::<u16>().ok()?, protocol.to_ascii_uppercase()))
+                })
+                .collect::<Vec<_>>();
+            ports.sort();
+            let ports = ports
+                .into_iter()
+                .enumerate()
+                .map(|(index, (container_port, protocol))| AppPort {
+                    name: if index == 0 {
+                        "http".to_string()
+                    } else {
+                        format!("port-{index}")
+                    },
+                    container_port,
+                    host_port: None,
+                    protocol,
+                })
+                .collect();
+            let mut volumes = config
+                .volumes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mount_path| AppVolume {
+                    name: mount_path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("data")
+                        .to_string(),
+                    mount_path,
+                    host_path: String::new(),
+                })
+                .collect::<Vec<_>>();
+            volumes.sort_by(|a, b| a.mount_path.cmp(&b.mount_path));
+            let parsed = parse_image_ref(image)?;
+            ImageMetadata {
+                ports,
+                volumes,
+                user: config.user.filter(|user| !user.is_empty()),
+                subpath_recipe: match_subpath_recipe(
+                    parsed
+                        .repository
+                        .strip_prefix("library/")
+                        .unwrap_or(&parsed.repository),
+                ),
+            }
+        } else {
+            inspect_image_metadata(image)
+                .await
+                .map_err(|e| AppsError::CommandFailed(format!("image inspect failed: {e}")))?
+        };
         Ok(ImageInspectResult {
             ports: meta.ports,
             volumes: meta.volumes,
@@ -5527,6 +7175,7 @@ impl AppsService {
             error!("Failed to start Docker: {e}");
             return None;
         }
+        self.recover_compose_deployment_transactions().await;
 
         // Bring up compose apps. NASty-managed stacks (#437) start in a
         // defined order with a settle delay after each; the rest keep
@@ -5534,16 +7183,36 @@ impl AppsService {
         // safety net (their containers may not have restart:always, and
         // Docker has usually already started them by now anyway).
         let mut managed: Vec<(String, StartupConfig)> = Vec::new();
+        let pull_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         if let Ok(mut entries) = tokio::fs::read_dir(COMPOSE_DIR).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let compose_file = entry.path().join("docker-compose.yml");
-                if !compose_file.exists() {
+                if !compose_file.exists() || entry.path().join(COMPOSE_TRANSACTION_FILE).exists() {
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
                 if let Err(e) = validate_app_name(&name) {
                     warn!("apps: refusing to restore unsafe compose directory name '{name}': {e}");
                     continue;
+                }
+                let pull_budget =
+                    pull_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if pull_budget.is_zero() {
+                    warn!(
+                        "Skipping registry restore pulls for compose app '{name}' after the 60s boot budget; trying locally cached images"
+                    );
+                } else {
+                    match tokio::time::timeout(pull_budget, self.pull_missing_compose_images(&name))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => warn!(
+                            "Could not restore missing images for compose app '{name}': {error}; trying locally cached images"
+                        ),
+                        Err(_) => warn!(
+                            "Registry restore pulls reached the 60s boot budget while processing compose app '{name}'; trying locally cached images"
+                        ),
+                    }
                 }
                 let cfg = load_startup_config(&name).await;
                 if cfg.managed {
@@ -5639,31 +7308,35 @@ impl AppsService {
         used
     }
 
-    async fn pull_image(&self, image: &str) -> Result<(), AppsError> {
+    async fn pull_image(
+        &self,
+        image: &str,
+        registry_credential_ids: &[String],
+        skip_if_present: bool,
+    ) -> Result<(), AppsError> {
         let docker = self.docker()?;
 
         // Short-circuit when the image is already in the local store.
         // Skips a round-trip to the registry every install, lets
         // airgapped boxes install from `docker load`-imported tarballs,
         // and lets the appliance-smoke nixosTest run without network.
-        if docker.inspect_image(image).await.is_ok() {
+        if skip_if_present && docker.inspect_image(image).await.is_ok() {
             return Ok(());
         }
 
-        let (from_image, tag) = if let Some((img, tag)) = image.rsplit_once(':') {
-            (img.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
+        let parsed = parse_image_ref(image)?;
 
         let options = CreateImageOptions {
-            from_image: Some(from_image.clone()),
-            tag: Some(tag.clone()),
+            from_image: Some(parsed.from_image),
+            tag: Some(parsed.reference),
             ..Default::default()
         };
+        let credentials = self
+            .registry_credentials_for_image(image, registry_credential_ids)
+            .await?;
 
         docker
-            .create_image(Some(options), None, None)
+            .create_image(Some(options), None, credentials)
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -5732,6 +7405,7 @@ impl AppsService {
 
         let compose_file = format!("{}/{}/docker-compose.yml", COMPOSE_DIR, name);
         if Path::new(&compose_file).exists() {
+            let _compose_guard = self.compose_mutation_guard().await;
             let output = Command::new("docker")
                 .args([
                     "compose",
@@ -5771,27 +7445,51 @@ impl AppsService {
     // ── Pull (update image) ─────────────────────────────────
 
     pub async fn pull(&self, name: &str) -> Result<App, AppsError> {
+        let guard = self.app_registry_read_guard().await;
+        self.pull_with_app_registry_guard(name, guard).await
+    }
+
+    pub async fn pull_with_app_registry_guard(
+        &self,
+        name: &str,
+        _guard: AppRegistryReadGuard,
+    ) -> Result<App, AppsError> {
+        self.pull_inner(name, true).await
+    }
+
+    /// Recreate an app after its image was already pulled by a streaming caller.
+    pub async fn recreate_after_pull(&self, name: &str) -> Result<App, AppsError> {
+        let guard = self.app_registry_read_guard().await;
+        self.recreate_after_pull_with_app_registry_guard(name, guard)
+            .await
+    }
+
+    pub async fn recreate_after_pull_with_app_registry_guard(
+        &self,
+        name: &str,
+        _guard: AppRegistryReadGuard,
+    ) -> Result<App, AppsError> {
+        self.pull_inner(name, false).await
+    }
+
+    async fn pull_inner(&self, name: &str, pull_images: bool) -> Result<App, AppsError> {
         validate_app_name(name)?;
         self.require_ready().await?;
 
         let compose_file = format!("{}/{}/docker-compose.yml", COMPOSE_DIR, name);
         if Path::new(&compose_file).exists() {
-            // docker compose pull + up -d (recreates with new images)
-            let pull = Command::new("docker")
-                .args([
-                    "compose",
-                    "-f",
-                    &compose_file,
-                    "--project-name",
-                    name,
-                    "pull",
-                ])
-                .output()
-                .await
-                .map_err(|e| AppsError::CommandFailed(e.to_string()))?;
-            if !pull.status.success() {
-                let stderr = String::from_utf8_lossy(&pull.stderr);
-                return Err(AppsError::DockerFailed(stderr.to_string()));
+            let _compose_guard = self.compose_mutation_guard().await;
+            let credential_ids = load_registry_credential_ids(name).await;
+            self.validate_registry_credential_ids(&credential_ids)
+                .await?;
+            let (_, images, _) =
+                effective_compose_inventory(Path::new(&compose_file), None).await?;
+            self.validate_registry_bindings(&images, &credential_ids)
+                .await?;
+            if pull_images {
+                for image in images {
+                    self.pull_image(&image, &credential_ids, false).await?;
+                }
             }
 
             let up = Command::new("docker")
@@ -5803,6 +7501,8 @@ impl AppsService {
                     name,
                     "up",
                     "-d",
+                    "--pull",
+                    "never",
                     "--no-build",
                     "--remove-orphans",
                 ])
@@ -5830,7 +7530,12 @@ impl AppsService {
             }
 
             // Pull latest
-            self.pull_image(&image).await?;
+            let credential_ids = load_registry_credential_ids(name).await;
+            self.validate_registry_bindings(std::slice::from_ref(&image), &credential_ids)
+                .await?;
+            if pull_images {
+                self.pull_image(&image, &credential_ids, false).await?;
+            }
 
             // Recreate container with same config but new image
             // Stop + remove + start from the pulled image
@@ -5877,6 +7582,7 @@ impl AppsService {
                 // pull-and-reinstall (else apps.pull would detach the app).
                 network: config.network,
                 static_ip: config.static_ip,
+                registry_credential_ids: Some(config.registry_credential_ids),
             };
             return self.install_inner(req, false).await;
         }
@@ -6829,27 +8535,6 @@ fn docker_data_root_status(docker_lib: &Path) -> Result<(), String> {
 
 // ── Container image inspection ──────────────────────────────
 
-fn parse_image_ref(image: &str) -> (String, String, String) {
-    let (image_no_tag, tag) = if let Some((img, tag)) = image.rsplit_once(':') {
-        (img.to_string(), tag.to_string())
-    } else {
-        (image.to_string(), "latest".to_string())
-    };
-
-    let parts: Vec<&str> = image_no_tag.splitn(2, '/').collect();
-    if parts.len() == 1 {
-        (
-            "registry-1.docker.io".to_string(),
-            format!("library/{}", parts[0]),
-            tag,
-        )
-    } else if parts[0].contains('.') || parts[0].contains(':') {
-        (parts[0].to_string(), parts[1].to_string(), tag)
-    } else {
-        ("registry-1.docker.io".to_string(), image_no_tag, tag)
-    }
-}
-
 struct ImageMetadata {
     ports: Vec<AppPort>,
     volumes: Vec<AppVolume>,
@@ -6915,7 +8600,14 @@ fn match_subpath_recipe(repo: &str) -> Option<SubPathRecipe> {
 }
 
 async fn inspect_image_metadata(image: &str) -> Result<ImageMetadata, String> {
-    let (registry, repo, tag) = parse_image_ref(image);
+    let parsed = parse_image_ref(image).map_err(|error| error.to_string())?;
+    let registry = if parsed.registry == "docker.io" {
+        "registry-1.docker.io".to_string()
+    } else {
+        parsed.registry
+    };
+    let repo = parsed.repository;
+    let tag = parsed.reference;
     let client = reqwest::Client::new();
 
     let registry_url = if registry.starts_with("http") {
@@ -7131,10 +8823,11 @@ async fn fetch_manifest_json(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppVolume, InstallAppRequest, StartupConfig, completes_ok_within, compose_file_args,
-        docker_data_root_status, extract_user_env, parse_compose_inventory, render_env_file,
-        render_startup_override, validate_app_name, validate_new_app_name,
-        validate_new_app_request, validate_simple_volumes, validate_volume_name,
+        AppVolume, InstallAppRequest, StartupConfig, canonical_registry_host, completes_ok_within,
+        compose_file_args, docker_data_root_status, extract_user_env, parse_compose_inventory,
+        parse_image_ref, render_env_file, render_startup_override, validate_app_name,
+        validate_new_app_name, validate_new_app_request, validate_simple_volumes,
+        validate_volume_name,
     };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -7218,6 +8911,7 @@ mod tests {
             subdomain: None,
             network: None,
             static_ip: None,
+            registry_credential_ids: None,
         };
 
         assert!(validate_new_app_request(&request).is_err());
@@ -7281,6 +8975,7 @@ mod tests {
 services:
   web:
     image: example/web:latest
+    pull_policy: always
   worker:
     build: .
     scale: 2
@@ -7291,20 +8986,81 @@ services:
   debug:
     image: example/debug:latest
     profiles: [debug]
+  built-image:
+    build: .
+    image: example/built:latest
+  local-only:
+    image: example/local:latest
+    pull_policy: never
 "#;
-        let (services, images) =
+        let (services, images, always_pull_images) =
             parse_compose_inventory(compose, None).expect("valid compose inventory");
 
-        assert_eq!(services, ["db", "db", "web", "worker", "worker"]);
+        assert_eq!(
+            services,
+            [
+                "built-image",
+                "db",
+                "db",
+                "local-only",
+                "web",
+                "worker",
+                "worker"
+            ]
+        );
         assert_eq!(
             images,
-            ["example/debug:latest", "example/web:latest", "postgres:18"]
+            [
+                "example/built:latest",
+                "example/debug:latest",
+                "example/local:latest",
+                "example/web:latest",
+                "postgres:18"
+            ]
+        );
+        assert_eq!(
+            always_pull_images,
+            std::collections::HashSet::from(["example/web:latest".to_string()])
         );
 
-        let active = std::collections::HashSet::from(["debug".to_string(), "web".to_string()]);
-        let (active_services, _) =
+        let active = std::collections::HashSet::from([
+            "built-image".to_string(),
+            "debug".to_string(),
+            "local-only".to_string(),
+            "web".to_string(),
+        ]);
+        let (active_services, active_images, _) =
             parse_compose_inventory(compose, Some(&active)).expect("effective inventory");
-        assert_eq!(active_services, ["debug", "web"]);
+        assert_eq!(
+            active_services,
+            ["built-image", "debug", "local-only", "web"]
+        );
+        assert_eq!(
+            active_images,
+            [
+                "example/built:latest",
+                "example/debug:latest",
+                "example/web:latest"
+            ]
+        );
+    }
+
+    #[test]
+    fn omitted_registry_bindings_are_distinct_from_an_explicit_clear() {
+        let omitted: InstallAppRequest = serde_json::from_value(serde_json::json!({
+            "name": "app",
+            "image": "example/app:latest"
+        }))
+        .unwrap();
+        assert_eq!(omitted.registry_credential_ids, None);
+
+        let cleared: InstallAppRequest = serde_json::from_value(serde_json::json!({
+            "name": "app",
+            "image": "example/app:latest",
+            "registry_credential_ids": []
+        }))
+        .unwrap();
+        assert_eq!(cleared.registry_credential_ids, Some(Vec::new()));
     }
 
     #[test]
@@ -8492,13 +10248,14 @@ services:
             "startup_order": 3,
             "startup_delay_secs": 5
         });
-        let out = splice_manifest_base(existing, "z", "new:tag", true);
+        let out = splice_manifest_base(existing, "z", "new:tag", true, &["credential".into()]);
         assert_eq!(out["image"], "new:tag");
         assert_eq!(out["allow_unsafe"], true);
         assert_eq!(out["ingress_subdomain"], "z.0f.ee");
         assert_eq!(out["startup_managed"], true);
         assert_eq!(out["startup_order"], 3);
         assert_eq!(out["startup_delay_secs"], 5);
+        assert_eq!(out["registry_credential_ids"][0], "credential");
     }
 
     #[test]
@@ -8508,7 +10265,7 @@ services:
         let existing = serde_json::json!({
             "proxy_disabled_reason": "emits absolute asset paths"
         });
-        let out = splice_manifest_base(existing, "haze", "img:tag", false);
+        let out = splice_manifest_base(existing, "haze", "img:tag", false, &[]);
         assert!(out.get("proxy_disabled_reason").is_none());
     }
 
@@ -8516,12 +10273,76 @@ services:
     fn splice_manifest_handles_missing_or_corrupt() {
         // Empty (fresh install) and non-object (corrupt) both yield a clean
         // object with just the base fields.
-        let fresh = splice_manifest_base(serde_json::json!({}), "a", "i", false);
+        let fresh = splice_manifest_base(serde_json::json!({}), "a", "i", false, &[]);
         assert_eq!(fresh["name"], "a");
         assert_eq!(fresh["kind"], "simple");
-        let corrupt = splice_manifest_base(serde_json::json!("not an object"), "a", "i", true);
+        let corrupt = splice_manifest_base(serde_json::json!("not an object"), "a", "i", true, &[]);
         assert_eq!(corrupt["image"], "i");
         assert_eq!(corrupt["allow_unsafe"], true);
+    }
+
+    #[test]
+    fn image_refs_canonicalize_registry_tags_ports_and_digests() {
+        let docker = parse_image_ref("ubuntu").unwrap();
+        assert_eq!(docker.registry, "docker.io");
+        assert_eq!(docker.repository, "library/ubuntu");
+        assert_eq!(docker.reference, "latest");
+
+        let alias = parse_image_ref("registry-1.docker.io/team/app:1.2").unwrap();
+        assert_eq!(alias.registry, "docker.io");
+        assert_eq!(alias.repository, "team/app");
+        assert_eq!(alias.reference, "1.2");
+
+        let local = parse_image_ref("localhost:5000/team/app@sha256:abcd").unwrap();
+        assert_eq!(local.registry, "localhost:5000");
+        assert_eq!(local.repository, "team/app");
+        assert_eq!(local.reference, "sha256:abcd");
+        assert_eq!(local.from_image, "localhost:5000/team/app");
+
+        let tagged_digest = parse_image_ref("ghcr.io/team/app:stable@sha256:abcd").unwrap();
+        assert_eq!(tagged_digest.repository, "team/app");
+        assert_eq!(tagged_digest.from_image, "ghcr.io/team/app");
+        assert_eq!(tagged_digest.reference, "sha256:abcd");
+    }
+
+    #[test]
+    fn registry_hosts_reject_schemes_paths_and_userinfo() {
+        for invalid in [
+            "https://ghcr.io",
+            "ghcr.io/team",
+            "user@ghcr.io",
+            "ghcr.io?x=y",
+        ] {
+            assert!(
+                canonical_registry_host(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        assert_eq!(canonical_registry_host("DOCKER.IO.").unwrap(), "docker.io");
+        assert_eq!(
+            canonical_registry_host("registry-1.docker.io").unwrap(),
+            "docker.io"
+        );
+        assert_eq!(
+            canonical_registry_host("[2001:db8::1]:5000").unwrap(),
+            "[2001:db8::1]:5000"
+        );
+    }
+
+    #[test]
+    fn registry_api_view_never_serializes_secret_material() {
+        let stored: super::StoredRegistryCredential = serde_json::from_value(serde_json::json!({
+            "id": "9f6e250d-bb20-4a87-81a8-6480f94e91ca",
+            "label": "GHCR",
+            "registry": "ghcr.io",
+            "username": "octocat",
+            "secret_encrypted": "ciphertext-marker"
+        }))
+        .unwrap();
+        let json = serde_json::to_string(&stored.redacted()).unwrap();
+        assert!(json.contains("\"has_secret\":true"));
+        assert!(!json.contains("ciphertext-marker"));
+        assert!(!json.contains("secret_encrypted"));
     }
 
     // ── resolve_ingress_subdomain ──

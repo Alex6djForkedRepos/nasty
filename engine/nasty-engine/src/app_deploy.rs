@@ -69,6 +69,10 @@ struct DeployRequest {
     /// running app.
     #[serde(default)]
     ingress_host_port: Option<u16>,
+    /// Named registry credentials pinned to this app. Secrets remain in the
+    /// engine; the deployment stream carries opaque IDs only.
+    #[serde(default)]
+    registry_credential_ids: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Default)]
@@ -251,6 +255,7 @@ async fn deploy_simple(
     session: &crate::auth::Session,
     client_ip: &str,
 ) {
+    let app_registry_guard = state.apps.app_registry_read_guard().await;
     if let Err(e) = nasty_apps::validate_new_app_name(&req.name) {
         report_error(socket, &req.name, "validate", &e.to_string()).await;
         return;
@@ -286,8 +291,29 @@ async fn deploy_simple(
     // Top-level flag wins over anything embedded in install_params, so the
     // privileged-deploy decision is plainly visible in the deploy request.
     params.allow_unsafe = req.allow_unsafe;
+    if let Some(ids) = &req.registry_credential_ids {
+        params.registry_credential_ids = Some(ids.clone());
+    }
+    let registry_credential_ids = params
+        .registry_credential_ids
+        .as_deref()
+        .unwrap_or_default();
     if let Err(e) = nasty_apps::validate_new_app_request(&params) {
         report_error(socket, &req.name, "validate", &e.to_string()).await;
+        return;
+    }
+    if let Err(error) = state
+        .apps
+        .validate_registry_bindings(std::slice::from_ref(&image), registry_credential_ids)
+        .await
+    {
+        report_error(
+            socket,
+            &req.name,
+            "validate-credentials",
+            &error.to_string(),
+        )
+        .await;
         return;
     }
     if let Some(ref s) = params.subdomain
@@ -311,7 +337,7 @@ async fn deploy_simple(
         ))
         .await;
 
-    if let Err(e) = pull_image_with_progress(socket, state, &image).await {
+    if let Err(e) = pull_image_with_progress(socket, state, &image, registry_credential_ids).await {
         report_error(socket, &req.name, "pull", &format!("pull failed: {e}")).await;
         return;
     }
@@ -357,7 +383,11 @@ async fn deploy_simple(
         .as_deref()
         .map(str::trim)
         .is_some_and(|s| !s.is_empty());
-    match state.apps.install(params).await {
+    match state
+        .apps
+        .install_with_app_registry_guard(params, app_registry_guard)
+        .await
+    {
         Ok(app) => {
             if chose_subdomain {
                 tokio::spawn(nasty_system::settings::reapply_tls_from_disk());
@@ -388,6 +418,8 @@ async fn deploy_compose(
     session: &crate::auth::Session,
     client_ip: &str,
 ) {
+    let app_registry_guard = state.apps.app_registry_read_guard().await;
+    let _compose_guard = state.apps.compose_mutation_guard().await;
     let compose_content = match &req.compose_file {
         Some(c) => c.clone(),
         None => {
@@ -395,7 +427,6 @@ async fn deploy_compose(
             return;
         }
     };
-
     // Reject dangerous compose directives before anything touches disk or
     // docker. Without this, an authenticated admin (or anyone who steals an
     // admin token) can mount '/' into a container and walk out with every
@@ -444,10 +475,36 @@ async fn deploy_compose(
         .await;
         return;
     }
-    if !is_update && let Err(e) = nasty_apps::validate_new_app_name(&req.name) {
+    if !is_update && let Err(e) = state.apps.ensure_new_app_name_available(&req.name).await {
         report_error(socket, &req.name, "validate", &e.to_string()).await;
         return;
     }
+
+    let registry_credential_ids = match &req.registry_credential_ids {
+        Some(ids) => ids.clone(),
+        None if is_update => state.apps.app_registry_credential_ids(&req.name).await,
+        None => Vec::new(),
+    };
+    if let Err(error) = state
+        .apps
+        .validate_registry_credential_ids(&registry_credential_ids)
+        .await
+    {
+        report_error(
+            socket,
+            &req.name,
+            "validate-credentials",
+            &error.to_string(),
+        )
+        .await;
+        return;
+    }
+
+    let attempt = uuid::Uuid::new_v4();
+    let staged_compose_path = format!("{compose_dir}/.nasty-compose-{attempt}.yml");
+    let staged_env_path = format!("{compose_dir}/.nasty-env-{attempt}");
+    let compose_backup_path = format!("{compose_dir}/.nasty-compose-{attempt}.backup");
+    let env_backup_path = format!("{compose_dir}/.nasty-env-{attempt}.backup");
 
     // Write compose file
     if let Err(e) = tokio::fs::create_dir_all(&compose_dir).await {
@@ -460,7 +517,23 @@ async fn deploy_compose(
         .await;
         return;
     }
-    if let Err(e) = tokio::fs::write(&compose_path, &compose_content).await {
+    if let Err(error) = state
+        .apps
+        .begin_compose_deployment_transaction(&req.name, &app_registry_guard)
+        .await
+    {
+        discard_compose_stage(&compose_dir, &[], !is_update).await;
+        report_error(
+            socket,
+            &req.name,
+            "stage-transaction",
+            &format!("could not reserve compose transaction: {error}"),
+        )
+        .await;
+        return;
+    }
+    if let Err(e) = tokio::fs::write(&staged_compose_path, &compose_content).await {
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
         report_error(
             socket,
             &req.name,
@@ -470,34 +543,34 @@ async fn deploy_compose(
         .await;
         return;
     }
-    // Persist the unsafe flag next to the compose file so list/get can surface
-    // it. Marker is the presence of `allow_unsafe: true` in the JSON file.
-    if let Err(e) = write_app_meta(&compose_dir, req.allow_unsafe).await {
-        report_error(
-            socket,
-            &req.name,
-            "write-meta",
-            &format!("failed to write app meta: {e}"),
-        )
-        .await;
-        return;
-    }
-
-    // Write .env: NASty's managed COMPOSE_PROJECT_NAME plus the operator's
-    // pasted dotenv (Immich/Nextcloud-style config). Compose reads it from
-    // the project directory for `${VAR}` substitution and defaults. Shared
-    // renderer so `compose_get` can split the operator's part back out.
-    // Failure is non-fatal for the project name (--project-name covers it)
-    // but a missing user env would leave `${VAR}` empty — log it.
+    // Stage and swap `.env` before validation. Compose's global --env-file
+    // handles interpolation, while a service-level `env_file: .env` reads the
+    // canonical project path directly. The backup is restored on any failure.
     let env_path = format!("{}/.env", compose_dir);
     if let Err(e) = tokio::fs::write(
-        &env_path,
+        &staged_env_path,
         nasty_apps::render_env_file(&req.name, req.env_file.as_deref()),
     )
     .await
     {
-        tracing::warn!("compose .env write to {env_path} failed: {e}");
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+        report_error(
+            socket,
+            &req.name,
+            "write-env",
+            &format!("failed to write compose environment: {e}"),
+        )
+        .await;
+        return;
     }
+    let had_env = match install_staged_file(&staged_env_path, &env_path, &env_backup_path).await {
+        Ok(had_env) => had_env,
+        Err(error) => {
+            rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+            report_error(socket, &req.name, "stage-env", &error).await;
+            return;
+        }
+    };
 
     // Validate
     let _ = socket
@@ -508,13 +581,28 @@ async fn deploy_compose(
     if let Err(e) = stream_command(
         socket,
         "docker",
-        &["compose", "-f", &compose_path, "config", "--quiet"],
+        &[
+            "compose",
+            "--env-file",
+            &env_path,
+            "-f",
+            &staged_compose_path,
+            "config",
+            "--quiet",
+        ],
     )
     .await
     {
-        if !is_update {
-            let _ = tokio::fs::remove_dir_all(&compose_dir).await;
-        }
+        abort_compose_stage(
+            &compose_dir,
+            &staged_compose_path,
+            &env_path,
+            &env_backup_path,
+            had_env,
+            !is_update,
+        )
+        .await;
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
         report_error(
             socket,
             &req.name,
@@ -531,7 +619,60 @@ async fn deploy_compose(
             DeployMessage::log("Pulling images...").into(),
         ))
         .await;
-    let images = extract_compose_images(&compose_content);
+    let images = match state
+        .apps
+        .compose_images_from_path(
+            std::path::Path::new(&staged_compose_path),
+            Some(std::path::Path::new(&env_path)),
+        )
+        .await
+    {
+        Ok(images) => images,
+        Err(error) => {
+            report_error(
+                socket,
+                &req.name,
+                "resolve-images",
+                &format!("could not resolve effective compose images: {error}"),
+            )
+            .await;
+            abort_compose_stage(
+                &compose_dir,
+                &staged_compose_path,
+                &env_path,
+                &env_backup_path,
+                had_env,
+                !is_update,
+            )
+            .await;
+            rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+            return;
+        }
+    };
+    if let Err(error) = state
+        .apps
+        .validate_registry_bindings(&images, &registry_credential_ids)
+        .await
+    {
+        report_error(
+            socket,
+            &req.name,
+            "validate-credentials",
+            &error.to_string(),
+        )
+        .await;
+        abort_compose_stage(
+            &compose_dir,
+            &staged_compose_path,
+            &env_path,
+            &env_backup_path,
+            had_env,
+            !is_update,
+        )
+        .await;
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+        return;
+    }
     if images.is_empty() {
         let _ = socket
             .send(Message::Text(
@@ -545,10 +686,19 @@ async fn deploy_compose(
                     DeployMessage::log(&format!("Pulling: {image}")).into(),
                 ))
                 .await;
-            if let Err(e) = pull_image_with_progress(socket, state, image).await {
-                if !is_update {
-                    let _ = tokio::fs::remove_dir_all(&compose_dir).await;
-                }
+            if let Err(e) =
+                pull_image_with_progress(socket, state, image, &registry_credential_ids).await
+            {
+                abort_compose_stage(
+                    &compose_dir,
+                    &staged_compose_path,
+                    &env_path,
+                    &env_backup_path,
+                    had_env,
+                    !is_update,
+                )
+                .await;
+                rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
                 report_error(
                     socket,
                     &req.name,
@@ -561,53 +711,115 @@ async fn deploy_compose(
         }
     }
 
+    let previous_registry_credential_ids = state.apps.app_registry_credential_ids(&req.name).await;
+    if let Err(error) = state
+        .apps
+        .set_app_registry_credential_ids_with_guard(
+            &req.name,
+            &registry_credential_ids,
+            &app_registry_guard,
+        )
+        .await
+    {
+        abort_compose_stage(
+            &compose_dir,
+            &staged_compose_path,
+            &env_path,
+            &env_backup_path,
+            had_env,
+            !is_update,
+        )
+        .await;
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+        report_error(
+            socket,
+            &req.name,
+            "write-credentials",
+            &format!("credential binding could not be reserved: {error}"),
+        )
+        .await;
+        return;
+    }
+
+    let _had_compose = match install_staged_file(
+        &staged_compose_path,
+        &compose_path,
+        &compose_backup_path,
+    )
+    .await
+    {
+        Ok(had_compose) => had_compose,
+        Err(error) => {
+            if let Err(restore_error) = state
+                .apps
+                .set_app_registry_credential_ids_with_guard(
+                    &req.name,
+                    &previous_registry_credential_ids,
+                    &app_registry_guard,
+                )
+                .await
+            {
+                warn!(app = %req.name, %restore_error, "failed to restore registry bindings after staging failure");
+            }
+            abort_compose_stage(
+                &compose_dir,
+                &staged_compose_path,
+                &env_path,
+                &env_backup_path,
+                had_env,
+                !is_update,
+            )
+            .await;
+            rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+            report_error(socket, &req.name, "stage-compose", &error).await;
+            return;
+        }
+    };
+
+    if let Err(error) = state.apps.sync_compose_deployment_files(&req.name).await {
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, false).await;
+        report_error(
+            socket,
+            &req.name,
+            "sync-compose",
+            &format!("could not persist compose transaction: {error}"),
+        )
+        .await;
+        return;
+    }
+
     // Start containers
     let _ = socket
         .send(Message::Text(
             DeployMessage::log("Starting containers...").into(),
         ))
         .await;
-    let mut args = vec![
-        "compose",
-        "-f",
-        &compose_path,
-        "--project-name",
-        &req.name,
-        "up",
-        "-d",
-        "--no-build",
+    let mut owned_args = vec![
+        "compose".to_string(),
+        "--env-file".to_string(),
+        env_path.clone(),
     ];
+    owned_args.extend(nasty_apps::compose_file_args(&req.name));
+    owned_args.extend([
+        "--project-name".to_string(),
+        req.name.clone(),
+        "up".to_string(),
+        "-d".to_string(),
+        "--pull".to_string(),
+        "never".to_string(),
+        "--no-build".to_string(),
+    ]);
     if is_update {
-        args.push("--remove-orphans");
+        owned_args.push("--remove-orphans".to_string());
     }
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     if let Err(e) = stream_command(socket, "docker", &args).await {
-        // Clean up partially created containers before removing the compose dir
         let _ = socket
             .send(Message::Text(
                 DeployMessage::log("Cleaning up failed deployment...").into(),
             ))
             .await;
-        // Best-effort cleanup of partially-created containers. `try_run`
-        // logs failures so a leak (containers/volumes that didn't get
-        // removed) is debuggable from the journal rather than mysterious
-        // disk-space loss.
-        nasty_common::cmd::try_run(
-            "docker",
-            &[
-                "compose",
-                "-f",
-                &compose_path,
-                "--project-name",
-                &req.name,
-                "down",
-                "-v",
-                "--remove-orphans",
-            ],
-        )
-        .await;
-        if !is_update {
-            let _ = tokio::fs::remove_dir_all(&compose_dir).await;
-        }
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, true).await;
         // #429: docker's "network <x> declared as external, but could not
         // be found" is opaque when <x> is a host bridge (Settings →
         // Network) rather than a Docker network. Surface a targeted hint.
@@ -634,6 +846,39 @@ async fn deploy_compose(
         };
         report_error(socket, &req.name, "compose-up", &msg).await;
         return;
+    }
+
+    if let Err(error) = write_app_meta(&compose_dir, req.allow_unsafe).await {
+        rollback_compose_transaction(state, &req.name, &app_registry_guard, true).await;
+        report_error(
+            socket,
+            &req.name,
+            "commit-compose",
+            &format!("app started but its deployment metadata could not be saved: {error}"),
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = state
+        .apps
+        .finish_compose_deployment_transaction(&req.name)
+        .await
+    {
+        report_error(
+            socket,
+            &req.name,
+            "commit-compose",
+            &format!("app started but its transaction could not be committed: {error}"),
+        )
+        .await;
+        return;
+    }
+    for backup in [&compose_backup_path, &env_backup_path] {
+        if let Err(error) = tokio::fs::remove_file(backup).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, %backup, "failed to remove compose deployment backup");
+        }
     }
 
     // Fresh installs start in path-prefix mode. Updates preserve the saved
@@ -673,36 +918,123 @@ async fn deploy_compose(
         .await;
 }
 
+async fn discard_compose_stage(compose_dir: &str, paths: &[&str], remove_project_dir: bool) {
+    if remove_project_dir {
+        if let Err(error) = tokio::fs::remove_dir_all(compose_dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, path = compose_dir, "failed to remove staged compose project");
+        }
+        return;
+    }
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, %path, "failed to remove staged compose file");
+        }
+    }
+}
+
+async fn rollback_compose_transaction(
+    state: &AppState,
+    app_name: &str,
+    guard: &nasty_apps::AppRegistryReadGuard,
+    reconcile_docker: bool,
+) {
+    if let Err(error) = state
+        .apps
+        .rollback_compose_deployment_transaction(app_name, guard, reconcile_docker)
+        .await
+    {
+        warn!(%error, app = app_name, "failed to roll back compose deployment transaction; recovery marker retained");
+    }
+}
+
+async fn install_staged_file(staged: &str, canonical: &str, backup: &str) -> Result<bool, String> {
+    let had_original = std::path::Path::new(canonical).exists();
+    if had_original {
+        tokio::fs::rename(canonical, backup)
+            .await
+            .map_err(|error| format!("backup {canonical}: {error}"))?;
+    }
+    if let Err(error) = tokio::fs::rename(staged, canonical).await {
+        if had_original && let Err(restore_error) = tokio::fs::rename(backup, canonical).await {
+            warn!(%restore_error, %canonical, "failed to restore file after staging failure");
+        }
+        return Err(format!("install staged {canonical}: {error}"));
+    }
+    Ok(had_original)
+}
+
+async fn restore_staged_file(canonical: &str, backup: &str, had_original: bool) {
+    if let Err(error) = tokio::fs::remove_file(canonical).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(%error, %canonical, "failed to remove staged file during rollback");
+    }
+    if had_original && let Err(error) = tokio::fs::rename(backup, canonical).await {
+        warn!(%error, %canonical, "failed to restore original file during rollback");
+    }
+}
+
+async fn abort_compose_stage(
+    compose_dir: &str,
+    staged_compose_path: &str,
+    env_path: &str,
+    env_backup_path: &str,
+    had_env: bool,
+    remove_project_dir: bool,
+) {
+    // The transaction snapshot owns fresh-install cleanup. Keeping the marker
+    // until it runs makes a failed cleanup recoverable on boot.
+    if !remove_project_dir {
+        restore_staged_file(env_path, env_backup_path, had_env).await;
+        discard_compose_stage(compose_dir, &[staged_compose_path], false).await;
+    }
+}
+
 async fn deploy_pull(socket: &mut WebSocket, state: &AppState, req: &DeployRequest) {
+    let app_registry_guard = state.apps.app_registry_read_guard().await;
     let compose_path = format!("/var/lib/nasty/apps/{}/docker-compose.yml", req.name);
 
     if std::path::Path::new(&compose_path).exists() {
+        let _compose_guard = state.apps.compose_mutation_guard().await;
         // Compose app: pull via bollard + recreate
         let _ = socket
             .send(Message::Text(
                 DeployMessage::log("Pulling latest images...").into(),
             ))
             .await;
-        let compose_content = match tokio::fs::read_to_string(&compose_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                report_error(
-                    socket,
-                    &req.name,
-                    "read-compose",
-                    &format!("read compose file: {e}"),
-                )
-                .await;
+        let credential_ids = state.apps.app_registry_credential_ids(&req.name).await;
+        let images = match state.apps.compose_images(&req.name).await {
+            Ok(images) => images,
+            Err(error) => {
+                report_error(socket, &req.name, "resolve-images", &error.to_string()).await;
                 return;
             }
         };
-        for image in extract_compose_images(&compose_content) {
+        if let Err(error) = state
+            .apps
+            .validate_registry_bindings(&images, &credential_ids)
+            .await
+        {
+            report_error(
+                socket,
+                &req.name,
+                "validate-credentials",
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
+        for image in images {
             let _ = socket
                 .send(Message::Text(
                     DeployMessage::log(&format!("Pulling: {image}")).into(),
                 ))
                 .await;
-            if let Err(e) = pull_image_with_progress(socket, state, &image).await {
+            if let Err(e) = pull_image_with_progress(socket, state, &image, &credential_ids).await {
                 report_error(
                     socket,
                     &req.name,
@@ -719,23 +1051,20 @@ async fn deploy_pull(socket: &mut WebSocket, state: &AppState, req: &DeployReque
                 DeployMessage::log("Recreating containers...").into(),
             ))
             .await;
-        if let Err(e) = stream_command(
-            socket,
-            "docker",
-            &[
-                "compose",
-                "-f",
-                &compose_path,
-                "--project-name",
-                &req.name,
-                "up",
-                "-d",
-                "--no-build",
-                "--remove-orphans",
-            ],
-        )
-        .await
-        {
+        let mut up_args = vec!["compose".to_string()];
+        up_args.extend(nasty_apps::compose_file_args(&req.name));
+        up_args.extend([
+            "--project-name".to_string(),
+            req.name.clone(),
+            "up".to_string(),
+            "-d".to_string(),
+            "--pull".to_string(),
+            "never".to_string(),
+            "--no-build".to_string(),
+            "--remove-orphans".to_string(),
+        ]);
+        let up_refs: Vec<&str> = up_args.iter().map(String::as_str).collect();
+        if let Err(e) = stream_command(socket, "docker", &up_refs).await {
             report_error(
                 socket,
                 &req.name,
@@ -766,7 +1095,22 @@ async fn deploy_pull(socket: &mut WebSocket, state: &AppState, req: &DeployReque
                 DeployMessage::log(&format!("Pulling image: {image}")).into(),
             ))
             .await;
-        if let Err(e) = pull_image_with_progress(socket, state, &image).await {
+        let credential_ids = state.apps.app_registry_credential_ids(&req.name).await;
+        if let Err(error) = state
+            .apps
+            .validate_registry_bindings(std::slice::from_ref(&image), &credential_ids)
+            .await
+        {
+            report_error(
+                socket,
+                &req.name,
+                "validate-credentials",
+                &error.to_string(),
+            )
+            .await;
+            return;
+        }
+        if let Err(e) = pull_image_with_progress(socket, state, &image, &credential_ids).await {
             report_error(socket, &req.name, "pull", &format!("pull failed: {e}")).await;
             return;
         }
@@ -777,7 +1121,11 @@ async fn deploy_pull(socket: &mut WebSocket, state: &AppState, req: &DeployReque
                 DeployMessage::log("Recreating container...").into(),
             ))
             .await;
-        match state.apps.pull(&req.name).await {
+        match state
+            .apps
+            .recreate_after_pull_with_app_registry_guard(&req.name, app_registry_guard)
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 report_error(socket, &req.name, "recreate", &e.to_string()).await;
@@ -803,8 +1151,16 @@ async fn deploy_pull(socket: &mut WebSocket, state: &AppState, req: &DeployReque
 /// Run a command and stream its combined stdout+stderr line by line over the WebSocket.
 /// Returns Ok(()) if the command exits successfully, Err(message) otherwise.
 async fn stream_command(socket: &mut WebSocket, cmd: &str, args: &[&str]) -> Result<(), String> {
-    let mut child = Command::new(cmd)
-        .args(args)
+    let mut command = Command::new(cmd);
+    command.args(args);
+    if cmd == "docker" {
+        let docker_config = "/run/nasty-docker-config";
+        tokio::fs::create_dir_all(docker_config)
+            .await
+            .map_err(|error| format!("create isolated Docker config: {error}"))?;
+        command.env("DOCKER_CONFIG", docker_config);
+    }
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1151,6 +1507,18 @@ pub(crate) fn validate_compose(
     for (svc_name, svc) in services {
         let scope = |field: &str| format!("services.{svc_name}.{field}");
 
+        if let Some(policy) = svc.get("pull_policy").and_then(|value| value.as_str())
+            && !matches!(
+                policy,
+                "always" | "missing" | "if_not_present" | "never" | "build"
+            )
+        {
+            return Err(format!(
+                "{} uses unsupported periodic policy '{policy}'; use always, missing, never, or build",
+                scope("pull_policy")
+            ));
+        }
+
         if !allow_unsafe {
             if svc.get("privileged").is_some_and(|value| {
                 value.as_bool() == Some(true)
@@ -1490,57 +1858,32 @@ pub(crate) fn validate_compose(
     Ok(())
 }
 
-/// Extract image references from a docker-compose YAML string.
-/// Looks for `image:` fields under `services:` — skips services that use `build:` instead.
-fn extract_compose_images(yaml: &str) -> Vec<String> {
-    // Simple YAML parsing — look for services with image: fields
-    let parsed: serde_json::Value = match serde_yaml_ng::from_str(yaml) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut images = Vec::new();
-    if let Some(services) = parsed.get("services").and_then(|s| s.as_object()) {
-        for (_name, svc) in services {
-            if let Some(image) = svc.get("image").and_then(|i| i.as_str())
-                && !image.is_empty()
-                && svc.get("build").is_none()
-            {
-                images.push(image.to_string());
-            }
-        }
-    }
-
-    // Deduplicate
-    images.sort();
-    images.dedup();
-    images
-}
-
 /// Pull a Docker image using bollard's API with structured per-layer progress.
 async fn pull_image_with_progress(
     socket: &mut WebSocket,
     state: &AppState,
     image: &str,
+    registry_credential_ids: &[String],
 ) -> Result<(), String> {
     let docker = state
         .apps
         .docker_client()
         .map_err(|e| format!("Docker not ready: {e}"))?;
 
-    let (from_image, tag) = if let Some((img, tag)) = image.rsplit_once(':') {
-        (img.to_string(), tag.to_string())
-    } else {
-        (image.to_string(), "latest".to_string())
-    };
+    let parsed = nasty_apps::parse_image_ref(image).map_err(|error| error.to_string())?;
 
     let options = CreateImageOptions {
-        from_image: Some(from_image.clone()),
-        tag: Some(tag.clone()),
+        from_image: Some(parsed.from_image),
+        tag: Some(parsed.reference),
         ..Default::default()
     };
+    let credentials = state
+        .apps
+        .registry_credentials_for_image(image, registry_credential_ids)
+        .await
+        .map_err(|error| error.to_string())?;
 
-    let mut stream = docker.create_image(Some(options), None, None);
+    let mut stream = docker.create_image(Some(options), None, credentials);
     let mut layers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     while let Some(result) = stream.next().await {
@@ -1653,6 +1996,14 @@ mod tests {
     #[test]
     fn strict_accepts_minimal_compose() {
         ok_strict("services:\n  web:\n    image: nginx\n");
+    }
+
+    #[test]
+    fn compose_rejects_periodic_pull_policies_we_cannot_preserve() {
+        err_strict(
+            "services:\n  web:\n    image: nginx\n    pull_policy: daily\n",
+            "unsupported periodic policy",
+        );
     }
 
     #[test]

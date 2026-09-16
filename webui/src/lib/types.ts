@@ -1860,6 +1860,8 @@ export interface App {
 	network?: string | null;
 	/** The app's IP on that network, when known (LAN-IP apps). */
 	network_ip?: string | null;
+	/** Opaque IDs of named registry credentials pinned to this app. */
+	registry_credential_ids?: string[];
 }
 
 export interface AppContainer {
@@ -1908,6 +1910,16 @@ export interface AppConfig {
 	/** Subdomain-ingress hostname, if any (round-tripped on Edit so saving
 	 * other fields doesn't drop the ingress). */
 	subdomain?: string | null;
+	registry_credential_ids?: string[];
+}
+
+/** Redacted Docker registry login metadata. The password/token never leaves the engine. */
+export interface RegistryCredential {
+	id: string;
+	label: string;
+	registry: string;
+	username: string;
+	has_secret: boolean;
 }
 
 /** A NASty-managed Docker network spec (apps.networks.create payload). */
