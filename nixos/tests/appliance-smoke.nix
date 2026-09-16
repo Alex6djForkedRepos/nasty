@@ -405,9 +405,9 @@ pkgs.testers.runNixOSTest {
     machine.start()
 
     machine.succeed("nasty-top --version | grep -Fq '0.0.11'")
-    machine.succeed("diskwatch --version | grep -Fq '0.5.2'")
-    machine.succeed("netwatch --version | grep -Fq '0.29.2'")
-    machine.succeed("syswatch --version | grep -Fq '0.10.0'")
+    machine.succeed("diskwatch --version | grep -Fq '0.5.8'")
+    machine.succeed("netwatch --version | grep -Fq '0.31.4'")
+    machine.succeed("syswatch --version | grep -Fq '0.14.2'")
 
     # nftables must establish a default-drop baseline independently of the
     # engine. Restart nftables as separate stop/start operations so PartOf stops

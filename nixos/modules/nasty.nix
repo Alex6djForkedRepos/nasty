@@ -831,12 +831,12 @@ in {
         diskwatchSrc = pkgs.fetchFromGitHub {
           owner = "matthart1983";
           repo = "diskwatch";
-          rev = "v0.5.2";
-          hash = "sha256-aebepClhjC5Gnw9Ct+z04XX0bcDRytk2Z88BeA0lE8Y=";
+          rev = "v0.5.8";
+          hash = "sha256-06zBqYPk9d+SOdltUcnHe703znyD+nPRcELV94D157w=";
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "diskwatch";
-        version = "0.5.2";
+        version = "0.5.8";
         src = diskwatchSrc;
         cargoLock.lockFile = "${diskwatchSrc}/Cargo.lock";
         meta.mainProgram = "diskwatch";
@@ -849,16 +849,21 @@ in {
         netwatchSrc = pkgs.fetchFromGitHub {
           owner = "matthart1983";
           repo = "netwatch";
-          rev = "v0.29.2";
-          hash = "sha256-evfnMhLV+qxovhmBr4bGvCnY7weBGzfw6I67VJfYKJc=";
+          rev = "v0.31.4";
+          hash = "sha256-TnbyfgHULEPZNfAH/WImwv4XH8hESIxnC5revwLZKY0=";
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "netwatch-tui";
-        version = "0.29.2";
+        version = "0.31.4";
         src = netwatchSrc;
         cargoLock.lockFile = "${netwatchSrc}/Cargo.lock";
         nativeBuildInputs = [ pkgs.pkg-config ];
         buildInputs = [ pkgs.libpcap ];
+        # Requires observing independent child processes through /proc,
+        # which is intentionally unavailable in the Nix build sandbox.
+        checkFlags = [
+          "--skip=collectors::connections::tests::controlled_polling_matrix_matches_independent_processes"
+        ];
         postInstall = ''
           install -Dm644 LICENSE "$out/share/licenses/netwatch/LICENSE"
           install -Dm644 NOTICE "$out/share/licenses/netwatch/NOTICE"
@@ -871,14 +876,16 @@ in {
         syswatchSrc = pkgs.fetchFromGitHub {
           owner = "matthart1983";
           repo = "syswatch";
-          rev = "v0.10.0";
-          hash = "sha256-EHijnB6hG3qrGteB0Q4Um9GgoIJqyZSflaMvQb2Zk8E=";
+          rev = "v0.14.2";
+          hash = "sha256-udVUX1qNaPDBI+nEjm7LQ+2+HG6TBlgsjyQOP8pBqao=";
         };
       in pkgs.rustPlatform.buildRustPackage {
         pname = "syswatch";
-        version = "0.10.0";
+        version = "0.14.2";
         src = syswatchSrc;
         cargoLock.lockFile = "${syswatchSrc}/Cargo.lock";
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = [ pkgs.libpcap ];
         meta.mainProgram = "syswatch";
       })
 
