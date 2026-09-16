@@ -4,6 +4,13 @@
 // fetches and same-origin WS upgrades carry it automatically — there is no
 // JS-visible token to thread through requests.
 
+export class EngineUnavailableError extends Error {
+	constructor(status: number) {
+		super(`NASty engine isn't accepting requests yet (HTTP ${status}). Retry in a moment.`);
+		this.name = 'EngineUnavailableError';
+	}
+}
+
 export async function login(username: string, password: string): Promise<void> {
 	let res: Response;
 	try {
@@ -30,16 +37,13 @@ export async function login(username: string, password: string): Promise<void> {
 	// Map status classes onto messages an operator can act on. Without
 	// this split, an engine that's down/timing out looked identical to
 	// a typo'd password — both surfaced as a bare "Login failed."
+	if (res.status === 502 || res.status === 503 || res.status === 504) {
+		throw new EngineUnavailableError(res.status);
+	}
 	if (res.status >= 500) {
 		throw new Error(
 			`NASty engine unavailable (HTTP ${res.status}). The backend isn't responding — check 'systemctl status nasty-engine' on the box.`
 		);
-	}
-	if (res.status === 503 || res.status === 504) {
-		// Caddy uses these when the upstream is unreachable / slow.
-		// (Covered by the >=500 branch above too, but keep the specific
-		// hint for the common gateway cases.)
-		throw new Error(`NASty engine isn't accepting requests yet (HTTP ${res.status}). Retry in a moment.`);
 	}
 
 	// 4xx — the request reached the engine and was refused. Honor the
