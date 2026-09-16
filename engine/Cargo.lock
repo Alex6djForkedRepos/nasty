@@ -629,6 +629,7 @@ dependencies = [
  "base64 0.22.1",
  "bollard-stubs",
  "bytes",
+ "chrono",
  "futures-core",
  "futures-util",
  "hex",
@@ -658,6 +659,7 @@ version = "1.53.1-rc.29.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce412eb6f7096743011dc3cb5c674caeb24ced61d8c498fe07cf7998a4fea889"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
  "serde_repr",
@@ -2928,6 +2930,7 @@ name = "nasty-apps"
 version = "0.1.0"
 dependencies = [
  "bollard",
+ "chrono",
  "futures-util",
  "libc",
  "nasty-common",
@@ -2940,6 +2943,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

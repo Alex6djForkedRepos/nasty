@@ -13,10 +13,11 @@ use crate::subvolume_dependents::SubvolumeDependents;
 use nasty_apps::{
     App, AppConfig, AppIngress, AppStats, AppdataRelocateStatus, AppsStatus, CaddyRouteSummary,
     CheckComposeRequest, CheckComposeResult, CheckDevicesRequest, CheckPortsRequest,
-    CheckVolumesRequest, ComposeContent, ComposeStartupEntry, DeviceMissing, EnableAppsRequest,
-    FixVolumePermsRequest, ImageInspectResult, InstallAppRequest, InstallComposeRequest,
-    ManagedNetwork, NetworkSummary, PortConflict, PruneResult, SetComposeStartupRequest,
-    SetIngressRequest, VolumeMismatch,
+    CheckVolumesRequest, ComposeContent, ComposeStartupEntry, CreateRegistryCredentialRequest,
+    DeviceMissing, EnableAppsRequest, FixVolumePermsRequest, ImageInspectResult, InstallAppRequest,
+    InstallComposeRequest, ManagedNetwork, NetworkSummary, PortConflict, PruneResult,
+    RegistryCredential, SetComposeStartupRequest, SetIngressRequest,
+    UpdateRegistryCredentialRequest, VolumeMismatch,
 };
 use nasty_backup::{BackupProfile, BackupScheduleEntry, BackupSnapshot, BackupStatus};
 use nasty_sharing::iscsi::{
@@ -2979,11 +2980,47 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     name: "apps.inspect_image",
                     desc: "Inspect a container image (registry/local) and return its declared ports, VOLUME bind paths, runtime user, and any known sub-path recipe — used by the install wizard to prefill the form.",
                     role: MethodRole::Any,
-                    params: MethodParams::AdHoc(ad_hoc_one(
-                        "image",
-                        "Image reference (`repo:tag`).",
-                    )),
+                    params: MethodParams::AdHoc(serde_json::json!({
+                        "type": "object",
+                        "required": ["image"],
+                        "properties": {
+                            "image": {"type": "string", "description": "Image reference (`repo:tag` or `repo@digest`)."},
+                            "registry_credential_id": {"type": ["string", "null"], "description": "Optional named credential pin. Using it requires an unscoped Admin session."}
+                        }
+                    })),
                     result: Some(gen_schema::<ImageInspectResult>(generator)),
+                },
+                Method {
+                    name: "apps.registry_credentials.list",
+                    desc: "List redacted named Docker registry credentials. Secrets and ciphertext are never returned. Requires an unscoped Admin session.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<Vec<RegistryCredential>>(generator)),
+                },
+                Method {
+                    name: "apps.registry_credentials.create",
+                    desc: "Create a named Docker registry credential encrypted at rest with systemd-creds. The registry host is canonicalized and immutable. Requires an unscoped Admin session.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<CreateRegistryCredentialRequest>(
+                        generator,
+                    )),
+                    result: Some(gen_schema::<RegistryCredential>(generator)),
+                },
+                Method {
+                    name: "apps.registry_credentials.update",
+                    desc: "Update a registry credential label, username, and optionally its password/token. Omit secret to retain it. Requires an unscoped Admin session.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<UpdateRegistryCredentialRequest>(
+                        generator,
+                    )),
+                    result: Some(gen_schema::<RegistryCredential>(generator)),
+                },
+                Method {
+                    name: "apps.registry_credentials.delete",
+                    desc: "Delete an unreferenced registry credential. Refuses while any app pins it. Requires an unscoped Admin session.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::AdHoc(ad_hoc_one("id", "Registry credential UUID.")),
+                    result: None,
                 },
                 Method {
                     name: "apps.caddy.routes",
@@ -3095,7 +3132,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "apps.pull",
-                    desc: "Pull the latest image(s) for a named app and recreate the container(s) — for simple apps it stops/removes/reinstalls preserving config and subdomain mode; for compose apps it runs `docker compose pull` then `up -d`.",
+                    desc: "Pull the latest image(s) for a named app through the Docker API with its registry credential binding, then recreate the container(s) while preserving app configuration.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "App name.")),
                     result: Some(gen_schema::<App>(generator)),
@@ -3157,7 +3194,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "apps.compose.update",
-                    desc: "Overwrite a compose app's docker-compose.yml, pre-create any newly added bind-mount sources, and run `docker compose up -d --no-build --pull missing --remove-orphans` to apply the new config.",
+                    desc: "Overwrite a compose app's docker-compose.yml, resolve and pull effective images through the Docker API, pre-create newly added bind-mount sources, and apply the config without implicit CLI pulls.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<InstallComposeRequest>(generator)),
                     result: Some(gen_schema::<App>(generator)),

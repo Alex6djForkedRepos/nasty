@@ -14,8 +14,10 @@ thiserror.workspace = true
 tracing.workspace = true
 schemars.workspace = true
 reqwest.workspace = true
-bollard = "0.21"
+bollard = { version = "0.21", features = ["chrono"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_yaml_ng = "0.10"
 tempfile = "3"
 futures-util.workspace = true
 libc.workspace = true
+uuid.workspace = true
