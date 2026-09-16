@@ -39,6 +39,8 @@ fn filesystem_param(method: &str) -> Option<&'static str> {
         | "fs.scrub.start"
         | "fs.scrub.status"
         | "fs.scrub.cancel"
+        | "fs.scrub.schedule.get"
+        | "fs.scrub.schedule.update"
         | "fs.fsck.start"
         | "fs.fsck.status"
         | "fs.reconcile.status"
@@ -71,6 +73,7 @@ fn owner_scoped_fs_read(method: &str) -> bool {
             | "fs.locked_dependents"
             | "fs.usage"
             | "fs.scrub.status"
+            | "fs.scrub.schedule.get"
             | "fs.fsck.status"
             | "fs.reconcile.status"
             | "fs.tpm.status"
@@ -171,8 +174,17 @@ pub(super) async fn try_route(
                     if let Some(reason) = check_filesystem_in_use(state, &p.name).await {
                         err(req, reason)
                     } else {
+                        let uuid = match state.filesystems.get(&p.name).await {
+                            Ok(filesystem) => filesystem.uuid,
+                            Err(error) => return Some(err(req, error)),
+                        };
                         match state.filesystems.destroy(p).await {
-                            Ok(()) => ok(req, "ok"),
+                            Ok(()) => {
+                                if let Err(error) = state.scrub_schedules.remove(&uuid).await {
+                                    tracing::warn!(%uuid, "Failed to remove scrub schedule after filesystem destroy: {error}");
+                                }
+                                ok(req, "ok")
+                            }
                             Err(e) => err(req, e),
                         }
                     }
@@ -214,8 +226,12 @@ pub(super) async fn try_route(
                             )
                         } else {
                             let name = request.name.clone();
+                            let uuid = request.expected_uuid.clone();
                             match state.filesystems.forget_unavailable(request).await {
                                 Ok(()) => {
+                                    if let Err(error) = state.scrub_schedules.remove(&uuid).await {
+                                        tracing::warn!(%uuid, "Failed to remove scrub schedule after forgetting filesystem: {error}");
+                                    }
                                     state
                                         .mount_failures
                                         .lock()
@@ -485,6 +501,32 @@ pub(super) async fn try_route(
             },
             Err(r) => r,
         },
+        "fs.scrub.schedule.get" => match require_str(req, "name") {
+            Ok(name) => match state.filesystems.get(name).await {
+                Ok(filesystem) => match state.scrub_schedules.get(name, &filesystem.uuid).await {
+                    Ok(status) => ok(req, status),
+                    Err(error) => err(req, error),
+                },
+                Err(error) => err(req, error),
+            },
+            Err(response) => response,
+        },
+        "fs.scrub.schedule.update" => {
+            match parse_params::<nasty_storage::scrub_scheduler::ScrubScheduleUpdate>(req) {
+                Ok(update) => match state
+                    .scrub_schedules
+                    .update_for_filesystem(&state.filesystems, update)
+                    .await
+                {
+                    Ok(status) => ok(req, status),
+                    Err(error @ nasty_storage::scrub_scheduler::ScrubScheduleError::Invalid(_)) => {
+                        invalid(req, error)
+                    }
+                    Err(error) => err(req, error),
+                },
+                Err(error) => invalid(req, error),
+            }
+        }
         "fs.fsck.start" => {
             #[derive(Deserialize)]
             struct FsckParams {
@@ -700,6 +742,8 @@ mod tests {
     fn filesystem_operations_identify_and_enforce_their_scope_parameter() {
         assert_eq!(filesystem_param("fs.destroy"), Some("name"));
         assert_eq!(filesystem_param("fs.key.export"), Some("name"));
+        assert_eq!(filesystem_param("fs.scrub.schedule.get"), Some("name"));
+        assert_eq!(filesystem_param("fs.scrub.schedule.update"), Some("name"));
         assert_eq!(filesystem_param("fs.device.remove"), Some("filesystem"));
         assert_eq!(filesystem_param("device.wipe"), None);
         assert!(!filesystem_scope_denied(Some("tank"), Some("tank")));
@@ -736,6 +780,7 @@ mod tests {
             "fs.locked_dependents",
             "fs.usage",
             "fs.scrub.status",
+            "fs.scrub.schedule.get",
             "fs.fsck.status",
             "fs.reconcile.status",
             "fs.tpm.status",

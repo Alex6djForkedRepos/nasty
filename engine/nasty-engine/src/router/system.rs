@@ -1127,6 +1127,10 @@ async fn build_operations(
         if !fs.mounted {
             continue;
         }
+        let scrub_schedule = state
+            .scrub_schedules
+            .status_for_operation(&fs.name, &fs.uuid)
+            .await;
         // Live byte counters from bcachefs's data-move framework (#540) —
         // the reliable signal for "is this actually moving data, and how
         // much" across all four operation kinds, read once per fs.
@@ -1156,6 +1160,9 @@ async fn build_operations(
                     last_run_at: None,
                     last_duration_secs: None,
                     last_outcome: None,
+                    schedule: None,
+                    next_run_at: None,
+                    schedule_error: None,
                     detail,
                     control: "cancel".into(),
                 });
@@ -1193,6 +1200,9 @@ async fn build_operations(
                     last_run_at: scrub.last_run_at,
                     last_duration_secs: scrub.last_duration_secs,
                     last_outcome: scrub_outcome_name(&scrub).map(str::to_string),
+                    schedule: scrub_schedule.schedule.clone(),
+                    next_run_at: scrub_schedule.next_run_at.clone(),
+                    schedule_error: scrub_schedule.schedule_error.clone(),
                     detail,
                     control: if scrub.cancel_requested {
                         "none".into()
@@ -1211,6 +1221,9 @@ async fn build_operations(
                     last_run_at: scrub.last_run_at,
                     last_duration_secs: scrub.last_duration_secs,
                     last_outcome: scrub_outcome_name(&scrub).map(str::to_string),
+                    schedule: scrub_schedule.schedule.clone(),
+                    next_run_at: scrub_schedule.next_run_at.clone(),
+                    schedule_error: scrub_schedule.schedule_error.clone(),
                     detail: scrub_idle_detail(&scrub),
                     control: "start".into(),
                 });
@@ -1241,6 +1254,9 @@ async fn build_operations(
                 last_run_at: None,
                 last_duration_secs: None,
                 last_outcome: None,
+                schedule: None,
+                next_run_at: None,
+                schedule_error: None,
                 detail,
                 control: ctrl.into(),
             });
@@ -1269,6 +1285,9 @@ async fn build_operations(
                 last_run_at: None,
                 last_duration_secs: None,
                 last_outcome: None,
+                schedule: None,
+                next_run_at: None,
+                schedule_error: None,
                 detail,
                 control: ctrl.into(),
             });
@@ -1339,6 +1358,9 @@ fn evacuate_idle_row() -> nasty_system::Operation {
         last_run_at: None,
         last_duration_secs: None,
         last_outcome: None,
+        schedule: None,
+        next_run_at: None,
+        schedule_error: None,
         detail: "No evacuation in progress".into(),
         control: "none".into(),
     }
@@ -1548,6 +1570,9 @@ mod operations_tests {
         assert_eq!(r.state, "idle");
         assert_eq!(r.control, "none");
         assert!(r.target.is_none());
+        assert!(r.schedule.is_none());
+        assert!(r.next_run_at.is_none());
+        assert!(r.schedule_error.is_none());
         assert_eq!(r.detail, "No evacuation in progress");
     }
 }

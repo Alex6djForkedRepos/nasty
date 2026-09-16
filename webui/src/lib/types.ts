@@ -98,6 +98,9 @@ export interface Operation {
 	fs: string;
 	target?: string | null;
 	run_id?: string | null;
+	schedule?: string | null;
+	next_run_at?: string | null;
+	schedule_error?: string | null;
 	state: string; // "running" | "active" | "idle" | "paused"
 	progress_percent?: number | null;
 	last_run_at?: number | null;
@@ -105,6 +108,14 @@ export interface Operation {
 	last_outcome?: 'ok' | 'errors' | 'corrected' | 'uncorrected' | 'failed_corrected' | 'failed_uncorrected' | 'failed' | 'cancelled' | null;
 	detail: string;
 	control: string; // "start" | "cancel" | "pause" | "resume" | "none"
+}
+
+/** Scrub schedule state returned by `fs.scrub.schedule.update`. */
+export interface ScrubScheduleStatus {
+	name: string;
+	schedule: string | null;
+	next_run_at: string | null;
+	schedule_error: string | null;
 }
 
 /** One IOMMU group with its constituent PCI devices, returned by

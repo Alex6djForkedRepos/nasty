@@ -138,6 +138,8 @@ mod tests {
         assert_eq!(translate("subvolume.list").0, HttpVerb::Get);
         assert_eq!(translate("subvolume.list_all").0, HttpVerb::Get);
         assert_eq!(translate("fs.scrub.status").0, HttpVerb::Get);
+        assert_eq!(translate("fs.scrub.schedule.get").0, HttpVerb::Get);
+        assert_eq!(translate("fs.scrub.schedule.update").0, HttpVerb::Put);
         assert_eq!(translate("subvolume.find_by_property").0, HttpVerb::Get);
         assert_eq!(translate("auth.delete_user").0, HttpVerb::Delete);
         assert_eq!(translate("share.iscsi.remove_acl").0, HttpVerb::Delete);
