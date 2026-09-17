@@ -235,6 +235,49 @@
       };
     });
 
+    mkInstaller = system: let
+      pkgs = mkPkgs system;
+      template = builtins.readFile ./nixos/system-flake/flake.nix.template;
+      hashBody = pkgs.lib.concatStringsSep "\n" (
+        builtins.filter
+          (line: !(pkgs.lib.hasInfix "@WRAPPER_FLAKE_VERSION@" line))
+          (pkgs.lib.splitString "\n" (pkgs.lib.removeSuffix "\n" template))
+      );
+      wrapperVersion = "sha256-${builtins.substring 0 16 (builtins.hashString "sha256" hashBody)}";
+      renderedFlake = builtins.replaceStrings
+        [ "@NASTY_VERSION@" "@LOCAL_SYSTEM@" "@WRAPPER_FLAKE_VERSION@" ]
+        [ "v${nasty-version}" system wrapperVersion ]
+        template;
+      systemFlake = pkgs.runCommand "nasty-installer-system-flake" {} ''
+        mkdir -p "$out"
+        cp ${./nixos/system-flake/hardware-configuration.nix} "$out/hardware-configuration.nix"
+        cp ${./nixos/system-flake/networking.nix} "$out/networking.nix"
+        cp ${pkgs.writeText "nasty-system-flake.nix" renderedFlake} "$out/flake.nix"
+      '';
+    in pkgs.writeShellApplication {
+      name = "nasty-install";
+      runtimeInputs = with pkgs; [
+        coreutils
+        dosfstools
+        e2fsprogs
+        gawk
+        gnugrep
+        gnused
+        gptfdisk
+        jq
+        nix
+        nixos-install-tools
+        parted
+        systemd
+        util-linux
+      ];
+      text = ''
+        export NASTY_INSTALL_SYSTEM=${system}
+        export NASTY_SYSTEM_FLAKE=${systemFlake}
+        exec ${pkgs.bash}/bin/bash ${./nixos/installer.sh} "$@"
+      '';
+    };
+
     mkNixosConfigs = system: let
       pkgs = mkPkgs system;
       nasty-engine = mkEngine system;
@@ -390,6 +433,7 @@
       webui = mkWebui "x86_64-linux";
       bcachefs-tools = mkBcachefsTools "x86_64-linux";
       tailscale = tailscale-nixpkgs.legacyPackages.x86_64-linux.tailscale;
+      installer = mkInstaller "x86_64-linux";
       nasty-rootfs = (mkNixosConfigs "x86_64-linux").nasty-rootfs.config.system.build.toplevel;
       nasty-cloud-image = (mkNixosConfigs "x86_64-linux").nasty-cloud.config.system.build.OCIImage;
       default = mkEngine "x86_64-linux";
@@ -400,6 +444,7 @@
       webui = mkWebui "aarch64-linux";
       bcachefs-tools = mkBcachefsTools "aarch64-linux";
       tailscale = tailscale-nixpkgs.legacyPackages.aarch64-linux.tailscale;
+      installer = mkInstaller "aarch64-linux";
       nasty-rootfs = (mkNixosConfigs "aarch64-linux").nasty-rootfs.config.system.build.toplevel;
       nasty-cloud-image = (mkNixosConfigs "aarch64-linux").nasty-cloud.config.system.build.OCIImage;
       default = mkEngine "aarch64-linux";

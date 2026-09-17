@@ -510,7 +510,7 @@ in
 
     The installer supports two modes:
       1) Entire disk for OS  (use separate disks for data)
-      2) Split disk          (8 GiB OS + rest as bcachefs data)
+      2) Split disk          (20 GiB OS + rest as bcachefs data)
 
     For manual installation, see the project documentation.
 

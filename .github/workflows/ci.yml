@@ -99,6 +99,38 @@ jobs:
           fi
           echo "npmDepsHash matches package-lock.json: $ACTUAL"
 
+  live-installer:
+    name: Live-system installer package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Check installer shell
+        run: nix run nixpkgs#shellcheck -- nixos/installer.sh
+
+      - name: Build installer package
+        run: nix build .#installer
+
+      - name: Check packaged entry point
+        run: nix run .#installer -- --help
+
+      - name: Dry-run current release against an isolated disk
+        run: |
+          truncate -s 24G installer-test.img
+          LOOP=$(sudo losetup --find --show installer-test.img)
+          trap 'sudo losetup -d "$LOOP"' EXIT
+          NIX_BIN=$(command -v nix)
+          sudo \
+            NASTY_INSTALL_ALLOW_NON_UEFI=1 \
+            NASTY_INSTALL_ALLOW_LOOP=1 \
+            "$NIX_BIN" run .#installer -- \
+              --disk "$LOOP" --mode split --dry-run
+
   installer-flake-template:
     # Two invariants on the wrapper-flake template, each load-bearing
     # for a different reason:
