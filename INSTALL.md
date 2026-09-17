@@ -11,116 +11,85 @@
 
 ## Alternative Installation (from any Linux live environment)
 
-If the NASty ISO doesn't boot on your hardware (some UEFI firmware is picky about NixOS ISOs), you can install from any Linux live environment — SystemRescueCD, Ubuntu live USB, Debian installer shell, etc.
+If the NASty ISO does not boot on your hardware, install from a current
+SystemRescue, Ubuntu, Debian, or other Linux live environment. The packaged
+installer uses the same machine-local wrapper and release inputs as the NASty
+ISO. It supports SATA, NVMe, virtio, and eMMC whole disks without manually
+constructing partition names.
+
+The live environment must itself be booted in **UEFI mode**, with Secure Boot
+disabled for the initial installation.
 
 ### Requirements
 
 - A working internet connection
-- A Linux live environment with `curl` and `parted`
+- A 64-bit x86_64 or aarch64 Linux live environment
+- Root access, `curl`, user-management tools, and a writable `/nix`
 - Target disk (all data will be erased)
 
 ### Steps
 
-Boot your live environment and get to a root shell, then:
+Boot the live environment and open a root shell. Confirm that it is running in
+UEFI mode and identify the target whole disk:
 
 ```bash
-# 1. Verify networking
-ping -c1 github.com
-
-# 2. Identify your target disk
-lsblk -d
+test -d /sys/firmware/efi
+lsblk -dp -o NAME,SIZE,MODEL,SERIAL,TRAN,TYPE,MOUNTPOINTS
 ```
 
-Pick your target disk. For a standard SATA/NVMe disk:
+Install the Nix package manager if the live system does not already provide it.
+The official single-user installer needs the standard `nixbld` build users when
+it is run as root:
 
 ```bash
-DISK=/dev/sda
-PART1="${DISK}1"
-PART2="${DISK}2"
-PART3="${DISK}3"
-```
-
-For eMMC (e.g. ODROID H3):
-
-```bash
-DISK=/dev/mmcblk0
-PART1="${DISK}p1"
-PART2="${DISK}p2"
-PART3="${DISK}p3"
-```
-
-Then proceed with the installation:
-
-```bash
-# 3. Partition
-#    Option A: Dedicated NAS disk (EFI + root, no data partition — use separate disks for storage)
-parted -s "$DISK" -- \
-  mklabel gpt \
-  mkpart ESP fat32 1MiB 512MiB \
-  set 1 esp on \
-  mkpart root ext4 512MiB 100%
-
-#    Option B: Single disk (EFI + root + data partition for bcachefs)
-parted -s "$DISK" -- \
-  mklabel gpt \
-  mkpart ESP fat32 1MiB 512MiB \
-  set 1 esp on \
-  mkpart root ext4 512MiB 20GiB \
-  mkpart data 20GiB 100%
-
-# 4. Format EFI and root partitions
-mkfs.fat -F32 "$PART1"
-mkfs.ext4 -F "$PART2"
-# (data partition, if created, is left unformatted — create a bcachefs filesystem via the WebUI)
-
-# 5. Mount
-mount "$PART2" /mnt
-mkdir -p /mnt/boot
-mount "$PART1" /mnt/boot
-
-# 6. Prepare Nix build users (required for Nix installation as root)
 groupadd -r nixbld 2>/dev/null || true
 for i in $(seq 1 10); do
-  useradd -r -g nixbld -G nixbld -d /var/empty -s /sbin/nologin "nixbld$i" 2>/dev/null || true
+  useradd -r -g nixbld -G nixbld -d /var/empty \
+    -s "$(command -v nologin || echo /bin/false)" "nixbld$i" 2>/dev/null || true
 done
-
-# 7. Install Nix package manager
 curl -L https://nixos.org/nix/install | sh -s -- --no-daemon --yes
 . /root/.nix-profile/etc/profile.d/nix.sh
-
-# 8. Enable flakes
-mkdir -p ~/.config/nix
-echo "experimental-features = nix-command flakes" > ~/.config/nix/nix.conf
-
-# 9. Install tools
-nix profile install nixpkgs#nixos-install-tools nixpkgs#git
-
-# 10. Clone NASty directly into the target's /etc/nixos
-git clone https://github.com/nasty-project/nasty.git /mnt/etc/nixos
-
-# 11. Generate hardware configuration for your machine
-nixos-generate-config --root /mnt --dir /tmp/hw-config
-
-# 12. Copy it into the NASty flake
-cp /tmp/hw-config/hardware-configuration.nix /mnt/etc/nixos/
-
-# 13. Install NASty (this takes 10-30 minutes)
-nixos-install --root /mnt \
-  --flake /mnt/etc/nixos#nasty \
-  --no-root-passwd
-
-# 14. Set root password
-nixos-enter --root /mnt -c 'echo "root:yourpassword" | /run/current-system/sw/bin/chpasswd'
-
-# 15. Reboot (remove the USB stick)
-reboot
 ```
 
+The `v0.1.1` tag predates the packaged helper, so pin the helper's reviewed
+implementation commit below. The machine-local wrapper it generates still pins
+the installed appliance to stable `v0.1.1`. Future releases will provide the
+helper directly from their release tag.
+
+Start with a dry run. It checks UEFI, Secure Boot, target-disk safety, release
+resolution, the wrapper lock, and NixOS evaluation without modifying the disk:
+
+```bash
+INSTALLER_REF=ab5fac83bfb9c0e5567c17e69f8d4623d79b712d
+DISK=/dev/nvme0n1
+
+nix --extra-experimental-features 'nix-command flakes' run \
+  "github:nasty-project/nasty/${INSTALLER_REF}#installer" -- \
+  --disk "$DISK" --mode whole --dry-run
+```
+
+If the dry run succeeds, repeat without `--dry-run`:
+
+```bash
+nix --extra-experimental-features 'nix-command flakes' run \
+  "github:nasty-project/nasty/${INSTALLER_REF}#installer" -- \
+  --disk "$DISK" --mode whole
+```
+
+Use `--mode split` to create a 20 GiB OS partition and leave the remainder as
+an unformatted third partition. The installer uses DHCP for the installed
+system; configure static networking from the WebUI after first boot.
+
 After reboot, open `https://<nasty-ip>` and log in with **admin** / **admin**.
+The first login requires changing that password.
 
 ### Notes
 
-- Step 2: make sure you pick the right disk — this will erase everything on it
-- Step 3: use Option A if you have separate disks for storage (recommended). Use Option B for single-disk setups.
-- Step 13: takes 10-30 minutes depending on your internet speed and hardware
-- The data partition (if created) is intentionally left unformatted — create a bcachefs filesystem from the WebUI after first boot
+- Prefer `--mode whole` with separate data disks.
+- The exact target path must be confirmed before erasure. Mounted, read-only,
+  active-swap, and stacked LVM/RAID/crypt devices are rejected.
+- Installation usually takes 10-30 minutes, depending on network and hardware.
+- In split mode, partition 3 is intentionally left unformatted. Create the
+  bcachefs filesystem from the WebUI after first boot.
+- The initial installation requires network access to GitHub, the Nix cache,
+  and `nasty.cachix.org`.
