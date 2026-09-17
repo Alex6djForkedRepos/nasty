@@ -60,7 +60,7 @@ Start with a dry run. It checks UEFI, Secure Boot, target-disk safety, release
 resolution, the wrapper lock, and NixOS evaluation without modifying the disk:
 
 ```bash
-INSTALLER_REF=ab5fac83bfb9c0e5567c17e69f8d4623d79b712d
+INSTALLER_REF=9fbbaebd2e34079bf0b6de97fca86cd30e73f80f
 DISK=/dev/nvme0n1
 
 nix --extra-experimental-features 'nix-command flakes' run \
