@@ -2,54 +2,167 @@
 
 ## v0.1.1 — 2026-09-16
 
-> **This release improves dashboard control, authorization boundaries, and
-> operational reliability.** Dashboards can be arranged into named views with
-> denser, configurable widgets. Backup and application recovery paths are more
-> resilient, security checks cover additional API surfaces, and bundled system
-> and diagnostics packages receive current fixes.
+> **This is the dashboard control, security & reliability release.** Dashboards
+> become configurable workspaces with named views, free placement, compact
+> widgets, and live health summaries. Backup scheduling and state persistence
+> are hardened, application storage gains safer recovery, private registries
+> become first-class, and a broad authorization review closes access gaps across
+> the management API. Storage maintenance, startup recovery, and the bundled
+> platform and diagnostics stack also receive substantial updates.
+
+### Headline changes
+
+- **Configurable dashboard workspaces (#810, #812, #816, #818–#834, #837).**
+  Choose built-in layouts or create named custom views with a responsive grid,
+  free widget placement, compact presentations, edit mode, and optional clock,
+  backup schedule, compute, service, container, storage, and health cards.
+- **Reliable, observable backups (#838–#840, #885).** Failed and abandoned jobs
+  reach terminal states, failures appear in history and alerts, profile state is
+  committed atomically, repository initialization is retry-safe, and five-field
+  POSIX schedules retain stable cursors across scheduler restarts.
+- **Tighter management boundaries (#846, #848, #849, #851–#855, #859–#865,
+  #867, #872–#875).** Authentication, settings, apps, backups, firmware, logs,
+  notifications, sharing, storage, networking, and audit endpoints now enforce
+  consistent role and resource-scope policy. Secret-bearing responses are
+  redacted and unattributable scoped inventories fail closed.
+- **Safer apps and storage recovery (#879, #889).** Missing Apps storage is
+  surfaced with a guarded recovery path, Docker cannot socket-activate against
+  an unsafe data root, and private registry credentials support authenticated
+  Simple App and Compose pulls without entering Compose files or logs.
+- **Stronger startup and host recovery (#800, #804, #890).** An optional Linux
+  watchdog can reboot on configured load, memory, or connectivity failures;
+  networking and SSH return before slow filesystem recovery; and the login page
+  reports engine startup progress instead of exposing controls prematurely.
+- **Scheduled and diagnosable storage maintenance (#856, #857, #888).** Scrubs
+  can run from persisted schedules, report corrected, uncorrected, and
+  interrupted outcomes with tool versions and error-byte estimates, and start a
+  bcachefs update directly from the version chip.
 
 ### Dashboard and WebUI
 
-- Dashboards support named views, edit mode, free placement, configurable grid
-  density, and compact compute, health, and resource widgets (#810, #812,
-  #818–#829).
-- Update availability is visible in the sidebar and emphasized consistently,
-  while release polling and status handling are more reliable (#817, #822,
-  #836, #858).
-- Dashboard clock, memory severity, chip layout, and removal interactions are
-  polished across screen sizes (#830–#834, #837).
+- Dashboard preferences migrate automatically while preserving existing custom
+  layouts. Malformed saved views are normalized instead of breaking the page
+  (#810, #812, #816, #819, #823, #824).
+- Service and managed-container counters distinguish healthy, unhealthy,
+  disabled, stale, loading, and unavailable states. Resource and compute cards
+  load independently and poll only while visible (#818, #823, #825).
+- Built-in dashboard tabs can be hidden, widgets can be removed and restored
+  without losing their layout, and keyboard controls remain available when
+  drag placement is unsuitable (#819–#821, #824, #827, #830, #831).
+- Optional host clock, MOTD, and upcoming-backup cards use authoritative host
+  time and configured timezone data (#828, #834).
+- Update availability appears beside the sidebar version, refreshes every five
+  minutes without blocking the WebSocket, and feeds the Update page without a
+  duplicate remote request (#817, #822, #836, #858).
+- Expanded sidebar group headers act as full-width back targets, and compact
+  dashboard spacing, memory severity colors, and editing controls are refined
+  across screen sizes (#829–#833, #837, #878).
 - Login waits for the engine startup result, reports progress, and fails closed
-  instead of briefly exposing authentication controls (#890).
+  instead of briefly exposing authentication controls. SSO remains disabled
+  until availability is known (#890).
+
+### Backups and recovery
+
+- Backup failures from validation, initialization, credential resolution, and
+  repository access are persisted in profile history and can raise a Backup
+  Failure alert. URL credentials are redacted from jobs, errors, alerts, RPC
+  responses, and journal output (#838).
+- Detached backup workers that panic, are cancelled, or exit without recording
+  a result are terminalized safely instead of remaining active forever (#839).
+- Profile changes and run results use private, fsynced temporary files plus
+  atomic rename. Failed persistence no longer leaves memory and disk state
+  silently diverged, and incomplete repository initialization can be retried
+  safely (#840).
+- Schedules use validated five-field POSIX cron syntax and authoritative UTC
+  previews. Scheduler cursors survive task restarts, rejected jobs are retried,
+  and corrupt startup state is not overwritten (#885).
 
 ### Security and access control
 
-- API authorization and response filtering are tightened for apps, audits,
-  backups, firmware, logs, networking, notifications, sharing, storage, and
-  update operations (#846–#875).
-- Application volume permission changes remain within the managed storage
-  boundary, and sensitive settings no longer leak through API responses
-  (#864, #848).
-- The `suppaftp` advisory is resolved and Argon2, WebAuthn, Vitest, Rust, and
-  WebUI dependencies receive compatible updates (#808, #841–#844).
+- Global identity, token, OIDC, WebAuthn, notification, audit, firmware,
+  journal, and backup REST administration require the appropriate unscoped
+  management role (#846, #851, #852, #860, #865, #867, #872).
+- Filesystem and owner scopes are enforced across filesystem operations,
+  subvolume dependencies, shares, block exports, apps, backups, alerts, and
+  storage inventories. Mixed, unresolved, or unattributable resources fail
+  closed rather than leaking a partial global view (#846, #849, #859,
+  #861–#863).
+- OIDC and DNS credentials, encrypted credential blobs, Compose source, `.env`
+  content, and app inspection data are no longer returned to roles that do not
+  need them (#848, #849).
+- Application volume permission repair requires an unscoped Admin, accepts only
+  canonical non-symlink targets, and uses physical no-dereference traversal
+  within the managed boundary (#864).
+- SMB identity mutation, protocol enable/disable operations, firmware checks,
+  iSCSI portal replacement, and network inspection now have explicit and
+  consistent role contracts (#853, #855, #872–#875).
+- The `suppaftp` advisory is resolved. Argon2, WebAuthn, Vitest, Rust, and WebUI
+  dependencies receive compatible updates (#808, #841–#844).
 
-### Reliability and operations
+### Apps, storage and system
 
-- Backup scheduling recovers cleanly from interrupted jobs, persists state
-  correctly, exposes failures, and handles retries more reliably (#838–#840,
-  #885).
-- Missing application storage is recovered safely, and private container
-  registry credentials can be managed without losing periodic pull policies
-  (#879, #889).
-- Periodic bcachefs scrub schedules and richer scrub outcomes improve ongoing
-  maintenance visibility (#856, #888).
-- A watchdog service improves recovery from engine failures (#800).
+- Apps storage availability is checked before Docker starts. Missing storage is
+  shown in the WebUI with a safe runtime-disable action, while stale mount
+  directories are reclaimed only when they are empty and ownership is proven
+  (#879).
+- Private registry credentials are encrypted at rest and selected per app.
+  Authenticated pulls avoid exposing credentials to Compose or logs, periodic
+  pull policies keep their cadence, and Compose deployment gains durable
+  rollback and recovery (#889).
+- A configurable Linux watchdog can monitor load, reclaimable memory, and
+  multiple IPv4 ping targets. Policies are Admin-only, disabled by default, and
+  preflighted before the watchdog is armed (#800).
+- Configured networking, firewall policy, and SSH are restored before slow
+  bcachefs mounts. Storage-dependent NFS and RDMA traffic stays closed until the
+  underlying storage is safe (#804).
+- Persisted, UUID-bound scrub schedules serialize with filesystem lifecycle
+  operations and do not run catch-up jobs after downtime (#888).
+- Scrub history records run IDs, exit bits, corrected and uncorrected outcomes,
+  approximate affected bytes, and bcachefs userspace, kernel, and module
+  versions (#857).
+- DNS provider guidance now shows the complete required credential set for the
+  selected provider instead of a generic single-token hint (#868, #871).
 
 ### Platform and tools
 
-- bcachefs-tools moves to **1.39.6**, Linux to **6.18.52**, and Tailscale to
-  **1.102.4** (#803, #806, #850, #877, #884, #891).
+- bcachefs-tools and its matching DKMS source move from 1.39.2 to **1.39.6**
+  (#803, #806, #850, #877).
+- Linux moves from 6.18.46 to **6.18.52** across the weekly nixpkgs updates, and
+  Tailscale moves from 1.102.2 to **1.102.4** (#801, #807, #845, #869, #884,
+  #891).
 - DiskWatch moves to **0.5.8**, NetWatch to **0.31.4**, SysWatch to **0.14.2**,
   and nasty-top to **0.0.11** (#870, #876, #891).
+- Appliance integration continues to verify the bundled diagnostics versions,
+  bcachefs smoke behavior, and Active Directory domain-controller flow (#891).
+
+### Upgrading
+
+- **Proxmox firmware:** NASty requires UEFI. Change the VM firmware from
+  SeaBIOS to OVMF before installation; otherwise the installed system will not
+  boot after the first restart.
+- **Scoped API credentials:** automation that previously read global inventory
+  or performed root-equivalent actions with a filesystem- or owner-scoped token
+  may now receive access-denied responses. Use the narrowest unscoped management
+  role appropriate for genuinely global operations (#846–#875).
+- **Backup schedules:** schedules are now parsed as five-field POSIX cron in
+  UTC. Review schedules that relied on non-POSIX syntax or assumptions about the
+  browser's local timezone (#885).
+- **Watchdog:** all watchdog checks remain disabled after upgrade. Enable only
+  policies whose thresholds and connectivity targets are appropriate for the
+  host; a triggered policy intentionally reboots the appliance (#800).
+- **bcachefs 1.39.x:** keep backups current and avoid downgrading tools or the
+  kernel after a filesystem has adopted newer 1.39.x on-disk features.
+
+---
+
+> **Proxmox users:** NASty requires UEFI. Switch the VM firmware from SeaBIOS to
+> OVMF before installing, otherwise NASty will not boot after the first restart.
+>
+> <img width="400" alt="Switch from SeaBIOS" src="https://github.com/user-attachments/assets/8e8a8752-b9f8-4bc1-97a8-8f298f122483" />
+>
+> ## ⬇
+>
+> <img width="400" alt="to OVMF (UEFI)" src="https://github.com/user-attachments/assets/5281863b-90dc-4560-b3fb-2624674eebdc" />
 
 ## v0.1.0 — 2026-08-25
 
