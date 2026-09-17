@@ -194,9 +194,22 @@ done < <(lsblk -nrpo NAME,TYPE "$DISK" | awk '$2 == "part" { print $1 }')
 echo
 echo "==> Resolving and evaluating the NASty release before disk changes..."
 STAGE_DIR=$(mktemp -d -t nasty-install.XXXXXX)
-cp "$NASTY_SYSTEM_FLAKE/hardware-configuration.nix" "$STAGE_DIR/"
 cp "$NASTY_SYSTEM_FLAKE/networking.nix" "$STAGE_DIR/"
 cp "$NASTY_SYSTEM_FLAKE/flake.nix" "$STAGE_DIR/"
+cat > "$STAGE_DIR/hardware-configuration.nix" <<'EOF'
+# Evaluation-only placeholder. The installer replaces this after partitioning.
+{ ... }:
+{
+  fileSystems."/" = {
+    device = "/dev/disk/by-label/NASTY_ROOT";
+    fsType = "ext4";
+  };
+  fileSystems."/boot" = {
+    device = "/dev/disk/by-label/NASTY_EFI";
+    fsType = "vfat";
+  };
+}
+EOF
 nix --extra-experimental-features 'nix-command flakes' flake lock "$STAGE_DIR"
 nix --extra-experimental-features 'nix-command flakes' eval --raw \
   "$STAGE_DIR#nixosConfigurations.nasty.config.system.build.toplevel.drvPath" >/dev/null
