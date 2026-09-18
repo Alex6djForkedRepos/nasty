@@ -269,7 +269,9 @@ let
     try:
         # Start Docker via the engine.  Spawned task waits up to 30s
         # for the daemon, so we poll apps.status afterwards.
+        ws.settimeout(60)
         call(ws, "apps.enable", 1, {})
+        ws.settimeout(10)
         deadline = _time.monotonic() + 60
         while True:
             status = call(ws, "apps.status", 2)
