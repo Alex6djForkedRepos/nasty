@@ -26,7 +26,7 @@ Options:
   --no-reboot       Return to the live shell after installation
   -h, --help        Show this help
 
-The split layout creates a 20 GiB OS partition and leaves partition 3
+The split layout creates a 50 GiB OS partition and leaves partition 3
 unformatted for later use through the NASty WebUI.
 EOF
 }
@@ -154,7 +154,7 @@ unsupported_children=$(lsblk -nrpo TYPE "$DISK" \
 if [ -z "$PART_MODE" ]; then
   echo "Partitioning mode:"
   echo "  1) whole - use the disk for the OS; use separate data disks"
-  echo "  2) split - 20 GiB OS; leave the remainder unformatted"
+  echo "  2) split - 50 GiB OS; leave the remainder unformatted"
   read -r -p "Choose [1/2]: " choice
   case "$choice" in
     1) PART_MODE="whole" ;;
@@ -169,10 +169,10 @@ case "$PART_MODE" in
       || die "whole-disk installation requires at least 16 GiB"
     ;;
   split)
-    [ "$DISK_SIZE_B" -ge 23622320128 ] \
-      || die "split installation requires at least 22 GiB"
-    if [ "$DISK_SIZE_G" -lt 40 ]; then
-      echo "Warning: only about $((DISK_SIZE_G - 20)) GiB will remain for data."
+    [ "$DISK_SIZE_B" -ge 55834574848 ] \
+      || die "split installation requires at least 52 GiB"
+    if [ "$DISK_SIZE_G" -lt 70 ]; then
+      echo "Warning: only about $((DISK_SIZE_G - 50)) GiB will remain for data."
     fi
     ;;
   *) die "--mode must be whole or split" ;;
@@ -249,8 +249,8 @@ else
     mklabel gpt \
     mkpart ESP fat32 1MiB 512MiB \
     set 1 esp on \
-    mkpart root ext4 512MiB 20GiB \
-    mkpart data 20GiB 100%
+    mkpart root ext4 512MiB 50GiB \
+    mkpart data 50GiB 100%
 fi
 
 partprobe "$DISK" 2>/dev/null || true

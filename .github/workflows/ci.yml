@@ -121,7 +121,7 @@ jobs:
 
       - name: Dry-run current release against an isolated disk
         run: |
-          truncate -s 24G installer-test.img
+          truncate -s 72G installer-test.img
           LOOP=$(sudo losetup --find --show installer-test.img)
           trap 'sudo losetup -d "$LOOP"' EXIT
           NIX_BIN=$(command -v nix)
