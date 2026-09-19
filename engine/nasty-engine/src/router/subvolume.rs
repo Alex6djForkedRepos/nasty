@@ -171,14 +171,17 @@ pub(super) async fn try_route(
                         .is_some_and(|f| f != p.filesystem)
                     {
                         err(req, "access denied")
-                    } else if let Some(conflict) =
-                        check_subvolume_in_use(state, &p.filesystem, &p.name).await
-                    {
-                        err(req, conflict)
                     } else {
-                        match state.subvolumes.delete(p, session.owner.as_deref()).await {
-                            Ok(()) => ok(req, "ok"),
-                            Err(e) => err(req, e),
+                        let _apps_config_guard = state.apps.storage_config_guard().await;
+                        if let Some(conflict) =
+                            check_subvolume_in_use(state, &p.filesystem, &p.name).await
+                        {
+                            err(req, conflict)
+                        } else {
+                            match state.subvolumes.delete(p, session.owner.as_deref()).await {
+                                Ok(()) => ok(req, "ok"),
+                                Err(e) => err(req, e),
+                            }
                         }
                     }
                 }

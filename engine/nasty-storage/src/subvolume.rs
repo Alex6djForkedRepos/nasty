@@ -96,7 +96,7 @@ pub enum SubvolumeError {
     InvalidStoragePolicy(String),
     #[error("cannot shrink subvolume from {current} to {requested} bytes")]
     ShrinkNotSupported { current: u64, requested: u64 },
-    #[error("could not delete child subvolume(s): {0}")]
+    #[error("child subvolume(s) must be deleted first: {0}")]
     ChildrenStuck(String),
     #[error("could not detach loop device {device}: {reason}")]
     LoopDetachFailed { device: String, reason: String },
@@ -166,6 +166,18 @@ pub fn validate_subvolume_name(name: &str) -> Result<(), SubvolumeError> {
         }
     }
     Ok(())
+}
+
+fn vm_disk_subvolume_name(name: &str) -> Result<String, SubvolumeError> {
+    validate_subvolume_name(name)?;
+    if name.contains('/') {
+        return Err(SubvolumeError::InvalidName(
+            "VM disk name must be one path component".to_string(),
+        ));
+    }
+    let nested = format!("vms/{name}");
+    validate_subvolume_name(&nested)?;
+    Ok(nested)
 }
 
 /// Snapshot names are always one component appended to the source subvolume's
@@ -1447,12 +1459,60 @@ impl SubvolumeService {
         req: CreateSubvolumeRequest,
         owner: Option<String>,
     ) -> Result<Subvolume, SubvolumeError> {
+        self.create_inner(req, owner, false).await
+    }
+
+    /// Create a VM block disk under the server-owned `vms/<name>` namespace.
+    pub async fn create_vm_disk(
+        &self,
+        filesystem: String,
+        name: String,
+        volsize_bytes: u64,
+        owner: Option<String>,
+    ) -> Result<Subvolume, SubvolumeError> {
+        let name = vm_disk_subvolume_name(&name)?;
+        let _namespace_guard = self.lock_destination(&filesystem, "vms").await;
+        match self.get(&filesystem, "vms", owner.as_deref()).await {
+            Ok(_) | Err(SubvolumeError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        self.create_inner(
+            CreateSubvolumeRequest {
+                filesystem,
+                name,
+                subvolume_type: SubvolumeType::Block,
+                volsize_bytes: Some(volsize_bytes),
+                compression: None,
+                comments: Some("Virtual machine disk".to_string()),
+                direct_io: None,
+                foreground_target: None,
+                background_target: None,
+                promote_target: None,
+                metadata_target: None,
+                data_replicas: None,
+                block_filesystem: None,
+            },
+            owner,
+            true,
+        )
+        .await
+    }
+
+    async fn create_inner(
+        &self,
+        req: CreateSubvolumeRequest,
+        owner: Option<String>,
+        allow_nested_block: bool,
+    ) -> Result<Subvolume, SubvolumeError> {
         validate_subvolume_name(&req.name)?;
 
         if req.subvolume_type == SubvolumeType::Block && req.volsize_bytes.is_none() {
             return Err(SubvolumeError::VolsizeRequired);
         }
-        if req.subvolume_type == SubvolumeType::Block && req.name.contains('/') {
+        if req.subvolume_type == SubvolumeType::Block
+            && req.name.contains('/')
+            && !allow_nested_block
+        {
             return Err(SubvolumeError::InvalidName(
                 "nested block subvolumes are not supported".to_string(),
             ));
@@ -1476,6 +1536,25 @@ impl SubvolumeService {
         let mount_point = self.fs_mount_point(&req.filesystem).await?;
         let subvol_path = subvol_path(&mount_point, &req.name);
 
+        if allow_nested_block {
+            let parent = Path::new(&subvol_path).parent().ok_or_else(|| {
+                SubvolumeError::InvalidName("VM disk destination has no parent".to_string())
+            })?;
+            if !parent.exists() {
+                match tokio::fs::create_dir(parent).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let metadata = tokio::fs::symlink_metadata(parent).await?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(SubvolumeError::InvalidName(
+                    "VM storage namespace must be a real directory".to_string(),
+                ));
+            }
+        }
+
         if Path::new(&subvol_path).exists() {
             info!(
                 "Subvolume '{}' already exists in filesystem '{}', returning existing (idempotent)",
@@ -1491,7 +1570,9 @@ impl SubvolumeService {
                     "a previous create was interrupted before provisioning completed".to_string(),
                 ));
             }
-            let existing = self.get(&req.filesystem, &req.name, None).await?;
+            let existing = self
+                .get(&req.filesystem, &req.name, owner.as_deref())
+                .await?;
             if existing.subvolume_type != req.subvolume_type {
                 return Err(SubvolumeError::ExistingIncompatible(format!(
                     "requested {:?}, existing {:?}",
@@ -1787,7 +1868,7 @@ impl SubvolumeService {
         name: &str,
     ) -> Result<Vec<String>, SubvolumeError> {
         let mount_point = self.fs_mount_point(filesystem).await?;
-        Ok(find_child_subvolumes(&mount_point, name).await)
+        find_child_subvolumes(&mount_point, name).await
     }
 
     /// Delete a subvolume.
@@ -1799,6 +1880,19 @@ impl SubvolumeService {
     ) -> Result<(), SubvolumeError> {
         let _destination_guard = self.lock_destination(&req.filesystem, &req.name).await;
         let subvol = self.get(&req.filesystem, &req.name, owner_filter).await?;
+
+        let mount_point = self.fs_mount_point(&req.filesystem).await?;
+        let subvol_path = subvol_path(&mount_point, &req.name);
+        let children = find_child_subvolumes(&mount_point, &req.name).await?;
+        if !children.is_empty() {
+            return Err(SubvolumeError::ChildrenStuck(
+                children
+                    .into_iter()
+                    .map(|child| format!("{child} (delete separately)"))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
 
         // For block subvolumes: detach loop device first. A failure here
         // (typically EBUSY — something still has the device open) used
@@ -1827,41 +1921,9 @@ impl SubvolumeService {
             }
         }
 
-        let mount_point = self.fs_mount_point(&req.filesystem).await?;
-        let subvol_path = subvol_path(&mount_point, &req.name);
-
         // bcachefs snapshots are independent first-class subvolumes — they survive
         // parent deletion. We intentionally do NOT delete snapshots here so that
         // snapshot-based restore/DR scenarios work correctly.
-
-        // Delete child subvolumes first (depth-first) — bcachefs rejects
-        // deleting a subvolume that contains nested subvolumes.
-        //
-        // Try every child even if one fails, so the operator gets the
-        // full list of stuck children in a single round trip instead
-        // of fix-one, retry, fix-next, retry. The partial-deletion
-        // window (some children gone, others not) is unavoidable —
-        // bcachefs has no transactional batch-delete and no "undo".
-        // Erroring out before the parent delete preserves the same
-        // partial state the old warn-and-continue path produced, but
-        // surfaces the real cause instead of a generic
-        // "directory not empty" from the parent attempt.
-        let children = find_child_subvolumes(&mount_point, &req.name).await;
-        let mut stuck: Vec<String> = Vec::new();
-        for child in children.iter().rev() {
-            let child_path = format!("{mount_point}/{child}");
-            info!(
-                "Deleting child subvolume '{child}' before parent '{}'",
-                req.name
-            );
-            if let Err(e) = cmd::run_ok("bcachefs", &["subvolume", "delete", &child_path]).await {
-                warn!("Failed to delete child subvolume '{child}': {e}");
-                stuck.push(format!("{child} ({e})"));
-            }
-        }
-        if !stuck.is_empty() {
-            return Err(SubvolumeError::ChildrenStuck(stuck.join("; ")));
-        }
 
         info!(
             "Deleting subvolume '{}' from filesystem '{}'",
@@ -2526,7 +2588,7 @@ impl SubvolumeService {
             owner_filter,
             allow_admin_override,
         )?;
-        let children = find_child_subvolumes(&mount_point, &req.subvolume).await;
+        let children = find_child_subvolumes(&mount_point, &req.subvolume).await?;
         if !children.is_empty() {
             return Err(SubvolumeError::CommandFailed(format!(
                 "rollback refused: '{}' has nested subvolumes ({}). Roll those back individually.",
@@ -3315,23 +3377,14 @@ fn find_loop_device_from_map(
 }
 
 /// Find all child subvolumes under a given parent path using `bcachefs subvolume list -R`.
-/// Returns paths relative to the mount point, sorted so deepest children come last
-/// (caller should reverse for depth-first deletion).
-async fn find_child_subvolumes(mount_point: &str, parent_name: &str) -> Vec<String> {
-    let output = match cmd::run_ok("bcachefs", &["subvolume", "list", "-R", mount_point]).await {
-        Ok(o) => o,
-        Err(e) => {
-            // Empty children list means the caller (subvolume delete
-            // path) won't see nested subvolumes that need to be
-            // removed first — the outer delete then fails with a
-            // less actionable error. Surface the real cause here.
-            warn!(
-                "bcachefs subvolume list -R {mount_point} failed: {e}; \
-                 children of {parent_name} will not be discovered"
-            );
-            return Vec::new();
-        }
-    };
+/// Returns paths relative to the mount point, sorted by name.
+async fn find_child_subvolumes(
+    mount_point: &str,
+    parent_name: &str,
+) -> Result<Vec<String>, SubvolumeError> {
+    let output = cmd::run_ok("bcachefs", &["subvolume", "list", "-R", mount_point])
+        .await
+        .map_err(SubvolumeError::CommandFailed)?;
 
     let prefix = format!("{parent_name}/");
     let mut children = Vec::new();
@@ -3343,9 +3396,8 @@ async fn find_child_subvolumes(mount_point: &str, parent_name: &str) -> Vec<Stri
             children.push(path.to_string());
         }
     }
-    // Sort so deeper paths come later — reverse for depth-first deletion
     children.sort();
-    children
+    Ok(children)
 }
 
 /// Recreate a writable subvolume at `dest_path` from a snapshot at
@@ -3563,6 +3615,21 @@ mod tests {
         assert!(validate_subvolume_name("projects/web").is_ok());
         assert!(validate_subvolume_name("a/b/c/d").is_ok());
         assert!(validate_subvolume_name("name.with.dots").is_ok());
+    }
+
+    #[test]
+    fn vm_disk_name_is_scoped_under_vms() {
+        assert_eq!(
+            vm_disk_subvolume_name("homeassistant").unwrap(),
+            "vms/homeassistant"
+        );
+    }
+
+    #[test]
+    fn vm_disk_name_rejects_nested_or_traversal_names() {
+        for name in ["nested/disk", "../disk", ".hidden", "disk@old"] {
+            assert!(vm_disk_subvolume_name(name).is_err(), "accepted {name}");
+        }
     }
 
     #[test]
