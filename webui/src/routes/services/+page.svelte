@@ -17,6 +17,17 @@
 	let dockerEnabling = $state(false);
 	let loading = $state(true);
 	let identity: AuthMe | null = $state(null);
+	let busyProtocols: string[] = $state([]);
+	type ServiceActivity = {
+		id: number;
+		service: string;
+		action: string;
+		status: 'pending' | 'success' | 'error';
+		detail: string;
+		time: string;
+	};
+	let serviceActivity: ServiceActivity[] = $state([]);
+	let nextActivityId = 0;
 
 	// Per-service config panels
 	let configOpen = $state<string | null>(null);
@@ -457,11 +468,38 @@
 			'Enable watchdog?',
 			'Low-memory failures can reboot immediately; persistent load or ping failures can also reboot this appliance. Every ping target must remain reachable.',
 		)) return;
-		const action = proto.enabled ? 'disable' : 'enable';
-		await withToast(
-			() => client.call(`service.protocol.${action}`, { name: proto.name }),
+		const enabling = !proto.enabled;
+		const action = enabling ? 'enable' : 'disable';
+		const activityId = nextActivityId++;
+		const activity: ServiceActivity = {
+			id: activityId,
+			service: proto.display_name,
+			action: enabling ? 'Enabling' : 'Disabling',
+			status: 'pending',
+			detail: proto.name === 'nut' && enabling
+				? 'Applying firewall rules, probing the UPS over USB, and starting NUT services. This can take up to two minutes.'
+				: 'Waiting for the service manager to finish.',
+			time: new Date().toLocaleTimeString(),
+		};
+		serviceActivity = [activity, ...serviceActivity].slice(0, 8);
+		busyProtocols = [...busyProtocols, proto.name];
+		const result = await withToast(
+			() => client.call<ProtocolStatus>(
+				`service.protocol.${action}`,
+				{ name: proto.name },
+				proto.name === 'nut' ? 120_000 : 10_000,
+			),
 			`${proto.display_name} ${proto.enabled ? 'disabled' : 'enabled'}`
 		);
+		busyProtocols = busyProtocols.filter((name) => name !== proto.name);
+		serviceActivity = serviceActivity.map((entry) => entry.id === activityId ? {
+			...entry,
+			status: result ? 'success' : 'error',
+			detail: result
+				? `${result.enabled ? 'Enabled' : 'Disabled'} and ${result.running ? 'running' : 'stopped'}.`
+				: 'The request failed. Refreshing the current service state.',
+			time: new Date().toLocaleTimeString(),
+		} : entry);
 		await refresh();
 	}
 
@@ -491,12 +529,12 @@
 							<Button
 								variant="secondary"
 								size="xs"
-								class="w-[65px] justify-center"
+								class="min-w-[65px] justify-center"
 								onclick={() => toggle(proto)}
-								disabled={!canToggle(proto)}
+								disabled={!canToggle(proto) || busyProtocols.includes(proto.name)}
 								title={canToggle(proto) ? `${proto.enabled ? 'Disable' : 'Enable'} ${proto.display_name}` : proto.system_service ? 'Administrator access is required to manage this system service' : 'Unscoped operator access is required to manage this protocol'}
 							>
-								{proto.enabled ? 'Disable' : 'Enable'}
+								{busyProtocols.includes(proto.name) ? (proto.enabled ? 'Disabling...' : 'Enabling...') : (proto.enabled ? 'Disable' : 'Enable')}
 							</Button>
 							{#if ['nfs', 'smb', 'iscsi', 'nvmeof', 'nut', 'watchdog', 'ssh', 'rest-server'].includes(proto.name)}
 								<Button variant="secondary" size="xs" onclick={() => toggleConfig(proto.name)}>
@@ -779,7 +817,8 @@
 {#if loading}
 	<p class="text-muted-foreground">Loading...</p>
 {:else}
-	<table class="w-full max-w-3xl text-sm">
+	<div class="grid items-start gap-8 xl:grid-cols-[minmax(0,48rem)_minmax(18rem,1fr)]">
+	<table class="w-full text-sm">
 		<thead>
 			<tr>
 				<th class="w-[180px] border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Service</th>
@@ -864,4 +903,39 @@
 			{/each}
 		</tbody>
 	</table>
+	<aside class="rounded-lg border border-border bg-muted/10 p-4 xl:sticky xl:top-4">
+		<div class="flex items-center justify-between gap-3">
+			<div>
+				<h2 class="text-sm font-semibold">Service activity</h2>
+				<p class="mt-0.5 text-xs text-muted-foreground">Recent actions on this page.</p>
+			</div>
+			{#if serviceActivity.length > 0}
+				<Button variant="ghost" size="xs" onclick={() => { serviceActivity = []; }}>Clear</Button>
+			{/if}
+		</div>
+		{#if serviceActivity.length === 0}
+			<div class="mt-4 rounded-md border border-dashed border-border p-4 text-xs text-muted-foreground">
+				Service enable and disable progress will appear here.
+			</div>
+		{:else}
+			<div class="mt-4 space-y-3">
+				{#each serviceActivity as entry (entry.id)}
+					<div class="rounded-md border border-border/70 bg-background/50 p-3">
+						<div class="flex items-start gap-2">
+							<span class="mt-1.5 h-2 w-2 shrink-0 rounded-full {entry.status === 'pending' ? 'animate-pulse bg-amber-400' : entry.status === 'success' ? 'bg-green-400' : 'bg-destructive'}"></span>
+							<div class="min-w-0 flex-1">
+								<div class="flex items-baseline justify-between gap-2">
+									<p class="text-xs font-medium">{entry.action} {entry.service}</p>
+									<span class="shrink-0 text-[0.65rem] text-muted-foreground">{entry.time}</span>
+								</div>
+								<p class="mt-1 text-xs leading-relaxed text-muted-foreground">{entry.detail}</p>
+							</div>
+						</div>
+					</div>
+				{/each}
+			</div>
+		{/if}
+		<a href="/logs" class="mt-4 inline-flex text-xs font-medium text-primary hover:underline">View full system logs</a>
+	</aside>
+	</div>
 {/if}
