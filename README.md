@@ -22,23 +22,25 @@ NASty is a NAS operating system built on NixOS and bcachefs. It turns commodity 
 
 ### Storage
 - **bcachefs** — compression, checksumming, erasure coding, tiering, encryption, O(1) snapshots
-- **File sharing** — NFS and SMB with per-share ACLs
+- **File sharing** — NFS and SMB with per-share ACLs, including discoverable macOS Time Machine destinations with optional size limits
 - **Block storage** — iSCSI and NVMe-oF with dedicated targets per volume, per-target portal management, and optional RDMA transports (iSER, NVMe-oF/RDMA, NFS-RDMA) for RoCE and InfiniBand NICs
 - **Subvolumes** — filesystem and block subvolumes with quotas, compression, and tiering per subvolume
-- **Snapshots** — instant, space-efficient point-in-time copies
+- **Snapshots and recovery** — instant point-in-time copies, writable clones, whole-subvolume rollback, and individual file or folder restore
 - **Encryption lifecycle** — lock and unlock encrypted filesystems from the WebUI, with a dependents preview that lists every app, VM, share, and backup that would break before you confirm. Optional **TPM2-sealed keys** auto-unlock on boot when the measured-boot state matches
-- **File browser** — browse, upload, edit, rename, copy, move, and bulk-manage files from the web UI
+- **File browser** — browse, upload, edit, rename, copy, move, and bulk-manage files, or create password-, expiry-, and download-limited guest links
 - **Backups** — encrypted, deduplicated, incremental backups to local, S3, SFTP, REST, or Backblaze B2 with per-profile schedules and retention — plus whole-snapshot restore, including disaster recovery onto a fresh box from an existing repository
+- **Storage operations** — scheduled scrubs, offline fsck, device evacuation, reconcile, and copy-GC with live progress and diagnostics
 
 ### Monitoring & Alerts
-- **Dashboard** — CPU, memory, storage, temperature, frequency — with scrollable history charts (30-day retention)
+- **Dashboards** — built-in and named custom views with movable, resizable widgets and scrollable history charts (30-day retention)
 - **Alerts** — configurable rules for filesystem usage, disk health, temperatures, scrub errors, and more
-- **Notifications** — alert delivery via SMTP email, Telegram, webhooks, and ntfy push notifications
-- **S.M.A.R.T.** — disk health monitoring with per-disk details
+- **Notifications** — alert delivery via SMTP email, Telegram, webhooks, ntfy, and Signal
+- **Disk health** — protocol-aware ATA/SATA, NVMe, and SAS/SCSI monitoring with per-disk details and topology
+- **Prometheus** — optional metrics endpoint for external monitoring
 - **[nasty-top](https://github.com/nasty-project/nasty-top)** — standalone TUI for live per-device IO, latency, and tuning
 
 ### Apps & VMs
-- **Apps** — Docker containers and Compose stacks with image pull progress, container inspect, live per-app resource usage (CPU %, memory, network and disk I/O), and custom `.env` files for compose stacks, and an `allow_unsafe` escape hatch for stacks that need privileged options. See [Jellyfin on NASty](docs/jellyfin.md) for a complete media-server example
+- **Apps** — Docker containers and Compose stacks with private registries, HTTPS ingress, managed networking and startup order, relocatable persistent data, live resource usage, custom `.env` files, and an `allow_unsafe` escape hatch for privileged options. See [Jellyfin on NASty](docs/jellyfin.md) for a complete media-server example
 - **Virtual machines** — QEMU/KVM with VNC console, disk snapshots, USB passthrough (editable on existing VMs), bridge selection, and an inline disk-import wizard for qcow2, raw, img, vdi, and vmdk images (optionally .xz/.gz/.bz2 compressed)
 - **Hardware passthrough** — IOMMU group view, USB device inventory, vfio-pci toggles that survive reboots, and SR-IOV virtual-function management (per-VF VLAN, MAC, trust, spoof-check)
 - **Network bridges** — Linux bridges for attaching VMs (and apps) to L2 networks alongside the host
@@ -51,10 +53,11 @@ NASty is a NAS operating system built on NixOS and bcachefs. It turns commodity 
 - **Networking** — NetworkManager-based with confirm-or-rollback: edits stage, apply, and auto-revert if you don't confirm in time, so a typo can't lock you out over SSH
 - **Let's Encrypt** — automatic TLS certificates via ACME (TLS-ALPN and DNS challenges)
 - **Tailscale** — built-in VPN with one-click setup
-- **Access control** — local user accounts with role-based permissions, API tokens, OIDC single sign-on, **WebAuthn / passkey** sign-in with admin-side credential reset, and an append-only audit log of every mutation, login attempt, and privileged-console open
+- **Access control** — role-based permissions, scoped API tokens, OIDC single sign-on, **WebAuthn / passkey** sign-in, a read-only file portal for authorized users, and an append-only audit log
 - **Active Directory** _(experimental)_ — join an existing domain as a member, or host your own: NASty as the domain controller with integrated DNS and Kerberos, WebUI user/group/computer management, domain backups, and RSAT compatibility for advanced administration
 - **Firewall** — engine-managed nftables, deny-by-default, with per-service source/interface restrictions and user-defined custom port rules for anything running outside NASty's service model
 - **UPS monitoring** — NUT integration for graceful shutdown on power loss (opt-in)
+- **Firmware and watchdog** — supported-device firmware updates plus optional load, memory, and connectivity watchdog recovery
 - **Atomic updates** — NixOS-based, with one-click rollback to any previous generation
 - **Secure Boot** _(experimental)_ — per-box opt-in lanzaboote-enforcing boot chain with a guided enrollment wizard from the Hardware page
 - **Binary cache** — fast updates via cachix on both x86_64 and aarch64 (engine, webui, bcachefs-tools pre-built — no Rust + npm compile on Pi / Odroid / Rockchip boxes)
@@ -67,10 +70,11 @@ NASty can serve as a storage backend for Kubernetes — provisioning persistent 
 - **[nasty-chart](https://github.com/nasty-project/nasty-chart)** — Helm chart for one-command install
 - **[nasty-plugin](https://github.com/nasty-project/nasty-plugin)** — `kubectl-nasty` for inspecting volumes, snapshots, clones, and health from the CLI
 
-## Community
+## Ecosystem & Integrations
 
-Integrations built by the community on top of NASty's JSON-RPC API:
+Integrations built on NASty's public WebSocket and REST APIs:
 
+- **[nasty-ha](https://github.com/nasty-project/nasty-ha)** — Home Assistant custom integration for local monitoring and optional VM and App controls
 - **[nastyplugin](https://github.com/WarlockSyno/nastyplugin)** by [@WarlockSyno](https://github.com/WarlockSyno) — Proxmox storage plugin for using NASty as a backing store for VM and container disks
 
 Building something with NASty? Open an issue or PR and we'll add it here.
@@ -117,9 +121,9 @@ Building something with NASty? Open an issue or PR and we'll add it here.
 1. Download the latest ISO from [Releases](../../releases)
 2. Boot it on your hardware — the installer lets you pick a disk and press Enter
 3. Open the WebUI at `https://<nasty-ip>`
-4. Default credentials: **admin** / **admin**
+4. Sign in with **admin** / **admin** and set a new password when prompted
 
-ISO won't boot? Some UEFI firmware doesn't like NixOS ISOs. See [INSTALL.md](INSTALL.md) for an alternative installation method from any Linux live environment.
+UEFI is required; Proxmox users must select OVMF. If the ISO will not boot on your firmware, see [INSTALL.md](INSTALL.md) for an alternative installation method from any Linux live environment.
 
 ## Update Flavors
 
@@ -131,8 +135,6 @@ NASty has three update flavors:
 | **Spicy** | Pre-release builds (`s*`) | Pre-release builds with newer features |
 | **Nasty** | Latest commit on main | Bleeding edge, no guarantees |
 
-Switch flavors from **Settings → Update → Flavor** in the WebUI.
-
 ## Architecture
 
 | Component | Technology | Why |
@@ -141,7 +143,7 @@ Switch flavors from **Settings → Update → Flavor** in the WebUI.
 | Web UI | SvelteKit + TypeScript | Reactive UI with real-time WebSocket updates |
 | OS | NixOS | Atomic updates, rollback, reproducible system config |
 | Filesystem | bcachefs | Checksumming, compression, tiering, snapshots, erasure coding |
-| API | JSON-RPC 2.0 over WebSocket | Persistent connection, bidirectional, low overhead |
+| API | JSON-RPC 2.0 over WebSocket and authenticated REST/OpenAPI | Realtime WebUI plus documented external integrations |
 
 ## Project Structure
 
@@ -163,4 +165,4 @@ NASty sends a random installation ID and daily aggregate usage data for mounted 
 
 ## License
 
-GPLv3
+GPL-3.0-only
