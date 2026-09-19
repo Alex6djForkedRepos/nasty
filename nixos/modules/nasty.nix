@@ -775,6 +775,7 @@ in {
       tcpdump           # packet capture for protocol debugging
       rsync             # file transfer and sync
       jq                # JSON parsing (used by engine scripts)
+      sqlite            # sqlite3 CLI for inspecting and maintaining SQLite databases
       htop
       python3           # scripting and quick data processing
       uv                # fast Python package manager (uv + uvx — `uvx <tool>` for one-shots)
