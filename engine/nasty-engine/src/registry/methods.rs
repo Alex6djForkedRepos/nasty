@@ -9,6 +9,7 @@ use super::{Method, MethodParams, MethodRole, ad_hoc_one, ad_hoc_two, gen_schema
 use crate::auth::{ApiToken, ApiTokenInfo, Role, UserInfo};
 use crate::fs_dependents::FsDependents;
 use crate::guestshare::{CreateGuestShareRequest, CreateGuestShareResult, GuestShareInfo};
+use crate::router::CreateVmDiskRequest;
 use crate::subvolume_dependents::SubvolumeDependents;
 use nasty_apps::{
     App, AppConfig, AppIngress, AppStats, AppdataRelocateStatus, AppsStatus, CaddyRouteSummary,
@@ -2791,6 +2792,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Operator,
                     params: MethodParams::Schema(gen_schema::<CreateVmRequest>(generator)),
                     result: Some(gen_schema::<VmConfig>(generator)),
+                },
+                Method {
+                    name: "vm.disk.create",
+                    desc: "Create a managed block disk under `vms/<name>` on the selected filesystem.",
+                    role: MethodRole::Operator,
+                    params: MethodParams::Schema(gen_schema::<CreateVmDiskRequest>(generator)),
+                    result: Some(gen_schema::<Subvolume>(generator)),
                 },
                 Method {
                     name: "vm.update",

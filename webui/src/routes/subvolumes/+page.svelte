@@ -318,6 +318,7 @@
 	let allVms: VmStatus[] = $state([]);
 	let allApps: App[] = $state([]);
 	let appsStoragePath: string | null = $state(null);
+	let appdataStoragePath: string | null = $state(null);
 	/** Engine-computed per-subvolume usage. Source of truth for the
 	 * Usage column — see `subvolume.list_dependents` in
 	 * nasty-engine/src/subvolume_dependents.rs. The local consumer
@@ -348,6 +349,7 @@
 		allVms = vms.status === 'fulfilled' ? vms.value : [];
 		allApps = appsList.status === 'fulfilled' ? appsList.value : [];
 		appsStoragePath = appsStat.status === 'fulfilled' ? (appsStat.value.storage_path ?? null) : null;
+		appdataStoragePath = appsStat.status === 'fulfilled' ? (appsStat.value.appdata_path ?? null) : null;
 		const next = new Map<string, SubvolumeDependents>();
 		if (deps.status === 'fulfilled') {
 			for (const d of deps.value) next.set(d.path, d);
@@ -544,7 +546,6 @@
 	}
 
 	const SYSTEM_SUBVOLUMES: Record<string, string> = {
-		'apps': 'Docker apps and container data',
 		'vms': 'Virtual machine images and disk storage',
 	};
 
@@ -596,8 +597,10 @@
 	 * lifecycles we shouldn't tear down implicitly from a Delete
 	 * Subvolume click. */
 	const blockingDeps = $derived.by((): { label: string; route?: string }[] => {
-		if (!deleteDeps) return [];
 		const out: { label: string; route?: string }[] = [];
+		for (const child of deleteChildren) out.push({ label: `nested subvolume '${child}'` });
+		if (!deleteDeps) return out;
+		for (const role of deleteDeps.apps_storage) out.push({ label: `Apps ${role}`, route: '/apps' });
 		for (const v of deleteDeps.vms) out.push({ label: `VM '${v}'`, route: '/vms' });
 		for (const a of deleteDeps.apps) out.push({ label: `app '${a}'`, route: '/apps' });
 		for (const b of deleteDeps.backup_jobs) out.push({ label: `backup job '${b}'`, route: '/backups' });
@@ -799,14 +802,18 @@
 	}
 	// Counts come from `subvolume.list_dependents` (engine-side, matches
 	// `fs.dependents` patterns including longest-prefix path attribution
-	// for nested subvolumes). The `system` badge stays client-side because
-	// it's a static SYSTEM_SUBVOLUMES table, not engine-derived state.
+	// for nested subvolumes). The `system` badge combines reserved layouts
+	// with the currently configured Apps paths.
 	const subvolumeUsage = $derived.by(() => {
 		const out = new Map<string, SubvolumeUsage>();
 		for (const sv of subvolumes) {
 			const d = dependentsByPath.get(sv.path);
 			out.set(svKey(sv), {
-				system: SYSTEM_SUBVOLUMES[sv.name] ?? null,
+				system: sv.path === appsStoragePath
+					? 'Docker images, containers, and default app volumes'
+					: sv.path === appdataStoragePath
+						? 'Persistent application data exposed through /appdata'
+						: SYSTEM_SUBVOLUMES[sv.name] ?? null,
 				nfs: d?.nfs_shares.length ?? 0,
 				smb: d?.smb_shares.length ?? 0,
 				iscsi: d?.iscsi_targets.length ?? 0,
@@ -1839,12 +1846,7 @@
 					<Button variant="secondary" size="sm" onclick={cancelDelete}>Close</Button>
 				</Dialog.Footer>
 			{:else}
-				<p class="mb-3 text-sm text-muted-foreground">
-					{#if deleteChildren.length > 0}
-						This will also delete {deleteChildren.length} nested subvolume{deleteChildren.length === 1 ? '' : 's'}: {deleteChildren.join(', ')}.
-					{/if}
-					All snapshots will also be deleted.
-				</p>
+				<p class="mb-3 text-sm text-muted-foreground">All snapshots will also be deleted.</p>
 
 				{#if cascadableDeps.length > 0}
 					<div class="mb-3 rounded-md border border-border bg-muted/20 p-3 text-sm">

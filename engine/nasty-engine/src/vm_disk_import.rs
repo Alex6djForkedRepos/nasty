@@ -126,7 +126,7 @@ struct ImportRequest {
     image_name: String,
     /// Block subvolume that receives the converted image. Must already
     /// exist and have its loop device attached (so a `block_device` is
-    /// present). The UI nudges users through `subvolume.create` when no
+    /// present). The UI nudges users through `vm.disk.create` when no
     /// suitable target exists.
     target_filesystem: String,
     target_subvolume: String,

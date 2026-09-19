@@ -367,6 +367,7 @@ export interface SubvolumeDependents {
 	filesystem: string;
 	name: string;
 	path: string;
+	apps_storage: string[];
 	apps: string[];
 	vms: string[];
 	backup_jobs: string[];

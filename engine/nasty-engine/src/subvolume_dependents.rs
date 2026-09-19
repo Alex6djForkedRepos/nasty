@@ -32,6 +32,7 @@ pub struct SubvolumeDependents {
     pub filesystem: String,
     pub name: String,
     pub path: String,
+    pub apps_storage: Vec<String>,
     pub apps: Vec<String>,
     pub vms: Vec<String>,
     pub backup_jobs: Vec<String>,
@@ -116,6 +117,28 @@ pub async fn find_all_subvolume_dependents(
         paths_desc.push(sv.path.clone());
     }
     paths_desc.sort_by_key(|p| std::cmp::Reverse(p.len()));
+
+    match nasty_apps::AppsService::load_config_strict() {
+        Ok(config) => {
+            for (role, path) in [
+                ("Docker storage", config.storage_path.as_deref()),
+                ("application data storage", config.appdata_path.as_deref()),
+            ] {
+                if let Some(path) = path
+                    && let Some(owning) = owning_subvol(&paths_desc, path)
+                    && let Some(deps) = by_path.get_mut(owning)
+                {
+                    deps.apps_storage.push(role.to_string());
+                }
+            }
+        }
+        Err(error) => {
+            for deps in by_path.values_mut() {
+                deps.state_errors
+                    .push(format!("Apps configuration: {error}"));
+            }
+        }
+    }
 
     // Apps. Coarse: every managed app inherits the subvolume that
     // hosts the apps storage path. Per-app bind mounts that escape
@@ -352,6 +375,7 @@ mod tests {
         let d = SubvolumeDependents::default();
         let j = serde_json::to_value(&d).unwrap();
         for k in [
+            "apps_storage",
             "apps",
             "vms",
             "backup_jobs",

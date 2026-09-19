@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use nasty_common::{ErrorCode, Request, Response};
 use tracing::debug;
 
@@ -19,6 +21,8 @@ mod snapshot;
 mod subvolume;
 mod system;
 mod vm;
+
+pub(crate) use vm::CreateVmDiskRequest;
 
 use crate::AppState;
 use crate::auth::{Role, Session};
@@ -127,6 +131,7 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "share.nvmeof.add_host"
                 | "share.nvmeof.remove_host"
                 | "vm.create"
+                | "vm.disk.create"
                 | "vm.update"
                 // `vm.delete` was admin-only; operator could spin up
                 // VMs they had no way to tear down. Closes the same
@@ -371,6 +376,7 @@ fn is_read_only(method: &str) -> bool {
 /// Derive the collection name for a mutation method, or None if read-only.
 fn collection_for_method(method: &str) -> Option<&'static str> {
     match method {
+        "vm.disk.create" => Some("subvolume"),
         m if m.starts_with("fs.device.") => Some("filesystem"),
         m if m.starts_with("fs.") && !is_read_only(m) => Some("filesystem"),
         m if m.starts_with("device.") && !is_read_only(m) => Some("filesystem"),
@@ -920,7 +926,28 @@ pub(super) async fn ensure_images_subvolume(
 
 // ── Subvolume in-use check ───────────────────────────────────────
 
-/// Check if a subvolume is in use by a VM, iSCSI target, or NVMe-oF subsystem.
+fn configured_apps_storage_role(
+    config: &nasty_apps::AppsConfig,
+    subvolume_path: &str,
+) -> Option<&'static str> {
+    if config
+        .storage_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path) == Path::new(subvolume_path))
+    {
+        return Some("Docker storage");
+    }
+    if config
+        .appdata_path
+        .as_deref()
+        .is_some_and(|path| Path::new(path) == Path::new(subvolume_path))
+    {
+        return Some("application data storage");
+    }
+    None
+}
+
+/// Check if a subvolume is in use by Apps, a VM, or a sharing service.
 /// Returns an error message if in use, None if safe to delete.
 pub(super) async fn check_subvolume_in_use(
     state: &AppState,
@@ -934,6 +961,27 @@ pub(super) async fn check_subvolume_in_use(
     let block_device = sv.block_device.as_deref();
     let block_volume_id = sv.block_volume_id.as_ref();
     let subvol_path = &sv.path;
+
+    match nasty_apps::AppsService::load_config_strict() {
+        Ok(config) => {
+            if let Some(role) = configured_apps_storage_role(&config, subvol_path) {
+                return Some(format!(
+                    "subvolume is configured as Apps {role}. Disable Apps or move its storage first."
+                ));
+            }
+        }
+        Err(error) => {
+            return Some(format!(
+                "cannot verify Apps storage dependencies because state failed to load: {error}"
+            ));
+        }
+    }
+    if state.apps.active_appdata_relocation_path().await.as_deref() == Some(subvol_path) {
+        return Some(
+            "subvolume is the target of an active appdata relocation. Wait for the move to finish."
+                .to_string(),
+        );
+    }
 
     // ── Block device checks (VMs, iSCSI, NVMe-oF) ──
 
@@ -1031,16 +1079,15 @@ pub(super) async fn check_subvolume_in_use(
 /// Check if a filesystem has any subvolumes with dependencies that would prevent destruction.
 pub(super) async fn check_filesystem_in_use(state: &AppState, name: &str) -> Option<String> {
     // Get all subvolumes on this filesystem
-    let subvols = state
-        .subvolumes
-        .list_all(None, None)
-        .await
-        .unwrap_or_default();
+    let subvols = match state.subvolumes.list_all(None, None).await {
+        Ok(subvols) => subvols,
+        Err(error) => {
+            return Some(format!(
+                "filesystem '{name}' cannot be destroyed: cannot verify subvolume dependencies: {error}"
+            ));
+        }
+    };
     let fs_subvols: Vec<_> = subvols.iter().filter(|sv| sv.filesystem == name).collect();
-
-    if fs_subvols.is_empty() {
-        return None;
-    }
 
     // Check each subvolume for dependencies
     for sv in &fs_subvols {
@@ -1052,15 +1099,35 @@ pub(super) async fn check_filesystem_in_use(state: &AppState, name: &str) -> Opt
         }
     }
 
-    // Check if apps runtime uses this filesystem
-    if state.apps.is_enabled() {
-        let config = nasty_apps::AppsService::load_config();
-        if let Some(ref path) = config.storage_path
-            && path.starts_with(&format!("/fs/{name}/"))
-        {
+    match nasty_apps::AppsService::load_config_strict() {
+        Ok(config) => {
+            let filesystem_path = Path::new("/fs").join(name);
+            if [
+                config.storage_path.as_deref(),
+                config.appdata_path.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|path| Path::new(path).starts_with(&filesystem_path))
+            {
+                return Some(format!(
+                    "filesystem '{name}' cannot be destroyed: configured Apps storage is on this filesystem. Disable Apps or move its storage first."
+                ));
+            }
+            if state
+                .apps
+                .active_appdata_relocation_path()
+                .await
+                .is_some_and(|path| Path::new(&path).starts_with(&filesystem_path))
+            {
+                return Some(format!(
+                    "filesystem '{name}' cannot be destroyed: it contains an active appdata relocation target. Wait for the move to finish."
+                ));
+            }
+        }
+        Err(error) => {
             return Some(format!(
-                "filesystem '{}' cannot be destroyed: apps runtime storage is on this filesystem. Disable Apps first.",
-                name
+                "filesystem '{name}' cannot be destroyed: cannot verify Apps storage dependencies: {error}"
             ));
         }
     }
@@ -1926,9 +1993,37 @@ pub(super) async fn read_bcachefs_error_count(uuid: &str) -> (u64, bool) {
 mod tests {
     use super::{
         AlertCoverage, ReconcileProgress, ReconcileProgressSample, audit_detail,
-        clear_reconcile_tracker, is_operator_allowed, is_read_only, is_universally_allowed,
-        is_user_allowed, reconcile_progress, reconcile_stall_check_at,
+        clear_reconcile_tracker, collection_for_method, configured_apps_storage_role,
+        is_operator_allowed, is_read_only, is_universally_allowed, is_user_allowed,
+        reconcile_progress, reconcile_stall_check_at,
     };
+
+    #[test]
+    fn configured_apps_storage_paths_are_protected() {
+        let config = nasty_apps::AppsConfig {
+            enabled: true,
+            storage_path: Some("/fs/tank/apps".into()),
+            appdata_path: Some("/fs/tank/appdata".into()),
+        };
+
+        assert_eq!(
+            configured_apps_storage_role(&config, "/fs/tank/apps"),
+            Some("Docker storage")
+        );
+        assert_eq!(
+            configured_apps_storage_role(&config, "/fs/tank/appdata"),
+            Some("application data storage")
+        );
+        assert_eq!(
+            configured_apps_storage_role(&config, "/fs/tank/unrelated"),
+            None
+        );
+    }
+
+    #[test]
+    fn vm_disk_creation_emits_a_subvolume_event() {
+        assert_eq!(collection_for_method("vm.disk.create"), Some("subvolume"));
+    }
 
     #[test]
     fn audit_detail_includes_host_path_mutations() {

@@ -171,6 +171,7 @@ pub(super) async fn try_route(
         "fs.destroy" => {
             match parse_params::<nasty_storage::filesystem::DestroyFilesystemRequest>(req) {
                 Ok(p) => {
+                    let _apps_config_guard = state.apps.storage_config_guard().await;
                     if let Some(reason) = check_filesystem_in_use(state, &p.name).await {
                         err(req, reason)
                     } else {

@@ -3434,6 +3434,11 @@ impl AppsService {
         self.compose_mutations.clone().lock_owned().await
     }
 
+    /// Serialize storage deletion checks with Apps enablement and appdata relocation.
+    pub async fn storage_config_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.config_mutations.clone().lock_owned().await
+    }
+
     pub async fn ensure_new_app_name_available(&self, app_name: &str) -> Result<(), AppsError> {
         validate_new_app_name(app_name)?;
         let mut filters = HashMap::new();
@@ -4488,6 +4493,15 @@ impl AppsService {
 
     pub async fn appdata_relocate_status(&self) -> Option<AppdataRelocateStatus> {
         self.appdata_relocate.lock().await.clone()
+    }
+
+    pub async fn active_appdata_relocation_path(&self) -> Option<String> {
+        self.appdata_relocate
+            .lock()
+            .await
+            .as_ref()
+            .filter(|status| status.running)
+            .map(|status| format!("/fs/{}/appdata", status.target_fs))
     }
 
     /// Move the appdata subvolume to another filesystem and flip the

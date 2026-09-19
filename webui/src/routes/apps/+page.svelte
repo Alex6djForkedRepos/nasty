@@ -2170,7 +2170,7 @@
 			<CardContent class="py-6">
 				<p class="mb-1 font-medium">Apps need the Docker runtime</p>
 				<p class="mb-4 text-sm text-muted-foreground">
-					Container apps run on a Docker daemon NASty manages as a service. Pick a filesystem for Docker's data, then enable the runtime — once it's up, click Install App again to continue.
+					Container apps run on a Docker daemon NASty manages as a service. Enabling creates an <code>apps</code> subvolume for Docker internals and default volumes, plus a separate <code>appdata</code> subvolume for persistent data exposed through <code>/appdata</code>. Appdata may remain empty until an app explicitly uses it.
 				</p>
 				{#if filesystems.length === 0}
 					<p class="mb-4 text-sm text-amber-400">You need at least one mounted filesystem before enabling Apps.</p>

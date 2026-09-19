@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use nasty_common::{ErrorCode, Request, Response};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::*;
@@ -17,6 +18,13 @@ use crate::auth::{Role, Session};
 struct ManagedVmDisk {
     device: Option<String>,
     source: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct CreateVmDiskRequest {
+    pub filesystem: String,
+    pub name: String,
+    pub volsize_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -258,6 +266,33 @@ pub(super) async fn try_route(
                 }
             }
             Err(e) => invalid(req, e),
+        },
+        "vm.disk.create" => match parse_params::<CreateVmDiskRequest>(req) {
+            Ok(p) => {
+                if session
+                    .filesystem
+                    .as_deref()
+                    .is_some_and(|filesystem| filesystem != p.filesystem)
+                {
+                    err(req, "access denied")
+                } else {
+                    let _guard = state.block_share_mutation.lock().await;
+                    match state
+                        .subvolumes
+                        .create_vm_disk(
+                            p.filesystem,
+                            p.name,
+                            p.volsize_bytes,
+                            session.owner.clone(),
+                        )
+                        .await
+                    {
+                        Ok(disk) => ok(req, disk),
+                        Err(error) => err(req, error),
+                    }
+                }
+            }
+            Err(error) => invalid(req, error),
         },
         "vm.update" => match parse_params::<nasty_vm::UpdateVmRequest>(req) {
             Ok(p) => {

@@ -417,10 +417,9 @@
 			importCreating = true;
 			importError = '';
 			try {
-				const sv = await client.call<{ block_device: string | null }>('subvolume.create', {
+				const sv = await client.call<{ name: string; block_device: string | null }>('vm.disk.create', {
 					filesystem: importNewSvFs,
 					name: importNewSvName,
-					subvolume_type: 'block',
 					volsize_bytes: importNewSvSize * 1024 * 1024 * 1024,
 				});
 				if (!sv.block_device) {
@@ -428,7 +427,7 @@
 					importCreating = false;
 					return;
 				}
-				importTargetKey = `${importNewSvFs}/${importNewSvName}`;
+				importTargetKey = `${importNewSvFs}/${sv.name}`;
 				await loadSubvolumes(); // so the new sv shows up if the user retries
 			} catch (e) {
 				importError = `Failed to create subvolume: ${e}`;
@@ -651,19 +650,11 @@
 
 		// Create a new block subvolume if requested
 		if (newDiskCreate && newDiskFs && newDiskSize > 0) {
-			// Subvolume name uses a slash so the disk lands at
-			// /fs/<filesystem>/vms/<name> rather than as a top-level
-			// vm-<name> subvolume next to the operator's data subvolumes
-			// (#354). Matches the layout `vms/images` already uses for VM
-			// disk-image uploads and mirrors how apps land under apps/.
-			// subvolume.create auto-creates the `vms/` parent on demand.
-			const svName = `vms/${newName}`;
 			const sizeBytes = newDiskSize * 1024 * 1024 * 1024;
 			const svResult = await withToast(
-				() => client.call('subvolume.create', {
+				() => client.call('vm.disk.create', {
 					filesystem: newDiskFs,
-					name: svName,
-					subvolume_type: 'block',
+					name: newName,
 					volsize_bytes: sizeBytes,
 				}),
 				'Disk subvolume created'
