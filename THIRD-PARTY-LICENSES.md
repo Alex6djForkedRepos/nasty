@@ -93,6 +93,7 @@ All dependencies use licenses compatible with GPL-3.0.
 | rsync | GPL-3.0 |
 | samba | GPL-3.0 |
 | smartmontools | GPL-2.0 |
+| SQLite | Public Domain |
 | syswatch | MIT |
 | targetcli-fb | Apache-2.0 |
 | tcpdump | BSD-3-Clause |
