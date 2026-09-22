@@ -132,6 +132,13 @@
             "${nasty}/nixos/modules/linuxquota.nix"
             "${nasty}/nixos/modules/nasty.nix"
             "${nasty}/nixos/appliance-base.nix"
+            # Ship a regular, operator-editable example without importing it.
+            # tmpfiles C copies only when absent, preserving local changes.
+            ({ ... }: {
+              systemd.tmpfiles.rules = [
+                "C /etc/nixos/custom.nix.example 0644 root root - ${nasty}/nixos/system-flake/custom.nix.example"
+              ];
+            })
             # Machine-local overlay files live directly under /etc/nixos.
             ./hardware-configuration.nix
             ./networking.nix

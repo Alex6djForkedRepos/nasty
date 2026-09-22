@@ -8,6 +8,45 @@ let
   # the module argument list so NixOS does not require it before defaults run.
   nasty-tailscale = args.nasty-tailscale or pkgs.tailscale;
 
+  # Maintenance fork created after ncdu author Yoran Heling passed away.
+  # Nixpkgs still packages the frozen v2.9.2 upstream source, so use the
+  # fork's content-addressed static release artifacts for our two platforms.
+  maintainedNcdu = let
+    version = "2.11.1";
+    artifacts = {
+      x86_64-linux = {
+        arch = "x86_64";
+        hash = "sha256-0TyI5LnQdTB8UU5sagkmHiIEXeyPvfFr8Y69AJOhRpQ=";
+      };
+      aarch64-linux = {
+        arch = "aarch64";
+        hash = "sha256-Nkprgsa/xa+D2DZgfxvyr4o0DPNAr6dqbfJFwLJ3YyY=";
+      };
+    };
+    artifact = artifacts.${pkgs.stdenv.hostPlatform.system} or
+      (throw "ncdu maintenance fork is not packaged for ${pkgs.stdenv.hostPlatform.system}");
+    src = pkgs.fetchzip {
+      url = "https://github.com/BratishkaErik/ncdu/releases/download/v${version}/ncdu-${version}-linux-${artifact.arch}.tar.gz";
+      inherit (artifact) hash;
+      stripRoot = false;
+    };
+  in pkgs.stdenvNoCC.mkDerivation {
+    pname = "ncdu";
+    inherit version;
+    dontUnpack = true;
+    installPhase = ''
+      install -Dm755 ${src}/ncdu $out/bin/ncdu
+    '';
+    meta = {
+      description = "Disk usage analyzer with an ncurses interface (maintenance fork)";
+      homepage = "https://github.com/BratishkaErik/ncdu";
+      license = lib.licenses.mit;
+      mainProgram = "ncdu";
+      platforms = builtins.attrNames artifacts;
+      sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+    };
+  };
+
   # Boot-time fail-closed policy. The engine atomically replaces this table
   # with its complete dynamic rules before restoring network-facing services.
   nastyFirewallBaselineText = ''
@@ -553,12 +592,17 @@ in {
          iotop-c -o
          iostat -x 1
          dool -dny 1
+         ncdu -x /fs/first                         browse directory usage without crossing filesystems
          btop                                       interactive CPU/mem/disk/net dashboard
          diskwatch                                  read-only disk diagnostics TUI (devices, SMART, IO, hot files)
          netwatch                                   read-only network diagnostics TUI (interfaces, connections, DNS, capture)
          syswatch                                   read-only system diagnostics TUI (CPU, memory, processes, services)
          # → type 'debug' for perf profiling and kernel oops symbolization
          # → type 'benchmark' for fio storage tests
+
+       archives
+         7zz x archive.zip -o/fs/first/extracted       extract an archive
+         7zz a archive.7z /fs/first/path               create an archive
 
        rustic — backup (restic-compatible, deduplicating, encrypted)
          rustic -r /path/to/repo -p <password> init              initialize a new backup repo
@@ -694,6 +738,7 @@ in {
 
        disk space
          df -h /                                           root partition usage
+         ncdu -x /fs/first                                 browse directory usage interactively
          nix-collect-garbage                               remove unreferenced store paths
          nix-collect-garbage -d                             also delete old generations
          du -sh /nix/store | sort -h | tail -20            biggest store paths
@@ -776,6 +821,8 @@ in {
       rsync             # file transfer and sync
       jq                # JSON parsing (used by engine scripts)
       sqlite            # sqlite3 CLI for inspecting and maintaining SQLite databases
+      _7zz              # 7zz archive creation and extraction
+      maintainedNcdu    # maintained ncdu fork for interactive directory usage
       htop
       python3           # scripting and quick data processing
       uv                # fast Python package manager (uv + uvx — `uvx <tool>` for one-shots)

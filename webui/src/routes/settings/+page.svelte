@@ -981,7 +981,8 @@
 					{:else}
 						<p class="text-xs text-muted-foreground italic">
 							Not created yet — <code class="rounded bg-muted px-1 py-0.5">custom.nix</code> doesn't exist.
-							Create it from a terminal to add custom config.
+							Create it from the shipped example with
+							<code class="rounded bg-muted px-1 py-0.5">cp custom.nix.example custom.nix</code>.
 						</p>
 					{/if}
 					<div class="mt-3">

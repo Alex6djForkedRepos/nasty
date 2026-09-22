@@ -411,6 +411,8 @@ pkgs.testers.runNixOSTest {
     machine.succeed("netwatch --version | grep -Fq '0.31.4'")
     machine.succeed("syswatch --version | grep -Fq '0.14.2'")
     machine.succeed("command -v sqlite3 && sqlite3 --version")
+    machine.succeed("7zz | grep -Fq '7-Zip'")
+    machine.succeed("ncdu --version | grep -Fq 'ncdu 2.11.1'")
 
     # nftables must establish a default-drop baseline independently of the
     # engine. Restart nftables as separate stop/start operations so PartOf stops
