@@ -16,11 +16,11 @@ let
     artifacts = {
       x86_64-linux = {
         arch = "x86_64";
-        hash = "sha256-b7tjbIJ0yY+wyr36vk2FLVbeTzHR+c9N25bG/SO3Wrg=";
+        hash = "sha256-0TyI5LnQdTB8UU5sagkmHiIEXeyPvfFr8Y69AJOhRpQ=";
       };
       aarch64-linux = {
         arch = "aarch64";
-        hash = "sha256-WeGn9NIe31X3VLD49pwANDMOhxLfpHXtW6pVHP+fuTc=";
+        hash = "sha256-Nkprgsa/xa+D2DZgfxvyr4o0DPNAr6dqbfJFwLJ3YyY=";
       };
     };
     artifact = artifacts.${pkgs.stdenv.hostPlatform.system} or
