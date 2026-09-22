@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Copy this file before editing it:
+#
+#   cp /etc/nixos/custom.nix.example /etc/nixos/custom.nix
+#
+# Apply your changes with:
+#
+#   nixos-rebuild switch --flake /etc/nixos#nasty
+#
+# NASty imports custom.nix only. This example file is never imported, and
+# NASty does not overwrite either file during updates.
+
+{ pkgs, lib, ... }:
+
+{
+  # Add packages from the pinned NASty Nixpkgs revision.
+  # environment.systemPackages = with pkgs; [
+  #   dysk
+  # ];
+
+  # Override an option set by NASty. mkForce is required when the existing
+  # definition has the same priority. This example disables .local discovery.
+  # services.avahi.enable = lib.mkForce false;
+}

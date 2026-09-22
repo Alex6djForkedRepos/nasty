@@ -65,6 +65,7 @@ All dependencies use licenses compatible with GPL-3.0.
 
 | Package | License |
 |---|---|
+| 7-Zip | LGPL-2.1-or-later; BSD-3-Clause |
 | avahi | LGPL-2.1-or-later |
 | bcachefs-tools | GPL-2.0 |
 | btop | Apache-2.0 |
@@ -82,6 +83,7 @@ All dependencies use licenses compatible with GPL-3.0.
 | jq | MIT |
 | lm-sensors | GPL-2.0 |
 | lsof | Zlib |
+| ncdu maintenance fork | MIT |
 | nfs-utils | GPL-2.0 |
 | netwatch | MIT; bundled FoxIO JA4 mapping data is BSD-3-Clause |
 | nvme-cli | GPL-2.0 |

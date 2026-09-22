@@ -30,7 +30,7 @@ Traditional NAS distros (FreeNAS/TrueNAS, OpenMediaVault) use FreeBSD or Debian 
 
 ## Can I add my own NixOS configuration?
 
-Yes. Advanced users can drop settings the WebUI doesn't expose into `/etc/nixos/custom.nix` — extra NixOS options, packages, systemd units, whatever. NASty imports it automatically when present, and never writes or overwrites it: only the generated `flake.nix` is re-rendered on upgrade, so your `custom.nix` survives reboots *and* upgrades. Use `lib.mkForce` where you need to override a value a NASty module already sets; import order alone does not override equal-priority NixOS definitions. Apply changes with `nixos-rebuild switch --flake /etc/nixos#nasty`. A syntax or build error fails the rebuild safely — the running generation keeps working — so just fix it and rebuild.
+Yes. Start with `cp /etc/nixos/custom.nix.example /etc/nixos/custom.nix`, then add settings the WebUI doesn't expose — extra NixOS options, packages, systemd units, whatever. NASty imports `custom.nix` automatically when present and never writes or overwrites it, so it survives reboots and upgrades. Use `lib.mkForce` where you need to override a value a NASty module already sets; import order alone does not override equal-priority NixOS definitions. Apply changes with `nixos-rebuild switch --flake /etc/nixos#nasty`. A syntax or build error fails the rebuild safely — the running generation keeps working — so just fix it and rebuild.
 
 ## Is this production-ready?
 
