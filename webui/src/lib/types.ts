@@ -599,6 +599,8 @@ export interface BlockDevice {
 	dev_type: string;
 	mount_point: string | null;
 	fs_type: string | null;
+	partition_table_type: string | null;
+	parent_path: string | null;
 	/** Filesystem UUID from lsblk — for bcachefs members this is the
 	 * *external* (whole-pool) UUID, matchable against `Filesystem.uuid`
 	 * to tell an offline/former member from a foreign disk (#472). */
@@ -624,6 +626,14 @@ export interface BlockDevice {
 	/** "detected" (from lsblk/sysfs) | "manual" (operator override). */
 	type_source: string;
 	io_scheduler: DeviceIoScheduler | null;
+}
+
+export interface DiskPreparation {
+	path: string;
+	identity: Record<string, unknown>;
+	partition_table_type: string | null;
+	fs_type: string | null;
+	children: [string, Record<string, unknown>, string | null][];
 }
 
 export type TieringProfileId = 'single' | 'write_cache' | 'full_tiering' | 'none' | 'manual';

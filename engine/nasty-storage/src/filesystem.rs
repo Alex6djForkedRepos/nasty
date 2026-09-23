@@ -404,6 +404,10 @@ pub struct CreateFilesystemRequest {
     pub name: String,
     /// Devices to include in the filesystem.
     pub devices: Vec<DeviceSpec>,
+    /// Explicitly confirmed whole disks to prepare. Each snapshot must still
+    /// match the live disk and all its children when the operation starts.
+    #[serde(default)]
+    pub prepare_disks: Vec<DiskPreparation>,
     /// Number of data replicas (default 1).
     #[serde(default = "default_replicas")]
     pub replicas: u32,
@@ -1054,8 +1058,8 @@ async fn detach_filesystem_loop_devices(mount_point: &str) -> Result<(), Filesys
 
 const MIN_CREATE_FREE_BYTES: u64 = 1_073_741_824;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BlockIdentity {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BlockIdentity {
     devno: String,
     size_bytes: u64,
     dev_type: String,
@@ -1066,7 +1070,30 @@ struct BlockIdentity {
     partition_uuid: Option<String>,
     partition_table_uuid: Option<String>,
     disk_sequence: Option<u64>,
+    serial: Option<String>,
+    wwn: Option<String>,
     logical_sector_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DiskPreparation {
+    pub path: String,
+    pub identity: BlockIdentity,
+    pub partition_table_type: Option<String>,
+    pub fs_type: Option<String>,
+    pub children: Vec<(String, BlockIdentity, Option<String>)>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeviceWipeRequest {
+    pub path: String,
+    /// Required for whole disks; obtained from `device.prepare.inspect`.
+    pub expected: Option<DiskPreparation>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DiskInspectRequest {
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1116,11 +1143,119 @@ impl BlockInventory {
     }
 }
 
+fn disk_preparation_snapshot(
+    inventory: &BlockInventory,
+    disk: &PreflightBlockDevice,
+) -> Result<DiskPreparation, FilesystemError> {
+    if disk.identity.dev_type != "disk" {
+        return Err(FilesystemError::InvalidInput(format!(
+            "{} is not a whole disk",
+            disk.path
+        )));
+    }
+    let mut children: Vec<_> = inventory
+        .descendants(disk)
+        .into_iter()
+        .map(|child| {
+            (
+                child.path.clone(),
+                child.identity.clone(),
+                child.fs_type.clone(),
+            )
+        })
+        .collect();
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(DiskPreparation {
+        path: disk.path.clone(),
+        identity: disk.identity.clone(),
+        partition_table_type: disk.partition_table_type.clone(),
+        fs_type: disk.fs_type.clone(),
+        children,
+    })
+}
+
+fn checked_preparation<'a>(
+    inventory: &'a BlockInventory,
+    expected: &DiskPreparation,
+) -> Result<&'a PreflightBlockDevice, FilesystemError> {
+    let path = canonical_block_path(&expected.path)?;
+    let disk = inventory
+        .get_path(&path)
+        .ok_or_else(|| FilesystemError::DeviceNotFound(expected.path.clone()))?;
+    if !preparation_matches(inventory, disk, expected)? {
+        return Err(FilesystemError::InvalidInput(format!(
+            "{} or its partitions changed since confirmation; refresh and try again",
+            expected.path
+        )));
+    }
+    Ok(disk)
+}
+
+fn preparation_matches(
+    inventory: &BlockInventory,
+    disk: &PreflightBlockDevice,
+    expected: &DiskPreparation,
+) -> Result<bool, FilesystemError> {
+    Ok(disk_preparation_snapshot(inventory, disk)? == *expected)
+}
+
+fn validate_preparation_usage(
+    inventory: &BlockInventory,
+    disk: &PreflightBlockDevice,
+    swaps: &HashSet<String>,
+    registered: &HashSet<String>,
+) -> Result<(), FilesystemError> {
+    if let Some(reason) = node_usage_error(inventory, disk, swaps, true, false) {
+        return Err(FilesystemError::DeviceInUse(format!(
+            "{} ({reason})",
+            disk.path
+        )));
+    }
+    for node in std::iter::once(disk).chain(inventory.descendants(disk)) {
+        if node.identity.dev_type != "disk" && node.identity.dev_type != "part" {
+            return Err(FilesystemError::DeviceInUse(format!(
+                "{} has a non-partition child {}",
+                disk.path, node.path
+            )));
+        }
+        if registered.contains(&node.path) {
+            return Err(FilesystemError::DeviceInUse(format!(
+                "{} is referenced by a registered filesystem",
+                node.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn report_preparation_failure(
+    error: FilesystemError,
+    confirmed: &[String],
+    started: &[String],
+    prepared: &[String],
+) -> FilesystemError {
+    if started.is_empty() {
+        return error;
+    }
+    let incomplete: Vec<_> = started
+        .iter()
+        .filter(|path| !prepared.contains(path))
+        .collect();
+    let unprocessed: Vec<_> = confirmed
+        .iter()
+        .filter(|path| !started.contains(path))
+        .collect();
+    FilesystemError::CommandFailed(format!(
+        "{error}; prepared disks: {prepared:?}; preparation may be partial on: {incomplete:?}; not processed: {unprocessed:?}. Inspect all selected disks before retrying"
+    ))
+}
+
 #[derive(Debug, Clone)]
 enum CreateTargetPlan {
     Existing {
         spec: DeviceSpec,
         identity: BlockIdentity,
+        prepare: Option<Box<DiskPreparation>>,
     },
     FreeSpace {
         spec: DeviceSpec,
@@ -1231,6 +1366,8 @@ fn parse_lsblk_inventory(output: &str) -> Result<BlockInventory, FilesystemError
                 partition_uuid: json_string(value, "partuuid"),
                 partition_table_uuid: json_string(value, "ptuuid"),
                 disk_sequence: json_u64(value, "disk-seq"),
+                serial: json_string(value, "serial"),
+                wwn: json_string(value, "wwn"),
                 logical_sector_bytes: json_u64(value, "log-sec").unwrap_or(512),
             };
 
@@ -1296,7 +1433,7 @@ async fn read_block_inventory() -> Result<BlockInventory, FilesystemError> {
             "--bytes",
             "--paths",
             "--output",
-            "NAME,KNAME,PATH,MAJ:MIN,SIZE,TYPE,PKNAME,FSTYPE,PTTYPE,PTUUID,PARTUUID,PARTN,START,RO,MOUNTPOINTS,LOG-SEC,DISK-SEQ",
+            "NAME,KNAME,PATH,MAJ:MIN,SIZE,TYPE,PKNAME,FSTYPE,PTTYPE,PTUUID,PARTUUID,PARTN,START,RO,MOUNTPOINTS,LOG-SEC,DISK-SEQ,SERIAL,WWN",
         ],
     )
     .await
@@ -1712,6 +1849,7 @@ fn target_containing_disk<'a>(
 
 async fn build_create_plan(
     req: CreateFilesystemRequest,
+    registered: &HashSet<String>,
 ) -> Result<CreateFilesystemPlan, FilesystemError> {
     validate_create_request(&req)?;
     if req.bind_to_tpm == Some(true) {
@@ -1736,6 +1874,18 @@ async fn build_create_plan(
 
     let inventory = read_block_inventory().await?;
     let swaps = read_active_swaps(&inventory).await?;
+    let mut confirmations = HashMap::new();
+    for expected in &req.prepare_disks {
+        if confirmations
+            .insert(expected.path.clone(), expected)
+            .is_some()
+        {
+            return Err(FilesystemError::InvalidInput(format!(
+                "{} was confirmed more than once",
+                expected.path
+            )));
+        }
+    }
     let mut resolved = Vec::with_capacity(req.devices.len());
     for spec in &req.devices {
         let (raw_path, free) = match spec.path.strip_suffix(":free") {
@@ -1746,8 +1896,18 @@ async fn build_create_plan(
         let node = inventory
             .get_path(&path)
             .ok_or_else(|| FilesystemError::DeviceNotFound(spec.path.clone()))?;
+        let prepare = confirmations.remove(&path);
         if free {
+            if prepare.is_some() {
+                return Err(FilesystemError::InvalidInput(format!(
+                    "{}:free cannot be erased as a whole disk",
+                    path
+                )));
+            }
             validate_free_space_parent(&inventory, node, &swaps)?;
+        } else if let Some(expected) = prepare {
+            checked_preparation(&inventory, expected)?;
+            validate_preparation_usage(&inventory, node, &swaps, registered)?;
         } else {
             validate_existing_create_target(&inventory, node, &swaps)?;
             if has_block_signatures(&node.path).await? {
@@ -1757,11 +1917,16 @@ async fn build_create_plan(
                 )));
             }
         }
-        resolved.push((spec.clone(), free, node));
+        resolved.push((spec.clone(), free, node, prepare.cloned()));
+    }
+    if let Some(path) = confirmations.keys().next() {
+        return Err(FilesystemError::InvalidInput(format!(
+            "{path} was confirmed for erasure but not selected as a whole disk"
+        )));
     }
 
     let mut selected_devnos = HashSet::new();
-    for (_, free, node) in &resolved {
+    for (_, free, node, _) in &resolved {
         if !selected_devnos.insert(node.identity.devno.clone()) {
             return Err(FilesystemError::InvalidInput(format!(
                 "{} is selected more than once, possibly through aliases",
@@ -1774,7 +1939,7 @@ async fn build_create_plan(
                 node.path
             )));
         };
-        for (_, other_free, other) in &resolved {
+        for (_, other_free, other, _) in &resolved {
             if node.identity.devno == other.identity.devno {
                 continue;
             }
@@ -1791,7 +1956,7 @@ async fn build_create_plan(
     }
 
     let mut targets = Vec::with_capacity(resolved.len());
-    for (spec, free, node) in resolved {
+    for (spec, free, node, prepare) in resolved {
         if free {
             let (partition_number, start_sector, end_sector, path) =
                 plan_free_partition(node).await?;
@@ -1807,6 +1972,7 @@ async fn build_create_plan(
             targets.push(CreateTargetPlan::Existing {
                 spec,
                 identity: node.identity.clone(),
+                prepare: prepare.map(Box::new),
             });
         }
     }
@@ -1907,7 +2073,9 @@ async fn revalidate_create_sources(plan: &CreateFilesystemPlan) -> Result<(), Fi
     let swaps = read_active_swaps(&inventory).await?;
     for target in &plan.targets {
         match target {
-            CreateTargetPlan::Existing { identity, .. } => {
+            CreateTargetPlan::Existing {
+                identity, prepare, ..
+            } => {
                 let current = inventory.get_identity(identity);
                 identity_changed(
                     identity,
@@ -1915,12 +2083,25 @@ async fn revalidate_create_sources(plan: &CreateFilesystemPlan) -> Result<(), Fi
                     current.map(|n| n.path.as_str()).unwrap_or(&identity.devno),
                 )?;
                 let current = current.expect("identity_changed checked presence");
-                validate_existing_create_target(&inventory, current, &swaps)?;
-                if has_block_signatures(&current.path).await? {
-                    return Err(FilesystemError::DeviceInUse(format!(
-                        "{} (a signature appeared after preflight)",
-                        current.path
-                    )));
+                if let Some(expected) = prepare {
+                    checked_preparation(&inventory, expected)?;
+                    // Registered members are checked again by the caller
+                    // immediately before any wipe.
+                    if let Some(reason) = node_usage_error(&inventory, current, &swaps, true, false)
+                    {
+                        return Err(FilesystemError::DeviceInUse(format!(
+                            "{} ({reason})",
+                            current.path
+                        )));
+                    }
+                } else {
+                    validate_existing_create_target(&inventory, current, &swaps)?;
+                    if has_block_signatures(&current.path).await? {
+                        return Err(FilesystemError::DeviceInUse(format!(
+                            "{} (a signature appeared after preflight)",
+                            current.path
+                        )));
+                    }
                 }
             }
             CreateTargetPlan::FreeSpace { parent, .. } => {
@@ -1984,7 +2165,7 @@ async fn execute_partition_plan(
 
     for target in &plan.targets {
         match target {
-            CreateTargetPlan::Existing { spec, identity } => {
+            CreateTargetPlan::Existing { spec, identity, .. } => {
                 let mut resolved = spec.clone();
                 let inventory = read_block_inventory().await?;
                 let node = inventory.get_identity(identity).ok_or_else(|| {
@@ -2702,13 +2883,64 @@ impl FilesystemService {
         req: CreateFilesystemRequest,
     ) -> Result<Filesystem, FilesystemError> {
         let _mutation_guard = self.block_mutations.lock().await;
-        let plan = build_create_plan(req).await?;
+        let confirmed: Vec<String> = req
+            .prepare_disks
+            .iter()
+            .map(|disk| disk.path.clone())
+            .collect();
+        let mut preparation_started = Vec::new();
+        let mut prepared = Vec::new();
+        let result = self
+            .create_locked(req, &mut preparation_started, &mut prepared)
+            .await;
+        result.map_err(|error| {
+            report_preparation_failure(error, &confirmed, &preparation_started, &prepared)
+        })
+    }
+
+    async fn create_locked(
+        &self,
+        request: CreateFilesystemRequest,
+        preparation_started: &mut Vec<String>,
+        prepared: &mut Vec<String>,
+    ) -> Result<Filesystem, FilesystemError> {
+        let registered = self.registered_block_paths().await?;
+        let mut plan = build_create_plan(request, &registered).await?;
         let mut req = plan.request.clone();
         if load_fs_state().await.contains_key(&req.name) {
             return Err(FilesystemError::AlreadyExists(req.name.clone()));
         }
         let mount_point = plan.mount_point.clone();
         reserve_create_mount_point(&plan).await?;
+        // Verify every selected device before the first irreversible write.
+        if let Err(error) = revalidate_create_sources(&plan).await {
+            let _ = tokio::fs::remove_dir(&mount_point).await;
+            return Err(error);
+        }
+        for target in &mut plan.targets {
+            let expected = match target {
+                CreateTargetPlan::Existing { prepare, .. } => prepare.clone(),
+                CreateTargetPlan::FreeSpace { .. } => None,
+            };
+            let Some(expected) = expected else { continue };
+            preparation_started.push(expected.path.clone());
+            if let Err(error) = self.prepare_whole_disk(&expected).await {
+                let _ = tokio::fs::remove_dir(&mount_point).await;
+                return Err(error);
+            }
+            prepared.push(expected.path.clone());
+            let inventory = read_block_inventory().await?;
+            let node = inventory
+                .get_path(&expected.path)
+                .ok_or_else(|| FilesystemError::DeviceNotFound(expected.path.clone()))?;
+            if let CreateTargetPlan::Existing {
+                identity, prepare, ..
+            } = target
+            {
+                *identity = node.identity.clone();
+                *prepare = None;
+            }
+        }
         req.devices = match execute_partition_plan(&plan).await {
             Ok(devices) => devices,
             Err(e) => {
@@ -3657,7 +3889,7 @@ impl FilesystemService {
             "lsblk",
             &[
                 "-Jbno",
-                "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,ROTA,MODEL,SERIAL,VENDOR,TRAN,UUID",
+                "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,PTTYPE,ROTA,MODEL,SERIAL,VENDOR,TRAN,UUID",
             ],
         )
         .await
@@ -3804,6 +4036,8 @@ impl FilesystemService {
                             dev_type: dev_type.to_string(),
                             mount_point: mountpoint,
                             fs_type: fstype,
+                            partition_table_type: pick("pttype"),
+                            parent_path: parent_disk.map(|name| format!("/dev/{name}")),
                             fs_uuid,
                             in_use: in_fs || actually_mounted,
                             rotational,
@@ -3950,6 +4184,8 @@ impl FilesystemService {
                             dev_type: "free".to_string(),
                             mount_point: None,
                             fs_type: None,
+                            partition_table_type: None,
+                            parent_path: Some(disk_path.clone()),
                             fs_uuid: None,
                             in_use: false,
                             rotational,
@@ -3978,43 +4214,174 @@ impl FilesystemService {
         Ok(devices)
     }
 
-    /// Wipe all filesystem signatures from a device.
-    /// Only allowed if the device is not currently in use by any filesystem.
-    pub async fn device_wipe(&self, path: &str) -> Result<(), FilesystemError> {
-        let _mutation_guard = self.block_mutations.lock().await;
-        let devices = self.list_devices().await?;
-        let dev = devices
+    async fn registered_block_paths(&self) -> Result<HashSet<String>, FilesystemError> {
+        // Fail closed if either persisted state or live filesystem discovery
+        // cannot be read: unmounted members still belong to their pool.
+        let mut paths: HashSet<String> = load_fs_state_strict()
+            .await?
+            .values()
+            .flat_map(|state| state.devices.iter().cloned())
+            .collect();
+        paths.extend(
+            self.list()
+                .await?
+                .into_iter()
+                .flat_map(|fs| fs.devices.into_iter().map(|device| device.path)),
+        );
+        Ok(paths
+            .into_iter()
+            .map(|path| canonical_block_path(&path).unwrap_or(path))
+            .collect())
+    }
+
+    pub async fn inspect_disks(
+        &self,
+        paths: &[String],
+    ) -> Result<Vec<DiskPreparation>, FilesystemError> {
+        let inventory = read_block_inventory().await?;
+        let swaps = read_active_swaps(&inventory).await?;
+        let registered = self.registered_block_paths().await?;
+        paths
             .iter()
-            .find(|d| d.path == path)
-            .ok_or_else(|| FilesystemError::CommandFailed(format!("device not found: {path}")))?;
-        if dev.in_use {
-            return Err(FilesystemError::CommandFailed(format!(
-                "device {path} is currently in use"
+            .map(|path| {
+                let path = canonical_block_path(path)?;
+                let disk = inventory
+                    .get_path(&path)
+                    .ok_or_else(|| FilesystemError::DeviceNotFound(path.clone()))?;
+                validate_preparation_usage(&inventory, disk, &swaps, &registered)?;
+                disk_preparation_snapshot(&inventory, disk)
+            })
+            .collect()
+    }
+
+    async fn prepare_whole_disk(&self, expected: &DiskPreparation) -> Result<(), FilesystemError> {
+        let inventory = read_block_inventory().await?;
+        let swaps = read_active_swaps(&inventory).await?;
+        let registered = self.registered_block_paths().await?;
+        let disk = checked_preparation(&inventory, expected)?;
+        validate_preparation_usage(&inventory, disk, &swaps, &registered)?;
+        info!(
+            "Preparing whole disk {} ({} child devices)",
+            expected.path,
+            expected.children.len()
+        );
+
+        // Clear signatures on the partitions *before* removing their table:
+        // otherwise old superblocks resurface if the disk is repartitioned.
+        for (path, identity, fs_type) in &expected.children {
+            let current = read_block_inventory().await?;
+            let swaps = read_active_swaps(&current).await?;
+            let registered = self.registered_block_paths().await?;
+            let parent = current.get_path(&expected.path);
+            identity_changed(&expected.identity, parent, &expected.path)?;
+            validate_preparation_usage(&current, parent.unwrap(), &swaps, &registered)?;
+            identity_changed(identity, current.get_path(path), path)?;
+            if current
+                .get_path(path)
+                .and_then(|node| node.fs_type.as_ref())
+                != fs_type.as_ref()
+            {
+                return Err(FilesystemError::InvalidInput(format!(
+                    "{path} signature changed since confirmation; refusing to erase it"
+                )));
+            }
+            cmd::run_ok("wipefs", &["--all", "--force", path])
+                .await
+                .map_err(FilesystemError::CommandFailed)?;
+        }
+        let current = read_block_inventory().await?;
+        let swaps = read_active_swaps(&current).await?;
+        let registered = self.registered_block_paths().await?;
+        let parent = current.get_path(&expected.path);
+        identity_changed(&expected.identity, parent, &expected.path)?;
+        validate_preparation_usage(&current, parent.unwrap(), &swaps, &registered)?;
+        if parent.and_then(|node| node.fs_type.as_ref()) != expected.fs_type.as_ref() {
+            return Err(FilesystemError::InvalidInput(format!(
+                "{} signature changed since confirmation; refusing to erase it",
+                expected.path
             )));
         }
-        info!("Wiping device {path}");
-        cmd::run_ok("wipefs", &["-a", path])
+        cmd::run_ok("wipefs", &["--all", "--force", &expected.path])
             .await
             .map_err(FilesystemError::CommandFailed)?;
-        if dev.dev_type == "disk" {
-            // wipefs erases the signatures libblkid probes for (primary
-            // GPT, protective MBR, filesystem superblocks) but NOT the
-            // backup GPT at the end of the disk. Leaving it behind makes
-            // every GPT-aware tool from then on lecture about "invalid
-            // main header, valid backup — you should repair the disk!"
-            // (#488). Zap both tables explicitly; best-effort because
-            // sgdisk exits non-zero while cleaning up exactly the
-            // half-wiped state we're fixing.
-            if let Err(e) = cmd::run_ok("sgdisk", &["--zap-all", path]).await {
-                debug!("sgdisk --zap-all {path}: {e} (expected on a half-wiped GPT)");
+        // Zap the backup GPT too; sgdisk can exit nonzero for an already
+        // damaged table, so the postcondition below is authoritative.
+        if let Err(error) = cmd::run_ok("sgdisk", &["--zap-all", &expected.path]).await {
+            debug!("sgdisk --zap-all {}: {error}", expected.path);
+        }
+        cmd::run_ok("partprobe", &[&expected.path])
+            .await
+            .map_err(FilesystemError::CommandFailed)?;
+        let _ = cmd::run_ok("udevadm", &["settle"]).await;
+        for _ in 0..10 {
+            let current = read_block_inventory().await?;
+            if let Some(disk) = current.get_path(&expected.path)
+                && disk.identity.devno == expected.identity.devno
+                && disk.identity.disk_sequence == expected.identity.disk_sequence
+                && disk.identity.size_bytes == expected.identity.size_bytes
+                && disk.identity.serial == expected.identity.serial
+                && disk.identity.wwn == expected.identity.wwn
+                && disk.children.is_empty()
+                && disk.partition_table_type.is_none()
+                && !has_block_signatures(&disk.path).await?
+            {
+                self.invalidate_list_cache().await;
+                info!("Whole disk {} prepared", expected.path);
+                return Ok(());
             }
-            // Drop stale kernel partition nodes from the pre-wipe table
-            // so the device list (and the free-space scan) stop seeing
-            // partitions that no longer exist on disk.
-            let _ = cmd::run_ok("partprobe", &[path]).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         self.invalidate_list_cache().await;
-        Ok(())
+        Err(FilesystemError::CommandFailed(format!(
+            "{} was wiped but partitions or signatures remain visible; inspect the device before retrying",
+            expected.path
+        )))
+    }
+
+    /// Clear a partition's signatures, or prepare a confirmed whole disk.
+    pub async fn device_wipe(&self, request: DeviceWipeRequest) -> Result<(), FilesystemError> {
+        let _mutation_guard = self.block_mutations.lock().await;
+        let path = canonical_block_path(&request.path)?;
+        let inventory = read_block_inventory().await?;
+        let node = inventory
+            .get_path(&path)
+            .ok_or_else(|| FilesystemError::DeviceNotFound(path.clone()))?;
+        if node.identity.dev_type == "disk" {
+            let expected = request.expected.as_ref().ok_or_else(|| {
+                FilesystemError::InvalidInput("whole-disk wipe requires a fresh inspection".into())
+            })?;
+            if expected.path != path {
+                return Err(FilesystemError::InvalidInput(
+                    "confirmed disk path differs".into(),
+                ));
+            }
+            self.prepare_whole_disk(expected).await.map_err(|error| {
+                FilesystemError::CommandFailed(format!(
+                    "{error}; if preparation started, {} may be partly erased. Refresh the device list before retrying",
+                    expected.path
+                ))
+            })
+        } else if node.identity.dev_type == "part" {
+            let identity = node.identity.clone();
+            let swaps = read_active_swaps(&inventory).await?;
+            let registered = self.registered_block_paths().await?;
+            validate_preparation_usage(&inventory, node, &swaps, &registered)?;
+            let current = read_block_inventory().await?;
+            let swaps = read_active_swaps(&current).await?;
+            let registered = self.registered_block_paths().await?;
+            let node = current.get_path(&path);
+            identity_changed(&identity, node, &path)?;
+            validate_preparation_usage(&current, node.unwrap(), &swaps, &registered)?;
+            cmd::run_ok("wipefs", &["--all", "--force", &path])
+                .await
+                .map_err(FilesystemError::CommandFailed)?;
+            self.invalidate_list_cache().await;
+            Ok(())
+        } else {
+            Err(FilesystemError::InvalidInput(format!(
+                "{path} is not a disk or partition"
+            )))
+        }
     }
 
     /// Add a device to an existing mounted filesystem.
@@ -5506,6 +5873,12 @@ pub struct BlockDevice {
     pub mount_point: Option<String>,
     /// Filesystem type detected on the device (e.g. `bcachefs`, `ext4`).
     pub fs_type: Option<String>,
+    /// Partition table on whole disks, even if no filesystem signature is present.
+    #[serde(default)]
+    pub partition_table_type: Option<String>,
+    /// Parent whole disk for partition and free-space rows.
+    #[serde(default)]
+    pub parent_path: Option<String>,
     /// Filesystem UUID from lsblk — for bcachefs members this is the
     /// *external* (whole-filesystem) UUID, so a candidate disk can be
     /// matched against an existing pool's `Filesystem.uuid` to tell an
@@ -7997,6 +8370,7 @@ mod tests {
                     durability: None,
                 })
                 .collect(),
+            prepare_disks: vec![],
             replicas: 1,
             compression: None,
             encryption: None,
@@ -8384,6 +8758,79 @@ mod tests {
             validate_free_space_parent(&inventory, disk, &HashSet::new()).is_ok(),
             "an exact unallocated extent may coexist with mounted sibling partitions"
         );
+    }
+
+    #[test]
+    fn whole_disk_preparation_checks_descendants_and_snapshot_identity() {
+        let mut inventory = create_inventory_fixture();
+        for node in inventory.devices.values_mut() {
+            node.mount_points.clear();
+        }
+        let disk = inventory.get_path("/dev/sda").unwrap();
+        // Normal create must not erase a partitioned disk implicitly.
+        assert!(validate_existing_create_target(&inventory, disk, &HashSet::new()).is_err());
+        validate_preparation_usage(&inventory, disk, &HashSet::new(), &HashSet::new()).unwrap();
+        let snapshot = disk_preparation_snapshot(&inventory, disk).unwrap();
+        assert_eq!(snapshot.children.len(), 3);
+        assert!(preparation_matches(&inventory, disk, &snapshot).unwrap());
+        assert!(
+            disk_preparation_snapshot(&inventory, inventory.get_path("/dev/sda3").unwrap())
+                .is_err()
+        );
+
+        let child = inventory
+            .get_path("/dev/sda3")
+            .unwrap()
+            .identity
+            .devno
+            .clone();
+        inventory.devices.get_mut(&child).unwrap().fs_type = Some("ext4".into());
+        assert!(
+            !preparation_matches(
+                &inventory,
+                inventory.get_path("/dev/sda").unwrap(),
+                &snapshot
+            )
+            .unwrap()
+        );
+
+        let disk = inventory.get_path("/dev/sda").unwrap();
+        assert!(
+            validate_preparation_usage(
+                &inventory,
+                disk,
+                &HashSet::from([child.clone()]),
+                &HashSet::new()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("active swap")
+        );
+        assert!(
+            validate_preparation_usage(
+                &inventory,
+                disk,
+                &HashSet::new(),
+                &HashSet::from(["/dev/sda3".into()])
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("registered filesystem")
+        );
+    }
+
+    #[test]
+    fn preparation_failure_reports_completed_partial_and_unprocessed_disks() {
+        let error = report_preparation_failure(
+            FilesystemError::CommandFailed("partprobe failed".into()),
+            &["/dev/sdb".into(), "/dev/sdc".into(), "/dev/sdd".into()],
+            &["/dev/sdb".into(), "/dev/sdc".into()],
+            &["/dev/sdb".into()],
+        )
+        .to_string();
+        assert!(error.contains("prepared disks: [\"/dev/sdb\"]"));
+        assert!(error.contains("partial on: [\"/dev/sdc\"]"));
+        assert!(error.contains("not processed: [\"/dev/sdd\"]"));
     }
 
     #[test]

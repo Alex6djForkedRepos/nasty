@@ -55,7 +55,11 @@ fn filesystem_param(method: &str) -> Option<&'static str> {
 fn requires_root_equivalent(method: &str) -> bool {
     matches!(
         method,
-        "fs.create" | "device.wipe" | "device.set_type" | "device.set_io_scheduler"
+        "fs.create"
+            | "device.wipe"
+            | "device.prepare.inspect"
+            | "device.set_type"
+            | "device.set_io_scheduler"
     )
 }
 
@@ -366,6 +370,15 @@ pub(super) async fn try_route(
             Ok(v) => ok(req, v),
             Err(e) => err(req, e),
         },
+        "device.prepare.inspect" => {
+            match parse_params::<nasty_storage::filesystem::DiskInspectRequest>(req) {
+                Ok(params) => match state.filesystems.inspect_disks(&params.paths).await {
+                    Ok(disks) => ok(req, disks),
+                    Err(error) => err(req, error),
+                },
+                Err(error) => invalid(req, error),
+            }
+        }
         "device.set_type" => match parse_params::<nasty_storage::disk_type::DiskTypeUpdate>(req) {
             Ok(u) => match nasty_storage::disk_type::set(u).await {
                 Ok(key) => ok(req, serde_json::json!({ "stable_id": key })),
@@ -382,18 +395,11 @@ pub(super) async fn try_route(
                 Err(error) => invalid(req, error),
             }
         }
-        "device.wipe" => match parse_params::<serde_json::Value>(req) {
-            Ok(p) => {
-                let path = p
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                match state.filesystems.device_wipe(&path).await {
-                    Ok(()) => ok(req, "ok"),
-                    Err(e) => err(req, e),
-                }
-            }
+        "device.wipe" => match parse_params::<nasty_storage::filesystem::DeviceWipeRequest>(req) {
+            Ok(request) => match state.filesystems.device_wipe(request).await {
+                Ok(()) => ok(req, "ok"),
+                Err(e) => err(req, e),
+            },
             Err(e) => invalid(req, e),
         },
         "fs.options.update" => match parse_params(req) {
@@ -757,6 +763,7 @@ mod tests {
         for method in [
             "fs.create",
             "device.wipe",
+            "device.prepare.inspect",
             "device.set_type",
             "device.set_io_scheduler",
         ] {
