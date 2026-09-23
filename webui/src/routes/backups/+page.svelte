@@ -58,7 +58,7 @@
 	let newS3Endpoint = $state(''); let newS3Region = $state(''); let newS3Bucket = $state(''); let newS3Key = $state(''); let newS3Secret = $state('');
 	let newSftpHost = $state(''); let newSftpUser = $state(''); let newSftpPath = $state(''); let newSftpPort = $state('');
 	let newRestUrl = $state(''); let newRestUser = $state(''); let newRestPassword = $state('');
-	let newB2Bucket = $state(''); let newB2Id = $state(''); let newB2Key = $state('');
+	let newB2Bucket = $state(''); let newB2BucketId = $state(''); let newB2Id = $state(''); let newB2Key = $state('');
 	/** PEM CA cert text the operator wants this profile to trust on top
 	 * of the system roots. Shown only for network targets — the local
 	 * backend doesn't speak TLS, so the field is irrelevant there. */
@@ -107,6 +107,7 @@
 		newRestUser = '';
 		newRestPassword = '';
 		newB2Bucket = '';
+		newB2BucketId = '';
 		newB2Id = '';
 		newB2Key = '';
 		newTrustedCacert = '';
@@ -232,7 +233,7 @@
 	let editS3Endpoint = $state(''); let editS3Region = $state(''); let editS3Bucket = $state(''); let editS3Key = $state(''); let editS3Secret = $state('');
 	let editSftpHost = $state(''); let editSftpUser = $state(''); let editSftpPath = $state(''); let editSftpPort = $state('');
 	let editRestUrl = $state(''); let editRestUser = $state(''); let editRestPassword = $state('');
-	let editB2Bucket = $state(''); let editB2Id = $state(''); let editB2Key = $state('');
+	let editB2Bucket = $state(''); let editB2BucketId = $state(''); let editB2Id = $state(''); let editB2Key = $state('');
 	let editTrustedCacert = $state('');
 	/** Snapshot of the target shape at startEdit time, used to detect
 	 * "operator changed the destination" so we can warn + reset
@@ -271,7 +272,7 @@
 		editS3Endpoint = ''; editS3Region = ''; editS3Bucket = ''; editS3Key = ''; editS3Secret = '';
 		editSftpHost = ''; editSftpUser = ''; editSftpPath = ''; editSftpPort = '';
 		editRestUrl = ''; editRestUser = ''; editRestPassword = '';
-		editB2Bucket = ''; editB2Id = ''; editB2Key = '';
+		editB2Bucket = ''; editB2BucketId = ''; editB2Id = ''; editB2Key = '';
 		// Round-trip the existing CA cert PEM (engine sends it back
 		// in cleartext — it's a public certificate, not a secret).
 		editTrustedCacert = p.trusted_cacert ?? '';
@@ -297,6 +298,7 @@
 				break;
 			case 'b2':
 				editB2Bucket = p.target.bucket;
+				editB2BucketId = p.target.bucket_id ?? '';
 				editB2Id = p.target.account_id;
 				break;
 		}
@@ -353,6 +355,7 @@
 				const t: BackupProfile['target'] = {
 					type: 'b2',
 					bucket: editB2Bucket,
+					bucket_id: editB2BucketId,
 					account_id: editB2Id,
 				} as BackupProfile['target'];
 				if (editB2Key) (t as { account_key: string }).account_key = editB2Key;
@@ -677,7 +680,7 @@
 			: newTargetType === 's3' ? { type: 's3' as const, endpoint: newS3Endpoint, region: newS3Region || undefined, bucket: newS3Bucket, access_key: newS3Key, secret_key: newS3Secret }
 			: newTargetType === 'sftp' ? { type: 'sftp' as const, host: newSftpHost, user: newSftpUser, path: newSftpPath, port: parseInt(newSftpPort) || undefined }
 			: newTargetType === 'rest' ? { type: 'rest' as const, url: newRestUrl, username: newRestUser || null, password: newRestPassword || null }
-			: { type: 'b2' as const, bucket: newB2Bucket, account_id: newB2Id, account_key: newB2Key };
+			: { type: 'b2' as const, bucket: newB2Bucket, bucket_id: newB2BucketId, account_id: newB2Id, account_key: newB2Key };
 
 		const profile = {
 			id: '',
@@ -1058,11 +1061,13 @@
 						<div><Label for="bk-rest-pass">Password</Label><Input id="bk-rest-pass" type="password" bind:value={newRestPassword} class="mt-1 font-mono" /></div>
 					</div>
 				{:else if newTargetType === 'b2'}
-					<div class="grid grid-cols-3 gap-3">
-						<div><Label for="bk-b2-bk">Bucket</Label><Input id="bk-b2-bk" bind:value={newB2Bucket} class="mt-1 font-mono" /></div>
-						<div><Label for="bk-b2-id">Account ID</Label><Input id="bk-b2-id" bind:value={newB2Id} class="mt-1 font-mono" /></div>
-						<div><Label for="bk-b2-key">Account Key</Label><Input id="bk-b2-key" type="password" bind:value={newB2Key} class="mt-1 font-mono" /></div>
+					<div class="grid grid-cols-2 gap-3">
+						<div><Label for="bk-b2-bk">Bucket Name</Label><Input id="bk-b2-bk" bind:value={newB2Bucket} class="mt-1 font-mono" /></div>
+						<div><Label for="bk-b2-bkid">Bucket ID</Label><Input id="bk-b2-bkid" bind:value={newB2BucketId} class="mt-1 font-mono" /></div>
+						<div><Label for="bk-b2-id">Application Key ID</Label><Input id="bk-b2-id" bind:value={newB2Id} class="mt-1 font-mono" /></div>
+						<div><Label for="bk-b2-key">Application Key</Label><Input id="bk-b2-key" type="password" bind:value={newB2Key} class="mt-1 font-mono" /></div>
 					</div>
+					<p class="text-xs text-muted-foreground">Find the bucket name and bucket ID on Backblaze's Buckets page. Use the key ID and application key from Application Keys.</p>
 				{/if}
 
 				{#if newTargetType === 'rest' || newTargetType === 's3' || newTargetType === 'b2'}
@@ -1278,14 +1283,16 @@
 										</div>
 									</div>
 								{:else if editTargetType === 'b2'}
-									<div class="grid grid-cols-3 gap-3">
-										<div><Label for="ed-b2-bk">Bucket</Label><Input id="ed-b2-bk" bind:value={editB2Bucket} class="mt-1 font-mono" /></div>
-										<div><Label for="ed-b2-id">Account ID</Label><Input id="ed-b2-id" bind:value={editB2Id} class="mt-1 font-mono" /></div>
+									<div class="grid grid-cols-2 gap-3">
+										<div><Label for="ed-b2-bk">Bucket Name</Label><Input id="ed-b2-bk" bind:value={editB2Bucket} class="mt-1 font-mono" /></div>
+										<div><Label for="ed-b2-bkid">Bucket ID</Label><Input id="ed-b2-bkid" bind:value={editB2BucketId} class="mt-1 font-mono" /></div>
+										<div><Label for="ed-b2-id">Application Key ID</Label><Input id="ed-b2-id" bind:value={editB2Id} class="mt-1 font-mono" /></div>
 										<div>
-											<Label for="ed-b2-key">Account Key</Label>
+											<Label for="ed-b2-key">Application Key</Label>
 											<Input id="ed-b2-key" type="password" bind:value={editB2Key} placeholder="Leave blank to keep existing" class="mt-1 font-mono" />
 										</div>
 									</div>
+									<p class="mt-1 text-xs text-muted-foreground">Older B2 profiles need a bucket ID. If you entered your account ID, replace it with the application key ID. Leave the application key blank to keep the saved key.</p>
 								{/if}
 
 								{#if editTargetType === 'rest' || editTargetType === 's3' || editTargetType === 'b2'}
