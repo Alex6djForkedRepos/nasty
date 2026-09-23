@@ -3862,8 +3862,17 @@ impl FilesystemService {
         Ok(())
     }
 
-    /// List block devices available for filesystem creation
+    /// List block devices available for filesystem creation.
     pub async fn list_devices(&self) -> Result<Vec<BlockDevice>, FilesystemError> {
+        self.list_devices_with_health(&[]).await
+    }
+
+    /// Merge the metrics service's cached SMART identity, without probing
+    /// every drive during each device inventory request.
+    pub async fn list_devices_with_health(
+        &self,
+        health: &[nasty_common::metrics_types::DiskHealth],
+    ) -> Result<Vec<BlockDevice>, FilesystemError> {
         // Collect all device paths already used by filesystems. If list()
         // fails (corrupt state file, permissions, …) we fall back to an
         // empty set so the caller still gets *some* answer, but we log
@@ -3901,28 +3910,14 @@ impl FilesystemService {
         let mut devices = Vec::new();
         let mut partition_parents = std::collections::HashMap::new();
         if let Some(blockdevices) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
-            fn classify(name: &str, rota: bool, transport: Option<&str>) -> (bool, String) {
-                if name.starts_with("nvme") {
-                    return (false, "nvme".to_string());
-                }
-                if name.starts_with("mmcblk") {
-                    return (false, "mmc".to_string());
-                }
-                // SAS drives report `tran == "sas"` from lsblk. Both SAS HDDs
-                // and SAS SSDs get the `sas` class so the WebUI Devices tab
-                // can badge them as the enterprise drives they are rather
-                // than disguising them as SATA hdd/ssd (issue #365). The
-                // rotational bit is still set correctly so callers that care
-                // about spinning vs solid-state get the right answer.
-                if matches!(transport, Some("sas")) {
-                    return (rota, "sas".to_string());
-                }
-                if rota {
-                    (true, "hdd".to_string())
-                } else {
-                    (false, "ssd".to_string())
-                }
-            }
+            let smart_by_path: HashMap<&str, &nasty_common::metrics_types::DiskHealth> = health
+                .iter()
+                // A megaraid endpoint may share a block path with its
+                // virtual volume; never ascribe that physical drive's
+                // identity to the controller's block device.
+                .filter(|disk| disk.transport.is_none() && disk.smart_status != "UNAVAILABLE")
+                .map(|disk| (disk.device.as_str(), disk))
+                .collect();
 
             // Read /proc/mounts to know which devices are *actually* mounted.
             // lsblk's mountpoint field can be stale after bcachefs device removal/wipe.
@@ -3951,6 +3946,7 @@ impl FilesystemService {
                 mounted_devices: &std::collections::HashSet<String>,
                 out: &mut Vec<BlockDevice>,
                 resolver: &crate::disk_type::IdentityResolver,
+                smart_by_path: &HashMap<&str, &nasty_common::metrics_types::DiskHealth>,
                 overrides: &std::collections::HashMap<String, String>,
                 scheduler_states: &std::collections::HashMap<String, IoSchedulerState>,
                 parent_disk: Option<&str>,
@@ -3971,14 +3967,11 @@ impl FilesystemService {
                         .and_then(|v| v.as_str())
                         .map(String::from);
                     let fstype = dev.get("fstype").and_then(|v| v.as_str()).map(String::from);
-                    let rota = dev
-                        .get("rota")
-                        .and_then(|v| {
-                            v.as_bool()
-                                .or_else(|| v.as_str().map(|s| s == "1"))
-                                .or_else(|| v.as_u64().map(|n| n == 1))
-                        })
-                        .unwrap_or(false);
+                    let rota = dev.get("rota").and_then(|v| {
+                        v.as_bool()
+                            .or_else(|| v.as_str().map(|s| s == "1"))
+                            .or_else(|| v.as_u64().map(|n| n == 1))
+                    });
                     // lsblk surfaces these only on whole disks; on partitions
                     // they're empty/null. Treat empty-after-trim as None so
                     // the WebUI can hide the field entirely instead of
@@ -3995,10 +3988,11 @@ impl FilesystemService {
                     let transport = pick("tran");
                     let fs_uuid = pick("uuid");
 
-                    // Transport needs to be resolved before classify so the
-                    // SAS path can use it.
-                    let (mut rotational, mut device_class) =
-                        classify(name, rota, transport.as_deref());
+                    let smart = smart_by_path
+                        .get(format!("/dev/{name}").as_str())
+                        .copied()
+                        .filter(|disk| smart_matches_disk(disk, serial.as_deref(), size));
+                    let mut classification = classify_disk(name, rota, smart, None);
 
                     if dev_type == "disk" || dev_type == "part" {
                         let path = format!("/dev/{name}");
@@ -4018,11 +4012,9 @@ impl FilesystemService {
                         if dev_type == "disk" {
                             let (key, kind) = resolver.resolve(name);
                             if let Some(class) = overrides.get(&key)
-                                && let Some((c, rota_override)) =
-                                    crate::disk_type::class_to_fields(class)
+                                && crate::disk_type::class_to_fields(class).is_some()
                             {
-                                device_class = c;
-                                rotational = rota_override;
+                                classification = classify_disk(name, rota, smart, Some(class));
                                 type_source = "manual".to_string();
                             }
                             stable_id = Some(key);
@@ -4040,8 +4032,12 @@ impl FilesystemService {
                             parent_path: parent_disk.map(|name| format!("/dev/{name}")),
                             fs_uuid,
                             in_use: in_fs || actually_mounted,
-                            rotational,
-                            device_class,
+                            rotational: classification.rotational,
+                            device_class: classification.device_class,
+                            media: classification.media,
+                            media_source: classification.media_source,
+                            native_interface: classification.native_interface,
+                            interface_source: classification.interface_source,
                             model,
                             serial,
                             vendor,
@@ -4065,6 +4061,7 @@ impl FilesystemService {
                             mounted_devices,
                             out,
                             resolver,
+                            smart_by_path,
                             overrides,
                             scheduler_states,
                             child_parent,
@@ -4099,6 +4096,7 @@ impl FilesystemService {
                 &mounted_devices,
                 &mut devices,
                 &resolver,
+                &smart_by_path,
                 &overrides,
                 &scheduler_states,
                 None,
@@ -4115,6 +4113,30 @@ impl FilesystemService {
             for device in &mut devices {
                 if device.dev_type == "disk" && in_use_parents.contains(device.path.as_str()) {
                     device.in_use = true;
+                }
+            }
+            let parent_media: HashMap<String, BlockDevice> = devices
+                .iter()
+                .filter(|device| device.dev_type == "disk")
+                .map(|disk| (disk.path.clone(), disk.clone()))
+                .collect();
+            for device in &mut devices {
+                if device.dev_type != "part" {
+                    continue;
+                }
+                if let Some(parent) = device
+                    .parent_path
+                    .as_ref()
+                    .and_then(|p| parent_media.get(p))
+                {
+                    device.rotational = parent.rotational;
+                    device.device_class.clone_from(&parent.device_class);
+                    device.media.clone_from(&parent.media);
+                    device.media_source.clone_from(&parent.media_source);
+                    device.native_interface.clone_from(&parent.native_interface);
+                    device.interface_source.clone_from(&parent.interface_source);
+                    device.transport.clone_from(&parent.transport);
+                    device.type_source.clone_from(&parent.type_source);
                 }
             }
         }
@@ -4152,6 +4174,10 @@ impl FilesystemService {
                         let (
                             rotational,
                             device_class,
+                            media,
+                            media_source,
+                            native_interface,
+                            interface_source,
                             model,
                             serial,
                             vendor,
@@ -4162,6 +4188,10 @@ impl FilesystemService {
                                 (
                                     d.rotational,
                                     d.device_class.clone(),
+                                    d.media.clone(),
+                                    d.media_source.clone(),
+                                    d.native_interface.clone(),
+                                    d.interface_source.clone(),
                                     d.model.clone(),
                                     d.serial.clone(),
                                     d.vendor.clone(),
@@ -4171,7 +4201,11 @@ impl FilesystemService {
                             })
                             .unwrap_or((
                                 false,
-                                "ssd".to_string(),
+                                "unknown".to_string(),
+                                None,
+                                "unknown".to_string(),
+                                None,
+                                "unknown".to_string(),
                                 None,
                                 None,
                                 None,
@@ -4190,6 +4224,10 @@ impl FilesystemService {
                             in_use: false,
                             rotational,
                             device_class,
+                            media,
+                            media_source,
+                            native_interface,
+                            interface_source,
                             model,
                             serial,
                             vendor,
@@ -5861,6 +5899,68 @@ fn parse_human_bytes(s: &str) -> Option<u64> {
     Some((num * multiplier) as u64)
 }
 
+struct DiskClassification {
+    rotational: bool,
+    device_class: String,
+    media: Option<String>,
+    media_source: String,
+    native_interface: Option<String>,
+    interface_source: String,
+}
+
+fn smart_matches_disk(
+    smart: &nasty_common::metrics_types::DiskHealth,
+    serial: Option<&str>,
+    size: u64,
+) -> bool {
+    (smart.capacity_bytes == 0 || smart.capacity_bytes == size)
+        && (smart.serial == "Unknown" || serial.is_none_or(|serial| serial == smart.serial))
+}
+
+fn classify_disk(
+    name: &str,
+    sysfs_rotational: Option<bool>,
+    smart: Option<&nasty_common::metrics_types::DiskHealth>,
+    media_override: Option<&str>,
+) -> DiskClassification {
+    let (native_interface, interface_source) = if let Some(interface) = smart
+        .and_then(|disk| disk.native_interface.as_deref())
+        .filter(|value| matches!(*value, "sata" | "sas" | "nvme"))
+    {
+        (Some(interface.to_string()), "smart")
+    } else if name.starts_with("nvme") {
+        (Some("nvme".to_string()), "kernel")
+    } else {
+        (None, "unknown")
+    };
+    let (media, media_source) = if let Some(value) = media_override {
+        // Legacy "nvme" overrides meant "fast". Keep them readable as
+        // SSD media without manufacturing an NVMe interface on a VM disk.
+        (Some(if value == "hdd" { "hdd" } else { "ssd" }), "manual")
+    } else if let Some(rotational) = smart.and_then(|disk| disk.rotational) {
+        (Some(if rotational { "hdd" } else { "ssd" }), "smart")
+    } else if native_interface.as_deref() == Some("nvme") {
+        (Some("ssd"), "kernel")
+    } else if let Some(rotational) = sysfs_rotational {
+        (Some(if rotational { "hdd" } else { "ssd" }), "sysfs")
+    } else {
+        (None, "unknown")
+    };
+    let device_class = match (media, native_interface.as_deref()) {
+        (Some("ssd"), Some("nvme")) => "nvme",
+        (Some(media), _) => media,
+        _ => "unknown",
+    };
+    DiskClassification {
+        rotational: media == Some("hdd"),
+        device_class: device_class.to_string(),
+        media: media.map(str::to_string),
+        media_source: media_source.to_string(),
+        native_interface,
+        interface_source: interface_source.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BlockDevice {
     /// Absolute path of the block device (e.g. `/dev/sda`).
@@ -5889,8 +5989,18 @@ pub struct BlockDevice {
     pub in_use: bool,
     /// Whether the underlying disk spins (false for NVMe/SSD, true for HDD).
     pub rotational: bool,
-    /// Device speed class: "nvme", "ssd", or "hdd".
+    /// Legacy class used by existing clients: "nvme", "ssd", "hdd", or "unknown".
     pub device_class: String,
+    /// Physical media (hdd/ssd), independent of drive interface and path.
+    #[serde(default)]
+    pub media: Option<String>,
+    #[serde(default)]
+    pub media_source: String,
+    /// Native drive interface from SMART; connection path remains `transport`.
+    #[serde(default)]
+    pub native_interface: Option<String>,
+    #[serde(default)]
+    pub interface_source: String,
     /// Drive model from lsblk (e.g. "Samsung SSD 970 EVO Plus 1TB"). None
     /// for partitions and for virtual disks that don't expose a model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5901,7 +6011,8 @@ pub struct BlockDevice {
     /// Drive vendor from lsblk (e.g. "ATA", "NVMe").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
-    /// Transport bus from lsblk (e.g. "sata", "nvme", "usb").
+    /// Connection path reported by lsblk (e.g. "sas" for a SATA drive
+    /// through a SAS shelf). Not necessarily the native drive interface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     /// Stable identity key this disk's type override is anchored to —
@@ -8338,6 +8449,73 @@ async fn verify_filesystem_device_identity(fs: &Filesystem) -> Result<(), Filesy
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn smart_identity(
+        rotational: Option<bool>,
+        interface: Option<&str>,
+    ) -> nasty_common::metrics_types::DiskHealth {
+        serde_json::from_value(serde_json::json!({
+            "device": "/dev/sdb", "model": "test", "serial": "serial", "firmware": "test",
+            "capacity_bytes": 1000, "temperature_c": null, "power_on_hours": null,
+            "health_passed": true, "smart_status": "PASSED", "rotational": rotational,
+            "native_interface": interface, "attributes": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn media_is_independent_of_sas_connection_and_native_interface() {
+        let sas_ssd = smart_identity(Some(false), Some("sas"));
+        let detected = classify_disk("sdb", Some(true), Some(&sas_ssd), None);
+        assert_eq!(detected.media.as_deref(), Some("ssd"));
+        assert_eq!(detected.native_interface.as_deref(), Some("sas"));
+        assert_eq!(detected.device_class, "ssd");
+        assert_eq!(detected.media_source, "smart");
+
+        let sata_hdd = smart_identity(Some(true), Some("sata"));
+        let detected = classify_disk("sdc", Some(false), Some(&sata_hdd), None);
+        assert_eq!(detected.media.as_deref(), Some("hdd"));
+        assert_eq!(detected.native_interface.as_deref(), Some("sata"));
+        assert!(detected.rotational);
+
+        let sas_hdd = smart_identity(Some(true), Some("sas"));
+        assert_eq!(
+            classify_disk("sdd", Some(true), Some(&sas_hdd), None)
+                .media
+                .as_deref(),
+            Some("hdd")
+        );
+        let nvme = classify_disk("nvme0n1", Some(false), None, None);
+        assert_eq!(nvme.media.as_deref(), Some("ssd"));
+        assert_eq!(nvme.native_interface.as_deref(), Some("nvme"));
+        assert_eq!(nvme.device_class, "nvme");
+    }
+
+    #[test]
+    fn missing_identity_stays_unknown_and_media_override_keeps_interface() {
+        let unknown = classify_disk("sdb", None, None, None);
+        assert_eq!(unknown.media, None);
+        assert_eq!(unknown.native_interface, None);
+        assert_eq!(unknown.device_class, "unknown");
+        let fallback = classify_disk("sdb", Some(true), None, None);
+        assert_eq!(fallback.media.as_deref(), Some("hdd"));
+        assert_eq!(fallback.media_source, "sysfs");
+        assert_eq!(fallback.native_interface, None);
+
+        let sas_ssd = smart_identity(Some(false), Some("sas"));
+        let overridden = classify_disk("sdb", Some(false), Some(&sas_ssd), Some("hdd"));
+        assert_eq!(overridden.media.as_deref(), Some("hdd"));
+        assert_eq!(overridden.media_source, "manual");
+        assert_eq!(overridden.native_interface.as_deref(), Some("sas"));
+    }
+
+    #[test]
+    fn cached_smart_identity_is_not_reused_after_a_disk_changes() {
+        let smart = smart_identity(Some(false), Some("sas"));
+        assert!(smart_matches_disk(&smart, Some("serial"), 1000));
+        assert!(!smart_matches_disk(&smart, Some("replacement"), 1000));
+        assert!(!smart_matches_disk(&smart, Some("serial"), 2000));
+    }
 
     fn unique_tmp(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};

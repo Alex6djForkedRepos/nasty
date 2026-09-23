@@ -366,10 +366,26 @@ pub(super) async fn try_route(
             },
             Err(r) => r,
         },
-        "device.list" => match state.filesystems.list_devices().await {
-            Ok(v) => ok(req, v),
-            Err(e) => err(req, e),
-        },
+        "device.list" => {
+            // SMART is a cached enhancement, not a prerequisite for the
+            // storage inventory. Keep device.list responsive if metrics is
+            // starting or unavailable.
+            let health = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fetch_metrics_json::<Vec<nasty_system::DiskHealth>>(
+                    &state.metrics_client,
+                    "/api/disks",
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+            match state.filesystems.list_devices_with_health(&health).await {
+                Ok(v) => ok(req, v),
+                Err(e) => err(req, e),
+            }
+        }
         "device.prepare.inspect" => {
             match parse_params::<nasty_storage::filesystem::DiskInspectRequest>(req) {
                 Ok(params) => match state.filesystems.inspect_disks(&params.paths).await {

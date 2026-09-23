@@ -17,6 +17,7 @@
 	import { confirmDangerous } from '$lib/confirm-dangerous.svelte';
 	import { unlockFs } from '$lib/unlock-fs.svelte';
 	import { summarizeDependents } from '$lib/fs-dependents';
+	import { diskTier, tierCapabilities } from '$lib/disk-tiers';
 	import type { Filesystem, UnavailableFilesystem, FilesystemDevice, BlockDevice, DiskPreparation, DeviceState, ScrubStatus, FsckStatus, ReconcileStatus, TieringProfile, TieringProfileId, FsDependents, TpmBindStatus, DiskHealth } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import SortTh from '$lib/components/SortTh.svelte';
@@ -504,9 +505,7 @@
 
 	function buildProfiles(): TieringProfile[] {
 		const sel = selectedDeviceObjects();
-		const hasNvme = sel.some(d => d.device_class === 'nvme');
-		const hasSsd  = sel.some(d => d.device_class === 'ssd');
-		const hasHdd  = sel.some(d => d.device_class === 'hdd' || d.device_class === 'mmc');
+		const { hasNvme, hasSsd, hasHdd } = tierCapabilities(sel);
 		const hasFast = hasNvme || hasSsd;
 		const hasSlow = hasHdd;
 		const has3Tiers = hasNvme && (hasSsd || hasHdd);
@@ -517,11 +516,11 @@
 
 		// Write-cache labels: fast = nvme/ssd → "fast", hdd → "slow"
 		const wcLabels: Record<string, string> = {};
-		sel.forEach(d => { wcLabels[d.path] = (d.device_class === 'hdd' || d.device_class === 'mmc') ? 'slow' : 'fast'; });
+		sel.forEach(d => { wcLabels[d.path] = diskTier(d) === 'hdd' ? 'slow' : diskTier(d) === 'unknown' ? 'unknown' : 'fast'; });
 
 		// Full-tier labels by device class
 		const ftLabels: Record<string, string> = {};
-		sel.forEach(d => { ftLabels[d.path] = d.device_class; });
+		sel.forEach(d => { ftLabels[d.path] = diskTier(d); });
 
 		// Full-tier targets
 		let ftFg: string | null = null;

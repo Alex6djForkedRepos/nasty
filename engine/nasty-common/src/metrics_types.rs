@@ -145,6 +145,10 @@ pub struct DiskHealth {
     /// the HDD-failure SMART-attribute alert to spinning disks (#503).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotational: Option<bool>,
+    /// Native drive interface from explicit SMART identity, not the host
+    /// connection path (a SATA drive can be reached through a SAS shelf).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_interface: Option<String>,
     /// ATA SMART attribute table (empty for NVMe and SAS drives).
     pub attributes: Vec<SmartAttribute>,
     /// NVMe SMART health information log (`Some` only on NVMe drives).

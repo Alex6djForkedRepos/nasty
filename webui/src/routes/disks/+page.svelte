@@ -138,8 +138,8 @@
 		}
 	}
 
-	// Manual disk-type override (#552): for VMs where lsblk's rotational
-	// bit is wrong. `device_class` of 'auto' clears the override.
+	// Manual media override (#552): for VMs where lsblk's rotational
+	// bit is wrong. 'auto' clears the override without changing interface.
 	async function setDiskType(dev: BlockDevice, deviceClass: string) {
 		const ok = await withToast(
 			() => client.call('device.set_type', { path: dev.path, device_class: deviceClass }),
@@ -211,9 +211,6 @@
 			case 'ssd': return 'bg-blue-950 text-blue-400';
 			case 'mmc': return 'bg-amber-950 text-amber-400';
 			case 'hdd': return 'bg-emerald-950 text-emerald-400';
-			// SAS = enterprise transport, distinct colour so it doesn't get
-			// visually conflated with consumer SATA hdd/ssd (#365).
-			case 'sas': return 'bg-rose-950 text-rose-400';
 			default: return 'bg-secondary text-muted-foreground';
 		}
 	}
@@ -358,7 +355,8 @@
 				<tr>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Device</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Size</th>
-					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Type</th>
+					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Media</th>
+					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Interface</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Scheduler</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Filesystem</th>
 					<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Status</th>
@@ -376,30 +374,37 @@
 						<td class="p-3 font-mono text-sm {dev.dev_type === 'part' ? 'pl-8' : ''}">{dev.path}</td>
 						<td class="p-3">{formatBytes(dev.size_bytes)}</td>
 						<td class="p-3">
-							<div class="flex items-center gap-2">
-								<span class="rounded px-1.5 py-0.5 text-xs font-semibold {deviceClassBadge(dev.device_class)}">
-									{dev.device_class.toUpperCase()}
-								</span>
-								{#if dev.dev_type === 'disk'}
+							{#if dev.dev_type === 'disk'}
+								<div class="flex items-center gap-2">
+									<span class="rounded px-1.5 py-0.5 text-xs font-semibold {deviceClassBadge(dev.media ?? '')}" title={`Media source: ${dev.media_source}`}>
+										{dev.media?.toUpperCase() ?? 'Unknown'}
+									</span>
 									<select
 										class="rounded border border-border bg-background px-1 py-0.5 text-xs text-foreground"
-										value={dev.type_source === 'manual' ? dev.device_class : 'auto'}
-										title="Override the detected disk type (for VMs where it's wrong)"
+										value={dev.type_source === 'manual' ? dev.media ?? 'auto' : 'auto'}
+										title="Override detected media (for VMs where it's wrong); interface is unchanged"
 										onchange={(e) => setDiskType(dev, e.currentTarget.value)}
 										disabled={schedulerPending[dev.path]}
 									>
 										<option value="auto">Auto</option>
 										<option value="ssd">SSD</option>
 										<option value="hdd">HDD</option>
-										<option value="nvme">NVMe</option>
 									</select>
 									{#if dev.type_source === 'manual'}
 										<span class="text-xs text-amber-400" title={idKindNote(dev.id_kind)}>
 											manual{dev.id_kind === 'volatile' ? ' ⚠' : ''}
 										</span>
 									{/if}
+								</div>
+							{/if}
+						</td>
+						<td class="p-3 text-xs">
+							{#if dev.dev_type === 'disk'}
+								<span class="font-semibold uppercase" title={`Interface source: ${dev.interface_source}`}>{dev.native_interface ?? 'Unknown'}</span>
+								{#if dev.transport && dev.transport.toLowerCase() !== dev.native_interface}
+									<span class="ml-1 text-muted-foreground">via {dev.transport.toUpperCase()}</span>
 								{/if}
-							</div>
+							{/if}
 						</td>
 						<td class="min-w-48 p-3">
 							{#if dev.dev_type === 'disk' && dev.io_scheduler}
@@ -913,7 +918,8 @@
 					<thead>
 						<tr>
 							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Device</th>
-							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Type</th>
+							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Media</th>
+							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Interface</th>
 							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Capacity</th>
 							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Filesystem</th>
 							<th class="border-b-2 border-border p-3 text-left text-xs uppercase text-muted-foreground">Mount</th>
@@ -923,7 +929,8 @@
 						{#each blockDevices as dev}
 							<tr class="border-b border-border">
 								<td class="p-3 font-mono text-sm">{dev.path}</td>
-								<td class="p-3"><Badge variant="secondary" class={deviceClassBadge(dev.device_class)}>{dev.device_class.toUpperCase()}</Badge></td>
+								<td class="p-3">{#if dev.dev_type === 'disk'}<Badge variant="secondary" class={deviceClassBadge(dev.media ?? '')}>{dev.media?.toUpperCase() ?? 'Unknown'}</Badge>{/if}</td>
+								<td class="p-3 text-xs">{#if dev.dev_type === 'disk'}{dev.native_interface?.toUpperCase() ?? 'Unknown'}{#if dev.transport && dev.transport.toLowerCase() !== dev.native_interface}<span class="ml-1 text-muted-foreground">via {dev.transport.toUpperCase()}</span>{/if}{/if}</td>
 								<td class="p-3 text-sm">{formatBytes(dev.size_bytes)}</td>
 								<td class="p-3 font-mono text-xs text-muted-foreground">{dev.fs_type ?? '—'}</td>
 								<td class="p-3 font-mono text-xs text-muted-foreground">{dev.mount_point ?? '—'}</td>
