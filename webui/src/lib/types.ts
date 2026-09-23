@@ -1597,6 +1597,9 @@ export type BackupTarget =
 	| {
 		type: 'b2';
 		bucket: string;
+		/** Empty for profiles saved before B2 bucket IDs were supported. */
+		bucket_id: string;
+		/** Existing wire name; supply the B2 application key ID. */
 		account_id: string;
 		/** Optional on the wire — same carry-forward story as S3.secret_key. */
 		account_key?: string;

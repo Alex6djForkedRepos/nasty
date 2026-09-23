@@ -136,6 +136,13 @@ pub enum BackupTarget {
     },
     B2 {
         bucket: String,
+        /// Backblaze's bucket ID is distinct from the human-readable bucket name.
+        /// Default allows profiles saved before this field existed to load and
+        /// be edited without discarding their encrypted credentials.
+        #[serde(default)]
+        bucket_id: String,
+        /// Stored as account_id for compatibility with existing profiles;
+        /// OpenDAL expects this value as application_key_id.
         account_id: String,
         /// B2 application key as the operator supplied it. Same shape
         /// + migration story as S3.secret_key.
@@ -321,13 +328,17 @@ impl BackupTarget {
                 opts
             }
             BackupTarget::B2 {
-                bucket, account_id, ..
+                bucket,
+                bucket_id,
+                account_id,
+                ..
             } => {
                 let mut opts = BTreeMap::new();
                 opts.insert("bucket".into(), bucket.clone());
-                opts.insert("account_id".into(), account_id.clone());
+                opts.insert("bucket_id".into(), bucket_id.clone());
+                opts.insert("application_key_id".into(), account_id.clone());
                 if let Some(key) = &resolved.b2_account_key {
-                    opts.insert("account_key".into(), key.clone());
+                    opts.insert("application_key".into(), key.clone());
                 }
                 BackendOptions::default()
                     .repository("opendal:b2")
@@ -378,11 +389,13 @@ impl BackupTarget {
             },
             BackupTarget::B2 {
                 bucket,
+                bucket_id,
                 account_id,
                 account_key,
                 account_key_encrypted: _,
             } => BackupTarget::B2 {
                 bucket: bucket.clone(),
+                bucket_id: bucket_id.clone(),
                 account_id: account_id.clone(),
                 account_key: account_key.as_ref().map(|_| "***".to_string()),
                 account_key_encrypted: None,
@@ -903,6 +916,27 @@ fn validate_sources(sources: &[String]) -> Result<(), BackupError> {
     Ok(())
 }
 
+fn validate_b2_target(target: &BackupTarget) -> Result<(), BackupError> {
+    if let BackupTarget::B2 {
+        bucket,
+        bucket_id,
+        account_id,
+        ..
+    } = target
+    {
+        for (label, value) in [
+            ("bucket name", bucket),
+            ("bucket ID", bucket_id),
+            ("application key ID", account_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(BackupError::Failed(format!("B2 {label} is required")));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_schedule(schedule: &mut Option<String>) -> Result<(), BackupError> {
     let Some(expression) = schedule.as_deref().map(str::trim) else {
         return Ok(());
@@ -1220,6 +1254,7 @@ impl BackupService {
         mut profile: BackupProfile,
     ) -> Result<BackupProfile, BackupError> {
         validate_sources(&profile.sources)?;
+        validate_b2_target(&profile.target)?;
         normalize_schedule(&mut profile.schedule)?;
         // Encrypt plaintext secrets before persisting. If the secrets
         // backend is unavailable on this host (no systemd-creds, broken
@@ -1260,6 +1295,7 @@ impl BackupService {
         mut update: BackupProfile,
     ) -> Result<BackupProfile, BackupError> {
         validate_sources(&update.sources)?;
+        validate_b2_target(&update.target)?;
         normalize_schedule(&mut update.schedule)?;
         // Same encryption-on-save invariant as create. The operator
         // can submit a plaintext password (rotate) or omit it (keep
@@ -2378,6 +2414,7 @@ mod tests {
     fn b2_with_plaintext(key: &str) -> BackupTarget {
         BackupTarget::B2 {
             bucket: "my-b2".into(),
+            bucket_id: "bucket-123".into(),
             account_id: "abc".into(),
             account_key: Some(key.into()),
             account_key_encrypted: None,
@@ -2626,13 +2663,49 @@ mod tests {
             Some("my-b2")
         );
         assert_eq!(
-            opts.options.get("account_id").map(String::as_str),
+            opts.options.get("bucket_id").map(String::as_str),
+            Some("bucket-123")
+        );
+        assert_eq!(
+            opts.options.get("application_key_id").map(String::as_str),
             Some("abc")
         );
         assert_eq!(
-            opts.options.get("account_key").map(String::as_str),
+            opts.options.get("application_key").map(String::as_str),
             Some("def")
         );
+        // Exercise rustic -> OpenDAL config parsing and builder, not just
+        // our map: unrecognized option names previously passed this test
+        // while Init Repo failed with "bucket_id is empty".
+        opts.to_backends()
+            .expect("B2 backend should build without contacting the service");
+    }
+
+    #[test]
+    fn legacy_b2_profile_can_be_repaired_without_rotating_its_key() {
+        let legacy = r#"{"type":"b2","bucket":"my-b2","account_id":"abc","account_key":"secret"}"#;
+        let existing = baseline_profile(serde_json::from_str(legacy).unwrap());
+        assert!(
+            matches!(&existing.target, BackupTarget::B2 { bucket_id, .. } if bucket_id.is_empty())
+        );
+        assert!(validate_b2_target(&existing.target).is_err());
+
+        let mut updated = baseline_profile(
+            serde_json::from_str(
+                r#"{"type":"b2","bucket":"my-b2","bucket_id":"bucket-123","account_id":"abc"}"#,
+            )
+            .unwrap(),
+        );
+        carry_forward_existing_secrets(&mut updated, &existing);
+        assert!(validate_b2_target(&updated.target).is_ok());
+        let opts = updated
+            .target
+            .to_backend_options(&resolve_plaintext_for_test(&updated.target));
+        assert_eq!(
+            opts.options.get("application_key").map(String::as_str),
+            Some("secret")
+        );
+        opts.to_backends().unwrap();
     }
 
     #[test]
@@ -2689,6 +2762,7 @@ mod tests {
         // / "rest" / "b2" verbatim.
         let json = serde_json::to_string(&BackupTarget::B2 {
             bucket: "x".into(),
+            bucket_id: "bucket-123".into(),
             account_id: "y".into(),
             account_key: Some("z".into()),
             account_key_encrypted: None,
