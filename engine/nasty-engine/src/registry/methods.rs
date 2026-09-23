@@ -523,13 +523,23 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "device.wipe",
-                    desc: "Erase all filesystem signatures from a device (wipefs). The device must not be in use.",
+                    desc: "Prepare a whole disk (requires an inspected snapshot) or clear a partition's signatures. Rejects mounted, held, swap, and registered filesystem devices.",
                     role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one(
-                        "path",
-                        "Block device path (e.g. /dev/sdb).",
-                    )),
+                    params: MethodParams::Schema(gen_schema::<
+                        nasty_storage::filesystem::DeviceWipeRequest,
+                    >(generator)),
                     result: None,
+                },
+                Method {
+                    name: "device.prepare.inspect",
+                    desc: "Inspect whole disks for explicit confirmation before destructive preparation. Rejects in-use devices.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<
+                        nasty_storage::filesystem::DiskInspectRequest,
+                    >(generator)),
+                    result: Some(
+                        gen_schema::<Vec<nasty_storage::filesystem::DiskPreparation>>(generator),
+                    ),
                 },
                 Method {
                     name: "device.set_type",
@@ -573,7 +583,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.create",
-                    desc: "Format and mount a new bcachefs filesystem.",
+                    desc: "Format and mount a new bcachefs filesystem. Optional prepare_disks requires matching inspected snapshots for selected whole disks; never prepares partitions or unconfirmed devices.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<CreateFilesystemRequest>(generator)),
                     result: Some(gen_schema::<Filesystem>(generator)),

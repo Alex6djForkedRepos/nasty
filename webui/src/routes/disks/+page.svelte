@@ -6,7 +6,7 @@
 	import { formatTemp } from '$lib/temperature.svelte';
 	import { withToast } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { AuthMe, BlockDevice, DiskHealth, ProtocolStatus, SmartAttribute } from '$lib/types';
+	import type { AuthMe, BlockDevice, DiskPreparation, DiskHealth, ProtocolStatus, SmartAttribute } from '$lib/types';
 	import { ataAttributeMetadata } from '$lib/smart_attribute_metadata';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
@@ -24,6 +24,7 @@
 	let pollInterval: ReturnType<typeof setInterval> | null = null;
 	let schedulerValues = $state<Record<string, string>>({});
 	let schedulerPending = $state<Record<string, boolean>>({});
+	let wipePending = $state<Record<string, boolean>>({});
 	let hasRootAccess = $state(false);
 
 	const client = getClient();
@@ -105,12 +106,36 @@
 	}
 
 	async function wipe(dev: BlockDevice) {
-		if (!await confirm(`Wipe ${dev.path}?`, `This will erase all filesystem signatures on ${dev.path}. The data itself is not overwritten but the device will appear blank.`)) return;
-		const ok = await withToast(
-			() => client.call('device.wipe', { path: dev.path }),
-			`${dev.path} wiped`
-		);
-		if (ok !== undefined) await loadBlockDevices();
+		if (wipePending[dev.path]) return;
+		wipePending[dev.path] = true;
+		let attempted = false;
+		try {
+			const fresh = await withToast(() => client.call<BlockDevice[]>('device.list'));
+			if (!fresh) return;
+			const current = fresh.find(device => device.path === dev.path);
+			if (!current || current.in_use || current.dev_type !== dev.dev_type) {
+				blockDevices = fresh;
+				return;
+			}
+			const expected = dev.dev_type === 'disk'
+				? await withToast(() => client.call<DiskPreparation[]>('device.prepare.inspect', { paths: [dev.path] }))
+				: undefined;
+			if (dev.dev_type === 'disk' && !expected?.[0]) return;
+			const identity = [current.path, current.model, current.serial && `SN ${current.serial}`, formatBytes(current.size_bytes)].filter(Boolean).join(' · ');
+			const partitions = expected?.[0].children.map(([path, , fsType]) => `${path}${fsType ? ` (${fsType})` : ''}`).join(', ');
+			const description = dev.dev_type === 'disk'
+				? `${identity}\nAffected partitions: ${partitions || 'none'}\n\nThis removes all partitions and filesystem signatures, making existing data inaccessible. This is not a secure erase.`
+				: `Clear filesystem signatures on ${dev.path}? The partition itself remains; this is not a secure erase.`;
+			if (!await confirm(dev.dev_type === 'disk' ? 'Wipe disk?' : 'Clear filesystem signatures?', description, { confirmLabel: dev.dev_type === 'disk' ? 'Wipe disk' : 'Clear signatures' })) return;
+			attempted = true;
+			await withToast(
+				() => client.call('device.wipe', { path: dev.path, expected: expected?.[0] }),
+				`${dev.path} prepared`
+			);
+		} finally {
+			delete wipePending[dev.path];
+			if (attempted) await loadBlockDevices();
+		}
 	}
 
 	// Manual disk-type override (#552): for VMs where lsblk's rotational
@@ -342,6 +367,8 @@
 			</thead>
 			<tbody>
 				{#each blockDevices as dev}
+					{@const children = blockDevices.filter(child => child.parent_path === dev.path && child.dev_type === 'part')}
+					{@const needsPreparation = dev.dev_type === 'disk' && (!!dev.partition_table_type || children.length > 0 || !!dev.fs_type)}
 					<tr
 						class="border-b border-border {dev.dev_type === 'part' ? 'bg-muted/10' : ''} {schedulerPending[dev.path] ? 'pointer-events-none opacity-50' : ''}"
 						aria-busy={schedulerPending[dev.path] || undefined}
@@ -402,15 +429,17 @@
 							{#if dev.in_use}
 								<Badge variant="default">In use</Badge>
 							{:else}
-								<Badge variant="secondary">Free</Badge>
-								{#if dev.fs_type}
+								<Badge variant="secondary">{needsPreparation ? 'Needs preparation' : 'Free'}</Badge>
+								{#if dev.fs_type && !needsPreparation}
 									<Badge variant="outline" class="ml-1 border-amber-700 text-amber-400">Has signatures</Badge>
 								{/if}
 							{/if}
 						</td>
 						<td class="p-3 w-px whitespace-nowrap">
-							{#if !dev.in_use && dev.fs_type}
-								<Button variant="destructive" size="xs" onclick={() => wipe(dev)} disabled={schedulerPending[dev.path]}>Wipe</Button>
+							{#if !dev.in_use && (needsPreparation || (dev.dev_type === 'part' && dev.fs_type))}
+								<Button variant="destructive" size="xs" onclick={() => wipe(dev)} disabled={schedulerPending[dev.path] || wipePending[dev.path] || !hasRootAccess}>
+									{wipePending[dev.path] ? 'Working...' : dev.dev_type === 'disk' ? 'Wipe disk' : 'Clear filesystem signatures'}
+								</Button>
 							{/if}
 						</td>
 					</tr>

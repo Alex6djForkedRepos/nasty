@@ -8,7 +8,7 @@
 		formatBytes,
 		formatPercent
 	} from '$lib/format';
-	import { withToast, success as toastSuccess } from '$lib/toast.svelte';
+	import { withToast, success as toastSuccess, error as toastError } from '$lib/toast.svelte';
 
 	let pageTab = $state<'manage' | 'diagnostics'>(
 		typeof window !== 'undefined' && window.location.hash === '#diagnostics' ? 'diagnostics' : 'manage'
@@ -17,7 +17,7 @@
 	import { confirmDangerous } from '$lib/confirm-dangerous.svelte';
 	import { unlockFs } from '$lib/unlock-fs.svelte';
 	import { summarizeDependents } from '$lib/fs-dependents';
-	import type { Filesystem, UnavailableFilesystem, FilesystemDevice, BlockDevice, DeviceState, ScrubStatus, FsckStatus, ReconcileStatus, TieringProfile, TieringProfileId, FsDependents, TpmBindStatus, DiskHealth } from '$lib/types';
+	import type { Filesystem, UnavailableFilesystem, FilesystemDevice, BlockDevice, DiskPreparation, DeviceState, ScrubStatus, FsckStatus, ReconcileStatus, TieringProfile, TieringProfileId, FsDependents, TpmBindStatus, DiskHealth } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import SortTh from '$lib/components/SortTh.svelte';
 	import { Card, CardContent } from '$lib/components/ui/card';
@@ -683,6 +683,10 @@
 		if (erasureCode && selectedPaths.length < 3) erasureCode = false;
 	});
 
+	function diskNeedsPreparation(dev: BlockDevice): boolean {
+		return dev.dev_type === 'disk' && (!!dev.fs_type || !!dev.partition_table_type || devices.some(child => child.parent_path === dev.path && child.dev_type === 'part'));
+	}
+
 	async function createFs() {
 		if (creating) return;
 		if (!newName || selectedPaths.length === 0) return;
@@ -690,6 +694,42 @@
 		if (encryption && (!passphrase || passphrase !== passphraseConfirm)) return;
 		const profile = activeProfile();
 		creating = true;
+		const currentDevices = await withToast(() => client.call<BlockDevice[]>('device.list'));
+		if (!currentDevices) { creating = false; return; }
+		const changed = selectedPaths.some(path => {
+			const prior = devices.find(device => device.path === path);
+			const current = currentDevices.find(device => device.path === path);
+			return !prior || !current || prior.size_bytes !== current.size_bytes || prior.dev_type !== current.dev_type
+				|| prior.serial !== current.serial || prior.stable_id !== current.stable_id || current.in_use;
+		});
+		devices = currentDevices;
+		if (changed) {
+			creating = false;
+			wizardStep = 1;
+			selectedPaths = [];
+			toastError('A selected device changed or became busy. Review the refreshed list and select devices again.');
+			return;
+		}
+		const paths = selectedPaths.filter(path => {
+			const dev = currentDevices.find(device => device.path === path);
+			return dev && dev.dev_type === 'disk' && !dev.in_use && diskNeedsPreparation(dev);
+		});
+		let prepareDisks: DiskPreparation[] = [];
+		if (paths.length) {
+			const inspected = await withToast(() => client.call<DiskPreparation[]>('device.prepare.inspect', { paths }));
+			if (!inspected) { creating = false; await refresh(); return; }
+			prepareDisks = inspected;
+			const descriptions = inspected.map(disk => {
+				const dev = devices.find(device => device.path === disk.path);
+				const identity = [disk.path, dev?.model, dev?.serial && `SN ${dev.serial}`, dev && formatBytes(dev.size_bytes)].filter(Boolean).join(' · ');
+				const children = disk.children.map(([path, , fsType]) => `  ${path}${fsType ? ` (${fsType})` : ''}`).join('\n');
+				return `${identity}${children ? `\n${children}` : ''}`;
+			});
+			const approved = await confirm('Erase selected disks and create filesystem?',
+				`These selected whole disks contain partitions or signatures:\n\n${descriptions.join('\n\n')}\n\nAll partitions and filesystem signatures on these disks will be removed. Existing data will become inaccessible. This is not a secure erase. Selected partitions and blank disks are not prepared.`,
+				{ confirmLabel: 'Erase disks and create filesystem' });
+			if (!approved) { creating = false; return; }
+		}
 		const ok = await withToast(
 			() => client.call('fs.create', {
 				name: newName,
@@ -697,6 +737,7 @@
 					path,
 					label: profile.device_labels[path] || undefined,
 				})),
+				prepare_disks: prepareDisks,
 				replicas,
 				compression: combineCompression(compression, compressionLevel) || undefined,
 				foreground_target: profile.foreground_target || undefined,
@@ -718,6 +759,11 @@
 			`Filesystem "${newName}" created`
 		);
 		creating = false;
+		if (ok === undefined && prepareDisks.length) {
+			wizardStep = 1;
+			selectedPaths = [];
+			await refresh();
+		}
 		if (ok !== undefined) {
 			wizardStep = 0;
 			newName = 'first';
@@ -1508,8 +1554,10 @@
 												{dev.device_class}
 											</span>
 											<span class="text-muted-foreground">{formatBytes(dev.size_bytes)}</span>
-											{#if dev.fs_type}
-												<span class="rounded border border-amber-700 px-1.5 py-0.5 text-[10px] text-amber-400">has signatures · wipe first</span>
+											{#if diskNeedsPreparation(dev)}
+												<span class="rounded border border-amber-700 px-1.5 py-0.5 text-[10px] text-amber-400">needs preparation · confirmation required</span>
+											{:else if dev.fs_type}
+												<span class="rounded border border-amber-700 px-1.5 py-0.5 text-[10px] text-amber-400">has signatures · clear first</span>
 											{/if}
 										</div>
 										{#if dev.model || dev.vendor || dev.transport || dev.serial}
@@ -1978,6 +2026,9 @@
 						Show format / mount commands
 					</button>
 					{#if showCreateCommands}
+						{#if selectedPaths.some(path => devices.some(dev => dev.path === path && diskNeedsPreparation(dev)))}
+							<p class="mt-2 text-xs text-amber-400">Whole-disk preparation is not shown in this command preview. NASty will inspect, confirm, and revalidate selected disks before formatting.</p>
+						{/if}
 						<pre class="mt-2 rounded-md border border-border bg-black/40 p-3 text-xs font-mono text-muted-foreground overflow-x-auto whitespace-pre-wrap">{formatCommandLines(buildFormatCommand())}
 
 {buildMountCommand().join(' ')}</pre>
