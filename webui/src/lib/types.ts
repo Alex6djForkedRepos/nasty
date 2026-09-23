@@ -609,6 +609,12 @@ export interface BlockDevice {
 	rotational: boolean;
 	/** "nvme" | "ssd" | "hdd" */
 	device_class: string;
+	/** HDD / SSD (null when media cannot be established). */
+	media: 'hdd' | 'ssd' | null;
+	media_source: 'smart' | 'sysfs' | 'kernel' | 'manual' | 'unknown';
+	/** Native interface, distinct from lsblk connection path (`transport`). */
+	native_interface: 'sata' | 'sas' | 'nvme' | null;
+	interface_source: 'smart' | 'kernel' | 'unknown';
 	/** Drive model from lsblk; missing on partitions and many virtual disks. */
 	model?: string;
 	/** Drive serial from lsblk; same caveat. */
@@ -947,6 +953,7 @@ export interface DiskHealth {
 	/** true = spinning HDD, false = SSD, null/undefined = unknown (NVMe
 	 * dumps carry no rotation rate). */
 	rotational?: boolean | null;
+	native_interface?: 'sata' | 'sas' | 'nvme';
 	attributes: SmartAttribute[];
 	nvme?: NvmeHealth;
 	scsi?: ScsiHealth;

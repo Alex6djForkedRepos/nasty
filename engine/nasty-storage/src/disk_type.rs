@@ -42,7 +42,7 @@ static STATE_LOCK: Mutex<()> = Mutex::const_new(());
 pub struct DiskTypeUpdate {
     /// Current device path (e.g. `/dev/sda`) — resolved to a stable key.
     pub path: String,
-    /// `ssd` | `hdd` | `nvme` | `auto`.
+    /// `ssd` | `hdd` | `auto` (legacy `nvme` overrides remain readable).
     pub device_class: String,
 }
 
@@ -54,8 +54,8 @@ pub async fn load() -> DiskTypeOverrides {
     nasty_common::load_singleton_or_recover(STATE_PATH).await
 }
 
-/// Map a stored class to `(device_class, rotational)`. `nvme`/`ssd` are
-/// non-rotational; `hdd` is rotational.
+/// Map a stored media override to its legacy representation. Accept old
+/// `nvme` entries for compatibility, but new overrides only set HDD/SSD media.
 pub fn class_to_fields(class: &str) -> Option<(String, bool)> {
     match class {
         "ssd" => Some(("ssd".to_string(), false)),
@@ -176,9 +176,9 @@ pub async fn set(update: DiskTypeUpdate) -> Result<String, String> {
     let (key, kind) = identity_for_path(&update.path).await;
     let clearing = update.device_class == "auto" || update.device_class.is_empty();
 
-    if !clearing && class_to_fields(&update.device_class).is_none() {
+    if !clearing && !matches!(update.device_class.as_str(), "ssd" | "hdd") {
         return Err(format!(
-            "invalid device class '{}': expected ssd, hdd, nvme, or auto",
+            "invalid device class '{}': expected ssd, hdd, or auto",
             update.device_class
         ));
     }

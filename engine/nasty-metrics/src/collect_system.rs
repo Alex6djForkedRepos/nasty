@@ -278,6 +278,10 @@ pub fn system_stats() -> SystemStats {
 #[derive(Deserialize)]
 struct SmartctlJson {
     #[serde(default)]
+    device: Option<SmartctlDeviceIdentity>,
+    #[serde(default)]
+    sata_version: Option<SmartctlSataVersion>,
+    #[serde(default)]
     model_name: Option<String>,
     #[serde(default)]
     serial_number: Option<String>,
@@ -348,6 +352,41 @@ struct SmartctlJson {
     // entries; the SCSI standard caps at 20.
     #[serde(flatten)]
     extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct SmartctlDeviceIdentity {
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SmartctlSataVersion {
+    #[serde(default)]
+    string: Option<String>,
+}
+
+fn native_drive_interface(json: &SmartctlJson) -> Option<&'static str> {
+    if json.device.as_ref().and_then(|d| d.protocol.as_deref()) == Some("NVMe")
+        || json.nvme_log.is_some()
+    {
+        Some("nvme")
+    } else if json
+        .sata_version
+        .as_ref()
+        .and_then(|v| v.string.as_deref())
+        .is_some_and(|version| version.starts_with("SATA"))
+    {
+        Some("sata")
+    } else if json
+        .scsi_transport_protocol
+        .as_ref()
+        .is_some_and(|transport| transport.name.starts_with("SAS"))
+    {
+        Some("sas")
+    } else {
+        None
+    }
 }
 
 #[derive(Deserialize)]
@@ -861,6 +900,7 @@ async fn build_disk_health(
                 "FAILED".to_string()
             },
             rotational: s.rotational,
+            native_interface: s.native_interface,
             attributes: s.attributes,
             nvme: s.nvme,
             scsi: s.scsi,
@@ -907,6 +947,7 @@ fn build_disk_health_unreachable_for_endpoint(
         health_passed: false,
         smart_status: SMART_STATUS_UNAVAILABLE.to_string(),
         rotational: None,
+        native_interface: None,
         attributes: Vec::new(),
         nvme: None,
         scsi: None,
@@ -933,6 +974,7 @@ struct SmartReport {
     power_on_hours: Option<u64>,
     health_passed: bool,
     rotational: Option<bool>,
+    native_interface: Option<String>,
     attributes: Vec<SmartAttribute>,
     nvme: Option<NvmeHealth>,
     scsi: Option<ScsiHealth>,
@@ -982,6 +1024,7 @@ async fn query_smartctl(device: &str, transport: Option<&str>) -> Option<SmartRe
     // both need to complete before we start consuming fields below.
     let scsi = build_scsi_health(&json);
     let ata = build_ata_health(&json);
+    let native_interface = native_drive_interface(&json).map(str::to_string);
 
     // smartctl returns table entries newest-first when sorted by
     // error_count, so the head is the most recent event we have a
@@ -1069,6 +1112,7 @@ async fn query_smartctl(device: &str, transport: Option<&str>) -> Option<SmartRe
         // HDD reports its RPM; SSD reports 0 / "Solid State Device";
         // NVMe dumps omit the field entirely (None).
         rotational: json.rotation_rate.map(|r| r > 0),
+        native_interface,
         attributes,
         nvme,
         scsi,
@@ -1434,6 +1478,36 @@ mod tests {
 
     fn parse(raw: &str) -> SmartctlJson {
         serde_json::from_str(raw).expect("smartctl fixture must parse")
+    }
+
+    #[test]
+    fn native_interface_uses_explicit_drive_identity_not_host_transport() {
+        let sata = parse(include_str!("../fixtures/ata_hgst_he10.json"));
+        let sas = parse(include_str!("../fixtures/sas_seagate_clean.json"));
+        let nvme = parse(include_str!("../fixtures/nvme_samsung_980_pro.json"));
+        assert_eq!(native_drive_interface(&sata), Some("sata"));
+        assert_eq!(native_drive_interface(&sas), Some("sas"));
+        assert_eq!(native_drive_interface(&nvme), Some("nvme"));
+        assert_eq!(
+            native_drive_interface(&parse(r#"{"device":{"protocol":"SCSI"}}"#)),
+            None
+        );
+        assert_eq!(
+            native_drive_interface(&parse(r#"{"device":{"protocol":"ATA"}}"#)),
+            None
+        );
+        assert_eq!(
+            native_drive_interface(&parse(
+                r#"{"device":{"protocol":"SCSI"},"sata_version":{"string":"SATA 3.2"}}"#
+            )),
+            Some("sata")
+        );
+        assert_eq!(
+            native_drive_interface(&parse(
+                r#"{"device":{"protocol":"SCSI"},"scsi_transport_protocol":{"name":"SAS (SPL-4)"}}"#
+            )),
+            Some("sas")
+        );
     }
 
     #[test]
