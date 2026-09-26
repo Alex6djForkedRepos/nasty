@@ -3795,7 +3795,7 @@ outputs = { nixpkgs, nasty, ... }: {
     }
 
     #[tokio::test]
-    async fn bootstrap_imports_and_preserves_existing_custom_config() {
+    async fn bootstrap_preserves_machine_local_config_and_boot_mode() {
         let dir = tempfile::tempdir().expect("temporary system-flake directory");
         let dest_dir = dir.path().to_str().expect("UTF-8 temporary path");
         let custom_path = dir.path().join("custom.nix");
@@ -3803,6 +3803,11 @@ outputs = { nixpkgs, nasty, ... }: {
         tokio::fs::write(&custom_path, custom)
             .await
             .expect("write operator custom config");
+        let boot_path = dir.path().join("nasty-installer-boot.nix");
+        let boot = "{ lib, ... }: { boot.loader.systemd-boot.enable = lib.mkForce false; }\n";
+        tokio::fs::write(&boot_path, boot)
+            .await
+            .expect("write installer boot mode");
 
         super::bootstrap_system_flake_from_template(
             super::EMBEDDED_WRAPPER_TEMPLATE,
@@ -3817,11 +3822,13 @@ outputs = { nixpkgs, nasty, ... }: {
             .await
             .expect("read preserved custom config");
         assert_eq!(preserved, custom);
+        assert_eq!(tokio::fs::read_to_string(&boot_path).await.unwrap(), boot);
 
         let wrapper = tokio::fs::read_to_string(dir.path().join("flake.nix"))
             .await
             .expect("read rendered wrapper");
         assert!(wrapper.contains("builtins.pathExists ./custom.nix"));
+        assert!(wrapper.contains("builtins.pathExists ./nasty-installer-boot.nix"));
         assert!(wrapper.contains("nixpkgs.lib.optional"));
         assert!(wrapper.contains("./custom.nix;"));
     }

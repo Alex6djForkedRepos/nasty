@@ -274,6 +274,7 @@
       text = ''
         export NASTY_INSTALL_SYSTEM=${system}
         export NASTY_SYSTEM_FLAKE=${systemFlake}
+        export NASTY_INSTALL_BOOT_HELPER=${./nixos/installer-boot.sh}
         exec ${pkgs.bash}/bin/bash ${./nixos/installer.sh} "$@"
       '';
     };

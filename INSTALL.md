@@ -17,8 +17,9 @@ installer uses the same machine-local wrapper and release inputs as the NASty
 ISO. It supports SATA, NVMe, virtio, and eMMC whole disks without manually
 constructing partition names.
 
-The live environment must itself be booted in **UEFI mode**, with Secure Boot
-disabled for the initial installation.
+Boot the live environment in the mode you want to install: UEFI on either
+supported architecture, or legacy BIOS on x86_64. Secure Boot must be disabled
+for the initial UEFI installation. BIOS installs do not support UEFI Secure Boot.
 
 ### Requirements
 
@@ -29,11 +30,11 @@ disabled for the initial installation.
 
 ### Steps
 
-Boot the live environment and open a root shell. Confirm that it is running in
-UEFI mode and identify the target whole disk:
+Boot the live environment and open a root shell. Check its firmware mode and
+identify the target whole disk:
 
 ```bash
-test -d /sys/firmware/efi
+if test -d /sys/firmware/efi; then echo UEFI; else echo BIOS; fi
 lsblk -dp -o NAME,SIZE,MODEL,SERIAL,TRAN,TYPE,MOUNTPOINTS
 ```
 
@@ -51,12 +52,13 @@ curl -L https://nixos.org/nix/install | sh -s -- --no-daemon --yes
 . /root/.nix-profile/etc/profile.d/nix.sh
 ```
 
-The `v0.1.1` tag predates the packaged helper, so pin the helper's reviewed
-implementation commit below. The machine-local wrapper it generates still pins
-the installed appliance to stable `v0.1.1`. Future releases will provide the
-helper directly from their release tag.
+The `v0.1.1` tag predates the packaged helper and BIOS support. The pinned
+helper below installs only in UEFI mode. To install in legacy BIOS mode, boot
+a NASty ISO containing BIOS support, or use a newer release's packaged helper
+once available. The boot mode is determined by how you boot the live system;
+`--boot-mode auto` is the default, and an explicit `uefi` or `bios` must match.
 
-Start with a dry run. It checks UEFI, Secure Boot, target-disk safety, release
+Start with a dry run. It checks the boot mode, Secure Boot, target-disk safety, release
 resolution, the wrapper lock, and NixOS evaluation without modifying the disk:
 
 ```bash
@@ -76,7 +78,7 @@ nix --extra-experimental-features 'nix-command flakes' run \
   --disk "$DISK" --mode whole
 ```
 
-Use `--mode split` to create a 20 GiB OS partition and leave the remainder as
+Use `--mode split` to create a 50 GiB OS partition and leave the remainder as
 an unformatted third partition. The installer uses DHCP for the installed
 system; configure static networking from the WebUI after first boot.
 
@@ -91,5 +93,9 @@ The first login requires changing that password.
 - Installation usually takes 10-30 minutes, depending on network and hardware.
 - In split mode, partition 3 is intentionally left unformatted. Create the
   bcachefs filesystem from the WebUI after first boot.
+- BIOS installation uses a small GPT BIOS-boot partition and GRUB; UEFI uses a
+  FAT32 EFI partition and systemd-boot. The installer saves its chosen mode in
+  `/etc/nixos/nasty-installer-boot.nix` so updates preserve the bootloader. To change modes,
+  reinstall rather than changing a WebUI setting.
 - The initial installation requires network access to GitHub, the Nix cache,
   and `nasty.cachix.org`.

@@ -111,7 +111,9 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Check installer shell
-        run: nix run nixpkgs#shellcheck -- nixos/installer.sh
+        run: |
+          nix run nixpkgs#shellcheck -- nixos/installer.sh nixos/installer-boot.sh nixos/tests/installer-boot.sh
+          bash nixos/tests/installer-boot.sh
 
       - name: Build installer package
         run: nix build .#installer
@@ -126,10 +128,27 @@ jobs:
           trap 'sudo losetup -d "$LOOP"' EXIT
           NIX_BIN=$(command -v nix)
           sudo \
-            NASTY_INSTALL_ALLOW_NON_UEFI=1 \
             NASTY_INSTALL_ALLOW_LOOP=1 \
             "$NIX_BIN" run .#installer -- \
-              --disk "$LOOP" --mode split --dry-run
+              --disk "$LOOP" --mode split --boot-mode auto --dry-run
+
+      - name: Check both boot partition layouts on an isolated disk
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq parted
+          truncate -s 72G installer-partitions.img
+          LOOP=$(sudo losetup --find --show installer-partitions.img)
+          trap 'sudo losetup -d "$LOOP"' EXIT
+          sudo NASTY_TEST_DISK="$LOOP" bash -c '
+            set -euo pipefail
+            source nixos/installer-boot.sh
+            for layout in whole split; do
+              nasty_partition_disk "$NASTY_TEST_DISK" bios "$layout"
+              parted -s "$NASTY_TEST_DISK" print | grep -Fq bios_grub
+              nasty_partition_disk "$NASTY_TEST_DISK" uefi "$layout"
+              parted -s "$NASTY_TEST_DISK" print | grep -Fq esp
+            done
+          '
 
   installer-flake-template:
     # Two invariants on the wrapper-flake template, each load-bearing

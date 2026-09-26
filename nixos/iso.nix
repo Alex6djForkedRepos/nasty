@@ -152,7 +152,22 @@ in
         exit 1
       fi
 
+      unset NASTY_EFI_DIR
+      source ${./installer-boot.sh}
+      case "$(uname -m)" in
+        x86_64) INSTALL_SYSTEM=x86_64-linux ;;
+        aarch64) INSTALL_SYSTEM=aarch64-linux ;;
+        *) echo "Error: unsupported CPU architecture" >&2; exit 1 ;;
+      esac
+      BOOT_MODE=$(nasty_select_boot_mode auto "$INSTALL_SYSTEM") || exit 1
+
       echo "=== NASty NAS Guided Installer ==="
+      echo "Boot mode: $BOOT_MODE (detected from the live environment)"
+      if [ "$BOOT_MODE" = bios ]; then
+        echo "Legacy BIOS uses GRUB and a GPT BIOS-boot partition; UEFI Secure Boot is unavailable."
+      else
+        echo "UEFI uses systemd-boot and a FAT32 EFI partition."
+      fi
       echo ""
 
       # List available disks
@@ -167,10 +182,16 @@ in
         echo "Error: $DISK is not a block device"
         exit 1
       fi
+      DISK=$(readlink -f "$DISK")
 
       # Get disk size in GiB for display
       DISK_SIZE_B=$(lsblk -b -d -n -o SIZE "$DISK")
       DISK_SIZE_G=$(( DISK_SIZE_B / 1073741824 ))
+      DISK_IDENTITY=$(lsblk --json -b -d -o PATH,TYPE,SIZE,RO,SERIAL,WWN "$DISK" \
+        | ${pkgs.jq}/bin/jq -c '.blockdevices[0] | {path,type,size,ro,serial,wwn}')
+      BOOT_MODULE_TMP=$(mktemp /tmp/nasty-boot-mode.XXXXXX)
+      trap 'rm -f "$BOOT_MODULE_TMP"' EXIT
+      nasty_write_boot_module "$BOOT_MODULE_TMP" "$BOOT_MODE" "$DISK" || exit 1
 
       echo ""
       echo "Disk: $DISK (''${DISK_SIZE_G} GiB)"
@@ -235,6 +256,12 @@ in
       fi
 
       echo ""
+      echo "Boot mode: $BOOT_MODE"
+      if [ "$BOOT_MODE" = bios ]; then
+        echo "Partition layout: 2 MiB BIOS-boot, ext4 root, optional unformatted data."
+      else
+        echo "Partition layout: 511 MiB EFI, ext4 root, optional unformatted data."
+      fi
       echo "WARNING: This will ERASE all data on $DISK"
       read -p "Continue? (yes/no): " CONFIRM
       if [ "$CONFIRM" != "yes" ]; then
@@ -243,6 +270,12 @@ in
       fi
 
       # Determine partition suffix style
+      CURRENT_IDENTITY=$(lsblk --json -b -d -o PATH,TYPE,SIZE,RO,SERIAL,WWN "$DISK" \
+        | ${pkgs.jq}/bin/jq -c '.blockdevices[0] | {path,type,size,ro,serial,wwn}')
+      if [ "$CURRENT_IDENTITY" != "$DISK_IDENTITY" ]; then
+        echo "Error: disk identity changed before erase; nothing was written" >&2
+        exit 1
+      fi
       PSEP=""
       if [[ "$DISK" == *nvme* ]] || [[ "$DISK" == *mmcblk* ]]; then
         PSEP="p"
@@ -250,20 +283,8 @@ in
 
       echo ""
       echo "==> Partitioning $DISK..."
-      if [ "$PART_MODE" = "1" ]; then
-        parted -s "$DISK" -- \
-          mklabel gpt \
-          mkpart ESP fat32 1MiB 512MiB \
-          set 1 esp on \
-          mkpart root ext4 512MiB 100%
-      else
-        parted -s "$DISK" -- \
-          mklabel gpt \
-          mkpart ESP fat32 1MiB 512MiB \
-          set 1 esp on \
-          mkpart root ext4 512MiB 50GiB \
-          mkpart data 50GiB 100%
-      fi
+      if [ "$PART_MODE" = "1" ]; then LAYOUT=whole; else LAYOUT=split; fi
+      nasty_partition_disk "$DISK" "$BOOT_MODE" "$LAYOUT"
 
       # Re-read partition table and wait for devices to settle
       partprobe "$DISK" 2>/dev/null || true
@@ -274,7 +295,9 @@ in
       PART2="''${DISK}''${PSEP}2"
 
       echo "==> Formatting partitions..."
-      mkfs.fat -F32 "$PART1"
+      if [ "$BOOT_MODE" = uefi ]; then
+        mkfs.fat -F32 "$PART1"
+      fi
       mkfs.ext4 -F -m 1 "$PART2"
       sync
 
@@ -286,7 +309,9 @@ in
       echo "==> Mounting..."
       mount -t ext4 "$PART2" /mnt
       mkdir -p /mnt/boot
-      mount -t vfat "$PART1" /mnt/boot
+      if [ "$BOOT_MODE" = uefi ]; then
+        mount -t vfat "$PART1" /mnt/boot
+      fi
 
       echo "==> Bootstrapping local system flake..."
       mkdir -p /mnt/etc/nixos
@@ -309,6 +334,7 @@ in
         --dest-dir /mnt/etc/nixos \
         --template-file /etc/nasty-source/nixos/system-flake/flake.nix.template \
         --system "$LOCAL_SYSTEM" >/dev/null
+      install -m 0644 "$BOOT_MODULE_TMP" /mnt/etc/nixos/nasty-installer-boot.nix
 
       echo "==> Generating hardware configuration..."
       nixos-generate-config --root /mnt --dir /tmp/hw-config
@@ -446,6 +472,7 @@ in
 
       echo ""
       echo "=== Installation complete! ==="
+      echo "  Installed boot mode: $BOOT_MODE"
       echo ""
       echo "  The NASty WebUI will be available at https://$NASTY_IP/"
       echo "  Default login: admin / admin"
@@ -457,22 +484,6 @@ in
       echo "  To reconfigure later:"
       echo "    nixos-rebuild switch --flake /etc/nixos#nasty"
       echo ""
-
-      if [ ! -d /sys/firmware/efi ]; then
-        echo ""
-        echo -e "\033[1;31m  ╔═══════════════════════════════════════════════════════╗"
-        echo -e "  ║                                                       ║"
-        echo -e "  ║  WARNING: You booted in Legacy BIOS mode.             ║"
-        echo -e "  ║  NASty requires UEFI to boot after installation.      ║"
-        echo -e "  ║                                                       ║"
-        echo -e "  ║  Before rebooting, switch to UEFI mode:               ║"
-        echo -e "  ║    - Proxmox: change BIOS from SeaBIOS to OVMF        ║"
-        echo -e "  ║    - Physical: enable UEFI boot in BIOS settings      ║"
-        echo -e "  ║    - Other VMs: select UEFI/OVMF firmware             ║"
-        echo -e "  ║                                                       ║"
-        echo -e "  ╚═══════════════════════════════════════════════════════╝\033[0m"
-        echo ""
-      fi
 
       read -p "Set root password now? (yes/no): " SET_PW
       if [ "$SET_PW" = "yes" ]; then
