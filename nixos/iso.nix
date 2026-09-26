@@ -1,4 +1,4 @@
-{ config, pkgs, lib, nasty-engine, nasty-webui, nasty-version, nixpkgs, nasty-rootfs-toplevel ? null, installerSystemFlake, ... }:
+{ config, pkgs, lib, nasty-engine, nasty-webui, nasty-version, nasty-rootfs-toplevel ? null, installerSystemFlake, ... }:
 
 let
   nasty-grub-theme = pkgs.runCommand "nasty-grub-theme" {
@@ -82,9 +82,10 @@ EOF
   '';
 in
 {
-  # Pre-built packages in the ISO's Nix store so nixos-install
-  # can reuse them instead of recompiling from source.
-  system.extraDependencies = [ nixpkgs nasty-engine ]
+  # Keep the pre-built appliance closure available to nixos-install. The
+  # installer already fetches nixpkgs via `nix flake lock`, so bundling its
+  # full source tree as an extra dependency only inflates the live ISO.
+  system.extraDependencies = [ nasty-engine ]
     ++ lib.optional (nasty-rootfs-toplevel != null) nasty-rootfs-toplevel
     ++ lib.optional (nasty-webui != null) nasty-webui;
 
