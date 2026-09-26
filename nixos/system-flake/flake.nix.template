@@ -143,6 +143,8 @@
             ./hardware-configuration.nix
             ./networking.nix
           ]
+          # Set by the installer to keep BIOS/UEFI choice stable across updates.
+          ++ nixpkgs.lib.optional (builtins.pathExists ./nasty-installer-boot.nix) ./nasty-installer-boot.nix
           ++ nixpkgs.lib.optional (builtins.pathExists ./passthrough.nix) ./passthrough.nix
           # VM guest-tools overlay — written by the engine when the
           # operator enables the heavy hypervisor integrations (VMware

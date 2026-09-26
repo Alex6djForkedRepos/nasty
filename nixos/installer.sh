@@ -5,6 +5,7 @@ set -euo pipefail
 TARGET_ROOT=/mnt
 DISK=""
 PART_MODE=""
+BOOT_MODE_REQUESTED=auto
 ASSUME_YES=0
 DRY_RUN=0
 NO_REBOOT=0
@@ -21,6 +22,7 @@ Install NASty from a Linux live environment.
 Options:
   --disk PATH       Target whole disk, for example /dev/nvme0n1
   --mode MODE       "whole" or "split"
+  --boot-mode MODE  "auto" (default), "uefi", or "bios"
   --yes             Skip the final destructive confirmation
   --dry-run         Validate the host, disk, release lock, and evaluation only
   --no-reboot       Return to the live shell after installation
@@ -63,6 +65,11 @@ while [ "$#" -gt 0 ]; do
       PART_MODE=$2
       shift 2
       ;;
+    --boot-mode)
+      [ "$#" -ge 2 ] || die "--boot-mode requires auto, uefi, or bios"
+      BOOT_MODE_REQUESTED=$2
+      shift 2
+      ;;
     --yes)
       ASSUME_YES=1
       shift
@@ -97,9 +104,14 @@ esac
 [ "$LOCAL_SYSTEM" = "$NASTY_INSTALL_SYSTEM" ] \
   || die "installer is for $NASTY_INSTALL_SYSTEM, but this host is $LOCAL_SYSTEM"
 
-if [ "${NASTY_INSTALL_ALLOW_NON_UEFI:-0}" != 1 ]; then
-  [ -d /sys/firmware/efi ] || die "the live system must be booted in UEFI mode"
-fi
+: "${NASTY_INSTALL_BOOT_HELPER:?installer boot helper is missing}"
+# Never allow a caller-supplied test path to override real firmware detection
+# during a destructive install.
+[ "$DRY_RUN" -eq 1 ] || unset NASTY_EFI_DIR
+# shellcheck source=nixos/installer-boot.sh
+source "$NASTY_INSTALL_BOOT_HELPER"
+BOOT_MODE=$(nasty_select_boot_mode "$BOOT_MODE_REQUESTED" "$LOCAL_SYSTEM") \
+  || die "cannot install in the requested firmware mode"
 
 shopt -s nullglob
 secure_boot_vars=(/sys/firmware/efi/efivars/SecureBoot-*)
@@ -122,6 +134,12 @@ list_disks() {
 }
 
 echo "=== NASty live-system installer ==="
+echo "Boot mode: $BOOT_MODE (detected from the live environment)"
+if [ "$BOOT_MODE" = bios ]; then
+  echo "Legacy BIOS uses GRUB and a GPT BIOS-boot partition; UEFI Secure Boot is unavailable."
+else
+  echo "UEFI uses systemd-boot and a FAT32 EFI partition."
+fi
 echo
 list_disks
 echo
@@ -184,6 +202,12 @@ DISK_IDENTITY=$(lsblk --json -b -d -o PATH,TYPE,SIZE,RO,SERIAL,WWN "$DISK" \
 echo
 echo "Selected disk:"
 lsblk -d -o NAME,SIZE,MODEL,SERIAL,WWN,TRAN "$DISK"
+echo "Boot mode: $BOOT_MODE"
+if [ "$BOOT_MODE" = bios ]; then
+  echo "Partition layout: 2 MiB BIOS-boot, ext4 root, optional unformatted data."
+else
+  echo "Partition layout: 511 MiB EFI, ext4 root, optional unformatted data."
+fi
 echo
 echo "Existing signatures:"
 wipefs "$DISK" || true
@@ -196,6 +220,8 @@ echo "==> Resolving and evaluating the NASty release before disk changes..."
 STAGE_DIR=$(mktemp -d -t nasty-install.XXXXXX)
 cp "$NASTY_SYSTEM_FLAKE/networking.nix" "$STAGE_DIR/"
 cp "$NASTY_SYSTEM_FLAKE/flake.nix" "$STAGE_DIR/"
+nasty_write_boot_module "$STAGE_DIR/nasty-installer-boot.nix" "$BOOT_MODE" "$DISK" \
+  || die "could not configure the bootloader"
 cat > "$STAGE_DIR/hardware-configuration.nix" <<'EOF'
 # Evaluation-only placeholder. The installer replaces this after partitioning.
 { ... }:
@@ -204,12 +230,18 @@ cat > "$STAGE_DIR/hardware-configuration.nix" <<'EOF'
     device = "/dev/disk/by-label/NASTY_ROOT";
     fsType = "ext4";
   };
+EOF
+if [ "$BOOT_MODE" = uefi ]; then
+  # The evaluation stub must match the filesystem layout that will be
+  # generated after partitioning; BIOS uses /boot on the ext4 root.
+  cat >> "$STAGE_DIR/hardware-configuration.nix" <<'EOF'
   fileSystems."/boot" = {
     device = "/dev/disk/by-label/NASTY_EFI";
     fsType = "vfat";
   };
-}
 EOF
+fi
+printf '}\n' >> "$STAGE_DIR/hardware-configuration.nix"
 nix --extra-experimental-features 'nix-command flakes' flake lock "$STAGE_DIR"
 nix --extra-experimental-features 'nix-command flakes' eval --raw \
   "$STAGE_DIR#nixosConfigurations.nasty.config.system.build.toplevel.drvPath" >/dev/null
@@ -238,20 +270,7 @@ wipefs --all --force "$DISK"
 sgdisk --zap-all "$DISK"
 
 echo "==> Partitioning $DISK..."
-if [ "$PART_MODE" = whole ]; then
-  parted -s "$DISK" -- \
-    mklabel gpt \
-    mkpart ESP fat32 1MiB 512MiB \
-    set 1 esp on \
-    mkpart root ext4 512MiB 100%
-else
-  parted -s "$DISK" -- \
-    mklabel gpt \
-    mkpart ESP fat32 1MiB 512MiB \
-    set 1 esp on \
-    mkpart root ext4 512MiB 50GiB \
-    mkpart data 50GiB 100%
-fi
+nasty_partition_disk "$DISK" "$BOOT_MODE" "$PART_MODE"
 
 partprobe "$DISK" 2>/dev/null || true
 udevadm settle --timeout=10
@@ -272,11 +291,13 @@ partition_path() {
   return 1
 }
 
-PART1=$(partition_path 1) || die "EFI partition did not appear"
+PART1=$(partition_path 1) || die "boot partition did not appear"
 PART2=$(partition_path 2) || die "root partition did not appear"
 
-echo "==> Formatting $PART1 and $PART2..."
-mkfs.fat -F32 -n NASTY_EFI "$PART1"
+echo "==> Formatting filesystem partitions..."
+if [ "$BOOT_MODE" = uefi ]; then
+  mkfs.fat -F32 -n NASTY_EFI "$PART1"
+fi
 mkfs.ext4 -F -m 1 -L NASTY_ROOT "$PART2"
 
 echo "==> Mounting target filesystems..."
@@ -285,8 +306,10 @@ mountpoint -q "$TARGET_ROOT" && die "$TARGET_ROOT is already a mount point"
 mount -t ext4 "$PART2" "$TARGET_ROOT"
 ROOT_MOUNTED=1
 mkdir -p "$TARGET_ROOT/boot"
-mount -t vfat "$PART1" "$TARGET_ROOT/boot"
-BOOT_MOUNTED=1
+if [ "$BOOT_MODE" = uefi ]; then
+  mount -t vfat "$PART1" "$TARGET_ROOT/boot"
+  BOOT_MOUNTED=1
+fi
 
 echo "==> Installing the machine-local system wrapper..."
 mkdir -p "$TARGET_ROOT/etc/nixos"
@@ -339,6 +362,7 @@ nixos-install --root "$TARGET_ROOT" \
 
 echo
 echo "Installation complete. Default WebUI login: admin / admin"
+echo "Installed boot mode: $BOOT_MODE"
 if [ "$PART_MODE" = split ]; then
   PART3=$(partition_path 3) || die "data partition did not appear"
   echo "Unformatted data partition: $PART3"

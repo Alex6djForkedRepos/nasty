@@ -74,6 +74,26 @@ sudo dd if=result/iso/nixos-*.iso of=/dev/sdX bs=4M status=progress
 
 Boot from USB and run `nasty-install` for guided setup.
 
+### Legacy BIOS install test (x86_64 Linux host)
+
+The ordinary NixOS test VM boots its kernel directly, so it does **not** test
+GRUB. Use SeaBIOS (QEMU's default firmware) with an install disk to check the
+bootloader as well as the OS:
+
+```bash
+qemu-img create -f qcow2 bios-install.qcow2 20G
+qemu-system-x86_64 -enable-kvm -m 4096 -smp 2 \
+  -drive file=bios-install.qcow2,format=qcow2 \
+  -cdrom result/iso/nasty-*.iso -boot d
+```
+
+Install in whole-disk mode. Confirm that the installer reports **BIOS**, that
+partition 1 has the `bios_grub` flag, and that `/etc/nixos/nasty-installer-boot.nix` selects
+GRUB. Power off and boot again **without** `-cdrom` to verify the GRUB menu and
+first boot. Then test `nixos-rebuild switch --flake /etc/nixos#nasty` and a
+generation rollback; neither should silently switch back to systemd-boot.
+Run a separate OVMF/UEFI install to check the EFI path remains intact.
+
 ## Option 3: Deploy to existing NixOS
 
 Add NASty as a flake input in your system configuration:
