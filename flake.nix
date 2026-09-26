@@ -361,7 +361,7 @@
       nasty-iso = nixpkgs.lib.nixosSystem {
         inherit system;
         specialArgs = {
-          inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools;
+          inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nixpkgs;
           nasty-rootfs-toplevel = nasty-rootfs.config.system.build.toplevel;
           installerSystemFlake = installerSystemFlake;
         };
@@ -379,7 +379,7 @@
       nasty-iso-sd = nixpkgs.lib.nixosSystem {
         inherit system;
         specialArgs = {
-          inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools;
+          inherit nasty-engine nasty-webui nasty-version nasty-bcachefs-tools nixpkgs;
           nasty-rootfs-toplevel = nasty-rootfs.config.system.build.toplevel;
           installerSystemFlake = installerSystemFlake;
         };
