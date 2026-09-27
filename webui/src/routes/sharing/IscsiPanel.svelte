@@ -24,11 +24,15 @@
 		iscsiReplacePortal,
 		iscsiRemovePortal,
 		iscsiLoadSubvolumes,
+		iscsiLoadBaseIqn,
 	} from '$lib/sharing/iscsi.svelte';
 
 	let { isAdmin = false }: { isAdmin?: boolean } = $props();
 
-	$effect(() => { if (iscsi.showCreate || iscsi.addLunTarget || iscsi.repairLunTarget) iscsiLoadSubvolumes(); });
+	$effect(() => {
+		if (iscsi.showCreate || iscsi.addLunTarget || iscsi.repairLunTarget) iscsiLoadSubvolumes();
+		if (iscsi.showCreate) iscsiLoadBaseIqn();
+	});
 
 	// Per-form "tried" flags — defer amber required-field decoration
 	// until each submit button is clicked at least once.
@@ -127,7 +131,7 @@
 			<div class="mb-4">
 				<Label for="iscsi-name">Target Name {#if !iscsi.newName && createTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</Label>
 				<Input id="iscsi-name" bind:value={iscsi.newName} placeholder="dbserver" class="mt-1 {requiredFieldCls(!iscsi.newName, createTried)}" />
-				<span class="mt-1 block text-xs text-muted-foreground">IQN: iqn.2137-01.com.nasty:{iscsi.newName || '...'}</span>
+				<span class="mt-1 block text-xs text-muted-foreground">IQN: {iscsi.iqnPrefix}:{iscsi.newName.toLowerCase() || '...'}</span>
 			</div>
 			<Button onclick={iscsiCreateGuarded}>Create</Button>
 		</CardContent>
