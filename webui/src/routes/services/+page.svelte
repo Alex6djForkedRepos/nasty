@@ -594,7 +594,7 @@
 									<div class="sm:col-span-3">
 										<label for="s-base-iqn" class="mb-1 block text-xs text-muted-foreground">Base IQN</label>
 										<input id="s-base-iqn" type="text" bind:value={baseIqn} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
-										<p class="mt-0.5 text-[0.6rem] text-muted-foreground">Prefix for all iSCSI target IQNs (e.g. iqn.2137-04.storage.nasty).</p>
+										<p class="mt-0.5 text-[0.6rem] text-muted-foreground">Prefix for new iSCSI targets (e.g. iqn.2137-04.storage.nasty). Existing target IQNs stay unchanged.</p>
 									</div>
 								</div>
 								<div class="mt-3 flex gap-2">

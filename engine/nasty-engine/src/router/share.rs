@@ -940,11 +940,14 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::iscsi::CreateTargetRequest>(req) {
                 Ok(mut p) => {
+                    let iqn = match nasty_sharing::iscsi::iqn_for_target_name(&p.name).await {
+                        Ok(iqn) => iqn,
+                        Err(error) => return Some(err(req, error)),
+                    };
                     if session_is_scoped(session) {
                         if p.device_path.is_none() {
                             return Some(err(req, "access denied"));
                         }
-                        let iqn = format!("iqn.2137-04.storage.nasty:{}", p.name);
                         if state.iscsi.list().await.is_ok_and(|targets| {
                             targets
                                 .iter()
@@ -982,6 +985,7 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                     {
                         return Some(err(req, conflict));
                     }
+                    p.resolved_iqn = Some(iqn);
                     match state.iscsi.create(p).await {
                         Ok(v) => ok(req, v),
                         Err(e) => err(req, e),

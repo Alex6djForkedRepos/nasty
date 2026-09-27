@@ -16,6 +16,7 @@ function initialIscsiState() {
 		targets: [] as IscsiTarget[],
 		loading: true,
 		protocol: null as ProtocolStatus | null,
+		iqnPrefix: 'iqn.2137-04.storage.nasty',
 		showCreate: false,
 		blockSubvolumes: [] as Subvolume[],
 		expanded: {} as Record<string, boolean>,
@@ -68,6 +69,13 @@ export async function iscsiLoadProtocol() {
 		const all = await getClient().call<ProtocolStatus[]>('service.protocol.list');
 		iscsi.protocol = all.find(p => p.name === 'iscsi') ?? null;
 	} catch { /* ignore */ }
+}
+
+export async function iscsiLoadBaseIqn() {
+	try {
+		const config = await getClient().call<{ iqn_prefix: string }>('service.base_names.get');
+		iscsi.iqnPrefix = config.iqn_prefix.toLowerCase();
+	} catch { /* keep the server default */ }
 }
 
 export async function iscsiLoadSubvolumes() {
