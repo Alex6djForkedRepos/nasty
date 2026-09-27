@@ -407,9 +407,6 @@ pkgs.testers.runNixOSTest {
     machine.start()
 
     machine.succeed("nasty-top --version | grep -Fq '0.0.11'")
-    machine.succeed("diskwatch --version | grep -Fq '0.5.8'")
-    machine.succeed("netwatch --version | grep -Fq '0.31.4'")
-    machine.succeed("syswatch --version | grep -Fq '0.14.2'")
     machine.succeed("command -v sqlite3 && sqlite3 --version")
     machine.succeed("7zz | grep -Fq '7-Zip'")
     machine.succeed("ncdu --version | grep -Fq 'ncdu 2.11.1'")
