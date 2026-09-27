@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 const STATE_DIR: &str = "/var/lib/nasty/shares/iscsi";
 const DEFAULT_IQN_PREFIX: &str = "iqn.2137-04.storage.nasty";
+const BASE_IQN_PATH: &str = "/var/lib/nasty/iscsi-base-iqn";
 const ISCSI_BASE: &str = "/sys/kernel/config/target/iscsi";
 const CORE_BASE: &str = "/sys/kernel/config/target/core";
 const UNRESOLVED_BACKSTORE: &str = "/dev/nasty-unresolved-block-volume";
@@ -167,7 +168,7 @@ impl HasId for IscsiTarget {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateTargetRequest {
-    /// Short name used to generate the IQN: iqn.2137-01.com.nasty:<name>
+    /// Short name used to generate the IQN: <configured base IQN>:<name>
     pub name: String,
     /// Optional human-readable alias for the target.
     pub alias: Option<String>,
@@ -180,6 +181,11 @@ pub struct CreateTargetRequest {
     #[serde(skip)]
     #[schemars(skip)]
     pub backing_volume: Option<BlockVolumeId>,
+    /// Resolved once by the router so scoped authorization and creation
+    /// cannot see different Base IQNs if the setting changes concurrently.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resolved_iqn: Option<String>,
     /// Current queue depth from TuningService, injected by the router.
     #[serde(skip)]
     #[schemars(skip)]
@@ -304,6 +310,62 @@ pub struct RemovePortalRequest {
 
 fn state_dir() -> StateDir {
     StateDir::new(STATE_DIR)
+}
+
+/// rtslib lowercases IQNs before looking them up in configfs. Create the
+/// configfs directory with the same spelling so saveconfig can find it.
+pub fn normalize_iqn_prefix(value: &str) -> Result<String, IscsiError> {
+    let prefix = value.trim().to_ascii_lowercase();
+    let valid = prefix
+        .strip_prefix("iqn.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(date, domain)| {
+            let (year, month) = date.split_once('-').unwrap_or(("", ""));
+            year.len() == 4
+                && year.bytes().all(|c| c.is_ascii_digit())
+                && month.len() == 2
+                && month.parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
+                && domain.split('.').count() >= 2
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                })
+        });
+    if !valid {
+        return Err(IscsiError::CommandFailed(
+            "Base IQN must look like iqn.YYYY-MM.reversed.domain (letters, digits, '-' and '.' only)"
+                .to_string(),
+        ));
+    }
+    Ok(prefix)
+}
+
+fn build_target_iqn(prefix: &str, name: &str) -> Result<String, IscsiError> {
+    validate_target_name(name)?;
+    let iqn = format!(
+        "{}:{}",
+        normalize_iqn_prefix(prefix)?,
+        name.to_ascii_lowercase()
+    );
+    if iqn.len() > 223 {
+        return Err(IscsiError::CommandFailed(
+            "iSCSI target IQN exceeds 223 characters".to_string(),
+        ));
+    }
+    Ok(iqn)
+}
+
+pub async fn iqn_for_target_name(name: &str) -> Result<String, IscsiError> {
+    let prefix = match tokio::fs::read_to_string(BASE_IQN_PATH).await {
+        Ok(prefix) => prefix,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DEFAULT_IQN_PREFIX.to_string()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    build_target_iqn(&prefix, name)
 }
 
 fn chap_enabled(userid: Option<&str>, password: Option<&str>) -> Result<bool, IscsiError> {
@@ -515,7 +577,10 @@ impl IscsiService {
     }
 
     pub async fn create(&self, req: CreateTargetRequest) -> Result<IscsiTarget, IscsiError> {
-        validate_target_name(&req.name)?;
+        let iqn = match req.resolved_iqn.as_deref() {
+            Some(iqn) => iqn.to_string(),
+            None => iqn_for_target_name(&req.name).await?,
+        };
         let has_explicit_acls = req.acls.is_some();
         if let Some(acls) = &req.acls {
             let mut initiators = std::collections::HashSet::new();
@@ -527,7 +592,6 @@ impl IscsiService {
             }
         }
         let targets: Vec<IscsiTarget> = state_dir().load_all_strict().await?;
-        let iqn = format!("{DEFAULT_IQN_PREFIX}:{}", req.name);
 
         if let Some(existing) = targets
             .into_iter()
@@ -1792,7 +1856,8 @@ fn np_path_for(tpg_path: &str, ip: &str, port: u16) -> String {
 /// then uses that string as a configfs directory name and a key in
 /// state files. RFC 3720 allows lowercase ASCII letters, digits, and
 /// `-`, `.`, `:` in the user-suffix — we accept the same set plus
-/// uppercase (LIO is case-insensitive in practice). In particular reject `_`:
+/// uppercase (canonicalized to lowercase before creating the configfs
+/// directory, as rtslib does when saving). In particular reject `_`:
 /// configfs accepts it but targetcli rejects the resulting IQN when saving,
 /// making a seemingly successful target disappear on reboot. Reject everything else,
 /// notably `/` (would escape the configfs subsystem dir) and control
@@ -2295,6 +2360,30 @@ mod tests {
         }))
         .unwrap();
         assert!(req.cmdsn_depth.is_none());
+    }
+
+    #[test]
+    fn target_iqn_uses_saved_prefix_and_rtslib_canonical_case() {
+        assert_eq!(
+            build_target_iqn(" IQN.2137-04.Storage.Nasty ", "iSCSI-1").unwrap(),
+            "iqn.2137-04.storage.nasty:iscsi-1"
+        );
+        assert_eq!(
+            build_target_iqn("iqn.2026-09.com.example", "game-server").unwrap(),
+            "iqn.2026-09.com.example:game-server"
+        );
+        assert!(build_target_iqn("iqn.2026-13.com.example", "games").is_err());
+        assert!(build_target_iqn("iqn.2026-09.com.example", "game_server").is_err());
+    }
+
+    #[test]
+    fn clients_cannot_supply_resolved_target_iqn() {
+        let req: CreateTargetRequest = serde_json::from_value(serde_json::json!({
+            "name": "games",
+            "resolved_iqn": "iqn.2026-09.other.host:games"
+        }))
+        .unwrap();
+        assert!(req.resolved_iqn.is_none());
     }
 
     #[test]

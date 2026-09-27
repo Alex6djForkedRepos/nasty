@@ -4,12 +4,13 @@
 
 	interface Props {
 		name: string;
+		prefix: string;
 	}
-	let { name = $bindable() }: Props = $props();
+	let { name = $bindable(), prefix }: Props = $props();
 </script>
 
 <div class="mb-4">
 	<Label>Target Name</Label>
 	<Input bind:value={name} placeholder="dbserver" class="mt-1" />
-	<p class="mt-1 text-xs text-muted-foreground">IQN: iqn.2137-01.com.nasty:{name || '...'}</p>
+	<p class="mt-1 text-xs text-muted-foreground">IQN: {prefix}:{name.toLowerCase() || '...'}</p>
 </div>

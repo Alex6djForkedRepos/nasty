@@ -594,9 +594,6 @@ in {
          dool -dny 1
          ncdu -x /fs/first                         browse directory usage without crossing filesystems
          btop                                       interactive CPU/mem/disk/net dashboard
-         diskwatch                                  read-only disk diagnostics TUI (devices, SMART, IO, hot files)
-         netwatch                                   read-only network diagnostics TUI (interfaces, connections, DNS, capture)
-         syswatch                                   read-only system diagnostics TUI (CPU, memory, processes, services)
          # → type 'debug' for perf profiling and kernel oops symbolization
          # → type 'benchmark' for fio storage tests
 
@@ -825,7 +822,6 @@ in {
       maintainedNcdu    # maintained ncdu fork for interactive directory usage
       htop
       python3           # scripting and quick data processing
-      uv                # fast Python package manager (uv + uvx — `uvx <tool>` for one-shots)
       file              # file type identification
       tree              # directory structure visualization
       eza               # modern ls replacement (colors, git, tree)
@@ -867,74 +863,6 @@ in {
         # what nasty-top's own flake does after nasty-top#17.
         cargoLock.lockFile = "${nastyTopSrc}/Cargo.lock";
         meta.mainProgram = "nasty-top";
-      })
-
-      # diskwatch — third-party read-only disk-diagnostics TUI (MIT,
-      # github:matthart1983/diskwatch). Consolidates lsblk/smartctl/
-      # iostat/df/SMART/hot-files into one console view and understands
-      # bcachefs multi-device mounts, so it complements nasty-top on the
-      # storage side. Packaged inline the same way as nasty-top above:
-      # pinned tag + cargoLock.lockFile, no cargoHash to maintain.
-      (let
-        diskwatchSrc = pkgs.fetchFromGitHub {
-          owner = "matthart1983";
-          repo = "diskwatch";
-          rev = "v0.5.8";
-          hash = "sha256-06zBqYPk9d+SOdltUcnHe703znyD+nPRcELV94D157w=";
-        };
-      in pkgs.rustPlatform.buildRustPackage {
-        pname = "diskwatch";
-        version = "0.5.8";
-        src = diskwatchSrc;
-        cargoLock.lockFile = "${diskwatchSrc}/Cargo.lock";
-        meta.mainProgram = "diskwatch";
-      })
-
-      # netwatch — sibling read-only network-diagnostics TUI. Packet capture
-      # uses libpcap; the TUI degrades gracefully when elevated capture/eBPF
-      # permissions are unavailable.
-      (let
-        netwatchSrc = pkgs.fetchFromGitHub {
-          owner = "matthart1983";
-          repo = "netwatch";
-          rev = "v0.31.4";
-          hash = "sha256-TnbyfgHULEPZNfAH/WImwv4XH8hESIxnC5revwLZKY0=";
-        };
-      in pkgs.rustPlatform.buildRustPackage {
-        pname = "netwatch-tui";
-        version = "0.31.4";
-        src = netwatchSrc;
-        cargoLock.lockFile = "${netwatchSrc}/Cargo.lock";
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = [ pkgs.libpcap ];
-        # Requires observing independent child processes through /proc,
-        # which is intentionally unavailable in the Nix build sandbox.
-        checkFlags = [
-          "--skip=collectors::connections::tests::controlled_polling_matrix_matches_independent_processes"
-        ];
-        postInstall = ''
-          install -Dm644 LICENSE "$out/share/licenses/netwatch/LICENSE"
-          install -Dm644 NOTICE "$out/share/licenses/netwatch/NOTICE"
-        '';
-        meta.mainProgram = "netwatch";
-      })
-
-      # syswatch — sibling read-only host-diagnostics TUI (MIT).
-      (let
-        syswatchSrc = pkgs.fetchFromGitHub {
-          owner = "matthart1983";
-          repo = "syswatch";
-          rev = "v0.14.2";
-          hash = "sha256-udVUX1qNaPDBI+nEjm7LQ+2+HG6TBlgsjyQOP8pBqao=";
-        };
-      in pkgs.rustPlatform.buildRustPackage {
-        pname = "syswatch";
-        version = "0.14.2";
-        src = syswatchSrc;
-        cargoLock.lockFile = "${syswatchSrc}/Cargo.lock";
-        nativeBuildInputs = [ pkgs.pkg-config ];
-        buildInputs = [ pkgs.libpcap ];
-        meta.mainProgram = "syswatch";
       })
 
       (writeShellScriptBin "nasty-cleanup" ''

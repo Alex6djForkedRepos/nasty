@@ -278,7 +278,7 @@ pub(super) async fn try_route(
                 .unwrap_or_else(|_| "nqn.2137-04.storage.nasty".into());
             ok(
                 req,
-                serde_json::json!({ "iqn_prefix": iqn.trim(), "nqn_prefix": nqn.trim() }),
+                serde_json::json!({ "iqn_prefix": iqn.trim().to_ascii_lowercase(), "nqn_prefix": nqn.trim() }),
             )
         }
         "service.base_names.update" => {
@@ -287,13 +287,15 @@ pub(super) async fn try_route(
                 .as_ref()
                 .and_then(|p| p.get("iqn_prefix"))
                 .and_then(|v| v.as_str())
-                && let Err(e) = tokio::fs::write("/var/lib/nasty/iscsi-base-iqn", iqn.trim()).await
             {
-                // Non-fatal — the engine still has the value in memory
-                // — but at restart it'll fall back to the default IQN,
-                // which is confusing if the user just configured a
-                // custom one.
-                tracing::warn!("persist iscsi base IQN failed: {e}");
+                let prefix = match nasty_sharing::iscsi::normalize_iqn_prefix(iqn) {
+                    Ok(prefix) => prefix,
+                    Err(error) => return Some(err(req, error)),
+                };
+                if let Err(error) = tokio::fs::write("/var/lib/nasty/iscsi-base-iqn", prefix).await
+                {
+                    return Some(err(req, format!("persist iscsi base IQN failed: {error}")));
+                }
             }
             if let Some(nqn) = req
                 .params

@@ -135,6 +135,11 @@ in
     + lib.optionalString pkgs.stdenv.hostPlatform.isAarch64 " -Xbcj arm64"
   );
 
+  # The live initrd sits outside the compressed SquashFS. Use xz here too;
+  # the installed appliance is built from a separate configuration.
+  boot.initrd.compressor = "xz";
+  boot.initrd.compressorArgs = [ "--check=crc32" "--threads=1" "--lzma2=preset=9e,dict=16MiB" ];
+
   environment.systemPackages = with pkgs; [
     bcachefs-tools
     parted

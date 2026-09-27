@@ -42,6 +42,7 @@
 		iscsi,
 		iscsiRefresh,
 		iscsiLoadProtocol,
+		iscsiLoadBaseIqn,
 	} from '$lib/sharing/iscsi.svelte';
 	import {
 		nvme,
@@ -136,6 +137,7 @@
 	}
 
 	function openShareWizard() {
+		if (activeTab === 'iscsi') iscsiLoadBaseIqn();
 		shareWizardStep = 1;
 		// The wizard is protocol-only (its button is hidden on the guest tab);
 		// guard keeps the types honest and is a no-op on 'guest'.
@@ -323,6 +325,7 @@
 			nfsLoadProtocol(),
 			smbLoadProtocol(),
 			iscsiLoadProtocol(),
+			iscsiLoadBaseIqn(),
 			nvmeLoadProtocol(),
 			rdmaLoad(),
 		]);
@@ -468,7 +471,7 @@
 					canMutateIdentities={canMutateSmbIdentities}
 				/>
 			{:else if shareProtocol === 'iscsi'}
-				<IscsiWizardForm bind:name={shareIscsiName} />
+				<IscsiWizardForm bind:name={shareIscsiName} prefix={iscsi.iqnPrefix} />
 			{:else if shareProtocol === 'nvmeof'}
 				<NvmeofWizardForm
 					bind:name={shareNvmeofName}
@@ -502,7 +505,7 @@
 						maxSizeGib={shareSmbTmMaxSize}
 					/>
 				{:else if shareProtocol === 'iscsi'}
-					<IscsiWizardReview name={shareIscsiName} fallbackName={sv?.name ?? ''} />
+					<IscsiWizardReview name={shareIscsiName} fallbackName={sv?.name ?? ''} prefix={iscsi.iqnPrefix} />
 				{:else if shareProtocol === 'nvmeof'}
 					<NvmeofWizardReview
 						name={shareNvmeofName}
