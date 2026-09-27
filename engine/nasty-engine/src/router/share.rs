@@ -982,6 +982,7 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                     {
                         return Some(err(req, conflict));
                     }
+                    p.cmdsn_depth = Some(state.tuning.get().await.iscsi_default_cmdsn_depth);
                     match state.iscsi.create(p).await {
                         Ok(v) => ok(req, v),
                         Err(e) => err(req, e),

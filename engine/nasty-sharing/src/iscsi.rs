@@ -180,6 +180,10 @@ pub struct CreateTargetRequest {
     #[serde(skip)]
     #[schemars(skip)]
     pub backing_volume: Option<BlockVolumeId>,
+    /// Current queue depth from TuningService, injected by the router.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub cmdsn_depth: Option<u32>,
     /// Initiator ACLs to set up. When provided, `generate_node_acls` is
     /// disabled and only these initiators are allowed.
     pub acls: Option<Vec<AclEntry>>,
@@ -596,6 +600,15 @@ impl IscsiService {
         }
 
         let configure = async {
+            // TuningService updates only TPGs that already exist. Apply the
+            // saved depth to this new TPG before saveconfig persists it.
+            if let Some(depth) = req.cmdsn_depth {
+                configfs_write(
+                    &format!("{tpg_path}/attrib/default_cmdsn_depth"),
+                    &depth.to_string(),
+                )
+                .await?;
+            }
             // Explicit ACL targets start deny-by-default and never enter demo mode.
             configfs_write(&format!("{tpg_path}/attrib/authentication"), "0").await?;
             configfs_write(
@@ -2272,6 +2285,16 @@ mod tests {
             "WWN not valid as: iqn, naa, eui"
         );
         assert_eq!(saveconfig_error_detail(b"ignored", b"error"), "error");
+    }
+
+    #[test]
+    fn clients_cannot_override_new_target_queue_depth() {
+        let req: CreateTargetRequest = serde_json::from_value(serde_json::json!({
+            "name": "games",
+            "cmdsn_depth": 999
+        }))
+        .unwrap();
+        assert!(req.cmdsn_depth.is_none());
     }
 
     #[test]
