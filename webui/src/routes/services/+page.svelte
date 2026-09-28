@@ -99,13 +99,23 @@
 	async function saveNut() {
 		savingNut = true;
 		await withToast(
-			() => client.call('system.nut.config.update', {
-				driver: nutDriver, port: nutPort, ups_name: nutUpsName,
-				description: nutDescription || undefined,
-				shutdown_on_battery_percent: parseInt(nutShutdownPercent) || undefined,
-				shutdown_on_battery_seconds: parseInt(nutShutdownSeconds) || undefined,
-			}),
-			'UPS configuration saved'
+			async () => {
+				await client.call('system.nut.config.update', {
+					driver: nutDriver, port: nutPort, ups_name: nutUpsName,
+					description: nutDescription || undefined,
+					shutdown_on_battery_percent: parseInt(nutShutdownPercent) || undefined,
+					shutdown_on_battery_seconds: parseInt(nutShutdownSeconds) || undefined,
+				});
+				for (let attempt = 0; attempt < 60; attempt++) {
+					const status = await client.call<{ state: 'idle' | 'applying' | 'applied' | 'failed'; error: string | null }>('system.nut.apply_status');
+					if (status.state === 'applied') return;
+					if (status.state === 'failed') throw new Error(`UPS configuration saved, but NUT restart failed: ${status.error ?? 'unknown error'}`);
+					if (status.state === 'idle') throw new Error('UPS configuration saved, but apply status was lost');
+					await new Promise(resolve => setTimeout(resolve, 2000));
+				}
+				throw new Error('UPS configuration saved, but NUT restart is still in progress');
+			},
+			'UPS configuration applied'
 		);
 		savingNut = false;
 		nutConfig = null;
@@ -647,7 +657,7 @@
 										<p class="mt-0.5 text-[0.6rem] text-muted-foreground">0 = disabled.</p>
 									</div>
 								</div>
-								<Button size="sm" class="mt-3" onclick={saveNut} disabled={savingNut}>{savingNut ? 'Saving...' : 'Save'}</Button>
+								<Button size="sm" class="mt-3" onclick={saveNut} disabled={savingNut}>{savingNut ? 'Applying...' : 'Save'}</Button>
 							{:else if proto.name === 'watchdog' && watchdogConfig}
 								<div class="max-w-2xl space-y-4">
 									<div class="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
