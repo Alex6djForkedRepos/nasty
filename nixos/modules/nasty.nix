@@ -1924,7 +1924,26 @@ in {
       nfsd."vers4.2" = true;
     };
 
-    systemd.services.nfs-server.wantedBy = mkIf cfg.nfs.enable (lib.mkForce []);
+    systemd.services.nfs-server = mkIf cfg.nfs.enable {
+      wantedBy = lib.mkForce [];
+      # The engine starts NFS after loading tuning.json, so its startup-time
+      # apply cannot reach nfsd. Lease/grace must be set before worker threads
+      # start; thread count can be set after nfs-server becomes active.
+      preStart = lib.mkAfter ''
+        if [ -f /var/lib/nasty/tuning.json ]; then
+          lease=$(${pkgs.jq}/bin/jq -er '.nfs_lease_time // 90 | numbers' /var/lib/nasty/tuning.json)
+          grace=$(${pkgs.jq}/bin/jq -er '.nfs_grace_time // 90 | numbers' /var/lib/nasty/tuning.json)
+          printf '%s\n' "$lease" > /proc/fs/nfsd/nfsv4leasetime
+          printf '%s\n' "$grace" > /proc/fs/nfsd/nfsv4gracetime
+        fi
+      '';
+      postStart = lib.mkAfter ''
+        if [ -f /var/lib/nasty/tuning.json ]; then
+          threads=$(${pkgs.jq}/bin/jq -er '.nfs_threads // 8 | numbers' /var/lib/nasty/tuning.json)
+          printf '%s\n' "$threads" > /proc/fs/nfsd/threads
+        fi
+      '';
+    };
 
     # Disable rpcbind — not needed for NFSv4-only
     services.rpcbind.enable = lib.mkForce false;
