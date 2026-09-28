@@ -328,10 +328,11 @@
 	}
 
 	async function saveRestConfig() {
-		await withToast(
+		const saved = await withToast(
 			() => client.call('service.rest_server.configure', { path: restServerPath }),
 			'Backup Server path updated'
 		);
+		if (saved === undefined) return;
 		showRestConfig = false;
 		await refresh();
 	}

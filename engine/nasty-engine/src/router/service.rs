@@ -28,6 +28,20 @@ fn rest_server_requires_root_equivalent(method: &str) -> bool {
     )
 }
 
+fn validate_rest_server_path(path: &str) -> Result<(), String> {
+    if !std::path::Path::new(path).is_absolute()
+        || std::path::Path::new(path)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        || path.chars().any(char::is_control)
+    {
+        return Err(
+            "Backup Server path must be absolute, without '..' or control characters".into(),
+        );
+    }
+    Ok(())
+}
+
 fn require_protocol_mutation_access(
     req: &Request,
     session: &Session,
@@ -354,13 +368,18 @@ pub(super) async fn try_route(
                 Ok(s) => s.to_string(),
                 Err(r) => return Some(r),
             };
+            if let Err(error) = validate_rest_server_path(&path) {
+                return Some(err(req, error));
+            }
 
             // Create subvolume if path is under /fs/ and doesn't exist
-            if path.starts_with("/fs/")
-                && !std::path::Path::new(&path).exists()
-                && let Some(rest) = path.strip_prefix("/fs/")
-                && let Some((fs_name, subvol_name)) = rest.split_once('/')
-            {
+            if path.starts_with("/fs/") && !std::path::Path::new(&path).exists() {
+                let Some((fs_name, subvol_name)) = path[4..].split_once('/') else {
+                    return Some(err(
+                        req,
+                        "Backup Server path must specify /fs/<filesystem>/<subvolume>",
+                    ));
+                };
                 let create_req = nasty_storage::subvolume::CreateSubvolumeRequest {
                     filesystem: fs_name.to_string(),
                     name: subvol_name.to_string(),
@@ -377,24 +396,57 @@ pub(super) async fn try_route(
                     block_filesystem: None,
                 };
                 if let Err(e) = state.subvolumes.create(create_req, None).await {
-                    // Without this log, the path write below succeeds
-                    // but the subvolume actually doesn't exist —
-                    // rest-server then refuses to start with a confusing
-                    // "no such file" error and the user has nothing to
-                    // tie the two together.
-                    tracing::warn!("rest-server storage subvolume create failed: {e}");
+                    return Some(err(
+                        req,
+                        format!("Backup Server storage could not be created: {e}"),
+                    ));
                 }
+            }
+
+            if !path.starts_with("/fs/")
+                && let Err(error) = tokio::fs::create_dir_all(&path).await
+            {
+                return Some(err(req, format!("create Backup Server directory: {error}")));
+            }
+            if !std::path::Path::new(&path).is_dir() {
+                return Some(err(
+                    req,
+                    format!("Backup Server path is not a directory: {path}"),
+                ));
             }
 
             if let Err(e) = tokio::fs::write("/var/lib/nasty/rest-server-path", &path).await {
                 return Some(err(req, format!("write config: {e}")));
             }
 
-            // Restart rest-server to pick up new path. `try_run` logs
-            // failures so a botched restart (config typo, port collision,
-            // etc.) shows up in the journal even though we don't surface
-            // it on the RPC reply (we already ack'd the path write).
-            nasty_common::cmd::try_run("systemctl", &["restart", "nasty-rest-server"]).await;
+            // A disabled service reads the path on its next enable. Restart
+            // only when enabled and report a failed apply distinctly from
+            // the already-persisted path setting.
+            if state
+                .protocols
+                .is_enabled(nasty_system::protocol::Protocol::RestServer)
+                .await
+            {
+                if let Err(error) =
+                    nasty_common::cmd::run_ok("systemctl", &["restart", "nasty-rest-server"]).await
+                {
+                    return Some(err(
+                        req,
+                        format!("Backup Server path saved, but restart failed: {error}"),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if !state
+                    .protocols
+                    .is_running(nasty_system::protocol::Protocol::RestServer)
+                    .await
+                {
+                    return Some(err(
+                        req,
+                        "Backup Server path saved, but service failed to stay running",
+                    ));
+                }
+            }
 
             ok(req, "ok")
         }
@@ -404,7 +456,9 @@ pub(super) async fn try_route(
 
 #[cfg(test)]
 mod tests {
-    use super::{protocol_mutation_access, rest_server_requires_root_equivalent};
+    use super::{
+        protocol_mutation_access, rest_server_requires_root_equivalent, validate_rest_server_path,
+    };
     use crate::auth::{EndpointAccess, Role, Session, authorize_session};
     use nasty_system::protocol::Protocol;
 
@@ -420,6 +474,15 @@ mod tests {
             must_change_password: false,
             client_ip: None,
         }
+    }
+
+    #[test]
+    fn rest_server_storage_path_must_be_absolute_without_parent_traversal() {
+        assert!(validate_rest_server_path("/fs/tank/backups").is_ok());
+        assert!(validate_rest_server_path("/var/lib/nasty/backups").is_ok());
+        assert!(validate_rest_server_path("backups").is_err());
+        assert!(validate_rest_server_path("/fs/tank/../elsewhere").is_err());
+        assert!(validate_rest_server_path("/fs/tank/backup\nelsewhere").is_err());
     }
 
     #[test]
