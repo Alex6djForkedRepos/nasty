@@ -10,6 +10,8 @@ use uuid::Uuid;
 const STATE_DIR: &str = "/var/lib/nasty/shares/nvmeof";
 const NVMET_BASE: &str = "/sys/kernel/config/nvmet";
 const DEFAULT_NQN_PREFIX: &str = "nqn.2137-04.storage.nasty";
+const BASE_NQN_PATH: &str = "/var/lib/nasty/nvmeof-base-nqn";
+const PREFIX_HISTORY_DIR: &str = "/var/lib/nasty/nvmeof-managed-prefixes";
 
 #[derive(Debug, Error)]
 pub enum NvmeofError {
@@ -98,6 +100,10 @@ pub struct CreateSubsystemRequest {
     #[serde(skip)]
     #[schemars(skip)]
     pub backing_volume: Option<BlockVolumeId>,
+    /// Resolved once by the router for both scoped authorization and creation.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resolved_nqn: Option<String>,
     /// Listen address (default 0.0.0.0). Only used when `device_path` is set.
     pub addr: Option<String>,
     /// Port number (default 4420). Only used when `device_path` is set.
@@ -197,6 +203,115 @@ fn state_dir() -> StateDir {
     StateDir::new(STATE_DIR)
 }
 
+static PREFIX_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub fn normalize_nqn_prefix(value: &str) -> Result<String, NvmeofError> {
+    let prefix = value.trim().to_ascii_lowercase();
+    let valid = prefix
+        .strip_prefix("nqn.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(date, domain)| {
+            let (year, month) = date.split_once('-').unwrap_or(("", ""));
+            year.len() == 4
+                && year.bytes().all(|c| c.is_ascii_digit())
+                && month.len() == 2
+                && month.parse::<u8>().is_ok_and(|m| (1..=12).contains(&m))
+                && domain.split('.').count() >= 2
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                })
+        });
+    if !valid {
+        return Err(NvmeofError::ConfigFs(
+            "Base NQN must look like nqn.YYYY-MM.reversed.domain (letters, digits, '-' and '.' only)"
+                .to_string(),
+        ));
+    }
+    Ok(prefix)
+}
+
+fn build_subsystem_nqn(prefix: &str, name: &str) -> Result<String, NvmeofError> {
+    validate_subsystem_name(name)?;
+    let nqn = format!("{}:{name}", normalize_nqn_prefix(prefix)?);
+    if nqn.len() > 223 {
+        return Err(NvmeofError::ConfigFs(
+            "NVMe-oF subsystem NQN exceeds 223 bytes".to_string(),
+        ));
+    }
+    Ok(nqn)
+}
+
+async fn base_nqn_prefix() -> Result<String, NvmeofError> {
+    let value = match tokio::fs::read_to_string(BASE_NQN_PATH).await {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DEFAULT_NQN_PREFIX.to_string()
+        }
+        Err(error) => return Err(error.into()),
+    };
+    normalize_nqn_prefix(&value)
+}
+
+async fn prefix_history_in(dir: &Path) -> Result<std::collections::BTreeSet<String>, NvmeofError> {
+    let path = dir.join("history.json");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error.into()),
+    };
+    serde_json::from_str(&text)
+        .map_err(|error| NvmeofError::ConfigFs(format!("parse {}: {error}", path.display())))
+}
+
+async fn remember_prefix_in(dir: &Path, prefix: &str) -> Result<(), NvmeofError> {
+    let mut prefixes = prefix_history_in(dir).await?;
+    if prefixes.insert(prefix.to_string()) {
+        StateDir::new(dir).save("history", &prefixes).await?;
+    }
+    Ok(())
+}
+
+async fn prefix_history() -> Result<std::collections::BTreeSet<String>, NvmeofError> {
+    prefix_history_in(Path::new(PREFIX_HISTORY_DIR)).await
+}
+
+async fn remember_prefix(prefix: &str) -> Result<(), NvmeofError> {
+    remember_prefix_in(Path::new(PREFIX_HISTORY_DIR), prefix).await
+}
+
+fn persisted_prefixes(persisted: &[NvmeofSubsystem]) -> std::collections::BTreeSet<String> {
+    let mut prefixes = std::collections::BTreeSet::from([DEFAULT_NQN_PREFIX.to_string()]);
+    for subsystem in persisted {
+        if let Some((prefix, _)) = subsystem.nqn.split_once(':') {
+            prefixes.insert(prefix.to_string());
+        }
+    }
+    prefixes
+}
+
+async fn managed_prefixes(
+    persisted: &[NvmeofSubsystem],
+) -> Result<std::collections::BTreeSet<String>, NvmeofError> {
+    let mut prefixes = persisted_prefixes(persisted);
+    prefixes.extend(prefix_history().await?);
+    // Older versions could save invalid, unused Base NQNs. Keep recovery
+    // driven by persisted subsystem identities even if that setting is bad.
+    if let Ok(prefix) = base_nqn_prefix().await {
+        prefixes.insert(prefix);
+    }
+    Ok(prefixes)
+}
+
+fn is_managed_nqn(nqn: &str, prefixes: &std::collections::BTreeSet<String>) -> bool {
+    prefixes.iter().any(|prefix| {
+        nqn.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+    })
+}
+
 /// Derive next port ID by scanning existing ports in configfs.
 async fn next_port_id() -> u16 {
     let ports_dir = format!("{NVMET_BASE}/ports");
@@ -226,6 +341,31 @@ impl Default for NvmeofService {
 impl NvmeofService {
     pub fn new() -> Self {
         Self
+    }
+
+    pub async fn update_base_nqn_prefix(value: &str) -> Result<String, NvmeofError> {
+        let prefix = normalize_nqn_prefix(value)?;
+        let _guard = PREFIX_LOCK.lock().await;
+        // Older versions accepted arbitrary text here but never used it to
+        // create subsystems. Let an operator replace an invalid saved value.
+        let previous = match base_nqn_prefix().await {
+            Ok(previous) => previous,
+            Err(NvmeofError::ConfigFs(_)) => DEFAULT_NQN_PREFIX.to_string(),
+            Err(error) => return Err(error),
+        };
+        remember_prefix(&previous).await?;
+        remember_prefix(&prefix).await?;
+        tokio::fs::write(BASE_NQN_PATH, &prefix).await?;
+        Ok(prefix)
+    }
+
+    pub async fn nqn_for_subsystem(name: &str) -> Result<String, NvmeofError> {
+        validate_subsystem_name(name)?;
+        let _guard = PREFIX_LOCK.lock().await;
+        let prefix = base_nqn_prefix().await?;
+        let nqn = build_subsystem_nqn(&prefix, name)?;
+        remember_prefix(&prefix).await?;
+        Ok(nqn)
     }
 
     pub async fn repair_namespace(
@@ -413,6 +553,22 @@ impl NvmeofService {
     /// state. nvmet configfs survives an engine-process restart, so merely
     /// skipping restore is not sufficient when backing identity is unsafe.
     pub async fn quiesce(&self) -> Result<(), NvmeofError> {
+        let (persisted, state_error) = match state_dir().load_all_strict().await {
+            Ok(persisted) => (persisted, None),
+            Err(error) => {
+                warn!("Cannot load NVMe-oF state for quiesce: {error}");
+                (Vec::new(), Some(NvmeofError::Io(error)))
+            }
+        };
+        let (prefixes, history_error) = match managed_prefixes(&persisted).await {
+            Ok(prefixes) => (prefixes, None),
+            Err(error) => {
+                // A damaged prefix history must not prevent us from disabling
+                // the exports still identified by persisted subsystem state.
+                warn!("Cannot load managed NVMe-oF prefix history: {error}");
+                (persisted_prefixes(&persisted), Some(error))
+            }
+        };
         let subsystem_dir = format!("{NVMET_BASE}/subsystems");
         let mut subsystems = match tokio::fs::read_dir(&subsystem_dir).await {
             Ok(entries) => entries,
@@ -422,7 +578,7 @@ impl NvmeofService {
         while let Some(subsystem) = subsystems.next_entry().await? {
             let nqn = subsystem.file_name();
             let nqn = nqn.to_string_lossy();
-            if !nqn.starts_with(DEFAULT_NQN_PREFIX) {
+            if !is_managed_nqn(&nqn, &prefixes) {
                 continue;
             }
             let namespace_dir = subsystem.path().join("namespaces");
@@ -438,7 +594,11 @@ impl NvmeofService {
                 })?;
             }
         }
-        Ok(())
+        if let Some(error) = state_error.or(history_error) {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Whether every persisted enabled namespace is currently enabled in
@@ -526,7 +686,10 @@ impl NvmeofService {
             }
         }
         let subsystems: Vec<NvmeofSubsystem> = state_dir().load_all_strict().await?;
-        let nqn = format!("{DEFAULT_NQN_PREFIX}:{}", req.name);
+        let nqn = match req.resolved_nqn.as_deref() {
+            Some(nqn) => nqn.to_string(),
+            None => Self::nqn_for_subsystem(&req.name).await?,
+        };
 
         if let Some(existing) = subsystems.into_iter().find(|s| s.nqn == nqn) {
             info!("NVMe-oF subsystem {nqn} already exists, returning existing (idempotent)");
@@ -1312,6 +1475,7 @@ async fn restore_namespace(ns_path: &str, namespace: &Namespace) -> Result<(), N
 async fn validate_managed_configfs_inventory(
     expected: &[NvmeofSubsystem],
 ) -> Result<(), NvmeofError> {
+    let prefixes = managed_prefixes(expected).await?;
     let expected: std::collections::HashMap<&str, std::collections::HashSet<u32>> = expected
         .iter()
         .map(|subsystem| {
@@ -1333,7 +1497,7 @@ async fn validate_managed_configfs_inventory(
     };
     while let Some(subsystem) = subsystems.next_entry().await? {
         let nqn = subsystem.file_name().to_string_lossy().to_string();
-        if !nqn.starts_with(DEFAULT_NQN_PREFIX) {
+        if !is_managed_nqn(&nqn, &prefixes) {
             continue;
         }
         let Some(expected_namespaces) = expected.get(nqn.as_str()) else {
@@ -1499,6 +1663,64 @@ fn validate_transport(t: &str) -> Result<(), NvmeofError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_nqn_prefix_is_validated_and_used_for_new_names() {
+        assert_eq!(
+            build_subsystem_nqn(" NQN.2026-09.Com.Example ", "fast-store").unwrap(),
+            "nqn.2026-09.com.example:fast-store"
+        );
+        assert!(build_subsystem_nqn("nqn.2026-13.com.example", "fast-store").is_err());
+        assert!(build_subsystem_nqn("nqn.2026-09.com.example", "bad/name").is_err());
+        assert!(build_subsystem_nqn("nqn.2026-09.com.example", &"x".repeat(200)).is_err());
+    }
+
+    #[test]
+    fn managed_prefix_match_keeps_old_names_and_ignores_foreign_targets() {
+        let prefixes = [
+            DEFAULT_NQN_PREFIX.to_string(),
+            "nqn.2026-09.com.example".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert!(is_managed_nqn("nqn.2137-04.storage.nasty:old", &prefixes));
+        assert!(is_managed_nqn("nqn.2026-09.com.example:new", &prefixes));
+        assert!(!is_managed_nqn(
+            "nqn.2026-09.com.example-extra:foreign",
+            &prefixes
+        ));
+        assert!(!is_managed_nqn(
+            "nqn.2014-08.org.nvmexpress.discovery",
+            &prefixes
+        ));
+    }
+
+    #[test]
+    fn client_cannot_choose_resolved_subsystem_nqn() {
+        let req: CreateSubsystemRequest = serde_json::from_value(serde_json::json!({
+            "name": "fast-store",
+            "resolved_nqn": "nqn.2026-09.other.host:fast-store"
+        }))
+        .unwrap();
+        assert!(req.resolved_nqn.is_none());
+    }
+
+    #[tokio::test]
+    async fn prefix_history_survives_changes_and_fails_closed_when_corrupt() {
+        let dir = std::env::temp_dir().join(format!("nasty-nqn-history-{}", Uuid::new_v4()));
+        remember_prefix_in(&dir, DEFAULT_NQN_PREFIX).await.unwrap();
+        remember_prefix_in(&dir, "nqn.2026-09.com.example")
+            .await
+            .unwrap();
+        let history = prefix_history_in(&dir).await.unwrap();
+        assert!(is_managed_nqn("nqn.2137-04.storage.nasty:old", &history));
+        assert!(is_managed_nqn("nqn.2026-09.com.example:new", &history));
+        tokio::fs::write(dir.join("history.json"), "not JSON")
+            .await
+            .unwrap();
+        assert!(prefix_history_in(&dir).await.is_err());
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
 
     fn volume(pool: &str, id: u32) -> BlockVolumeId {
         BlockVolumeId {

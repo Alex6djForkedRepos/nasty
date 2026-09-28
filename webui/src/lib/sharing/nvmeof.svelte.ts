@@ -15,6 +15,7 @@ function initialNvmeState() {
 		subsystems: [] as NvmeofSubsystem[],
 		loading: true,
 		protocol: null as ProtocolStatus | null,
+		nqnPrefix: 'nqn.2137-04.storage.nasty',
 		showCreate: false,
 		blockSubvolumes: [] as Subvolume[],
 		expanded: {} as Record<string, boolean>,
@@ -60,6 +61,13 @@ export async function nvmeLoadProtocol() {
 		const all = await getClient().call<ProtocolStatus[]>('service.protocol.list');
 		nvme.protocol = all.find(p => p.name === 'nvmeof') ?? null;
 	} catch { /* ignore */ }
+}
+
+export async function nvmeLoadBaseNqn() {
+	try {
+		const config = await getClient().call<{ nqn_prefix: string }>('service.base_names.get');
+		nvme.nqnPrefix = config.nqn_prefix.toLowerCase();
+	} catch { /* keep the server default */ }
 }
 
 export async function nvmeLoadSubvolumes() {

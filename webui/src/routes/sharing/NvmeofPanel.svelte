@@ -23,11 +23,15 @@
 		nvmeAddHost,
 		nvmeRemoveHost,
 		nvmeLoadSubvolumes,
+		nvmeLoadBaseNqn,
 	} from '$lib/sharing/nvmeof.svelte';
 
 	let { isAdmin = false }: { isAdmin?: boolean } = $props();
 
-	$effect(() => { if (nvme.showCreate || nvme.addNsSubsys || nvme.repairNsSubsys) nvmeLoadSubvolumes(); });
+	$effect(() => {
+		if (nvme.showCreate || nvme.addNsSubsys || nvme.repairNsSubsys) nvmeLoadSubvolumes();
+		if (nvme.showCreate) nvmeLoadBaseNqn();
+	});
 
 	// Per-form "tried" flags — defer amber required-field decoration
 	// until each submit button is clicked at least once.
@@ -111,7 +115,7 @@
 			<div class="mb-4">
 				<Label for="nvme-name">Share Name {#if !nvme.newName && createTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</Label>
 				<Input id="nvme-name" bind:value={nvme.newName} placeholder="faststore" class="mt-1 {requiredFieldCls(!nvme.newName, createTried)}" />
-				<span class="mt-1 block text-xs text-muted-foreground">NQN: nqn.2137.com.nasty:{nvme.newName || '...'}</span>
+				<span class="mt-1 block text-xs text-muted-foreground">NQN: {nvme.nqnPrefix}:{nvme.newName || '...'}</span>
 			</div>
 			<div class="grid grid-cols-2 gap-4 mb-4">
 				<div>

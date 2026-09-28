@@ -6,13 +6,15 @@
 		name: string;
 		addr: string;
 		port: string;
+		prefix: string;
 	}
-	let { name = $bindable(), addr = $bindable(), port = $bindable() }: Props = $props();
+	let { name = $bindable(), addr = $bindable(), port = $bindable(), prefix }: Props = $props();
 </script>
 
 <div class="mb-4">
 	<Label>Subsystem Name</Label>
 	<Input bind:value={name} placeholder="storage-vol" class="mt-1" />
+	<p class="mt-1 text-xs text-muted-foreground">NQN: {prefix}:{name || '...'}</p>
 </div>
 <div class="grid grid-cols-2 gap-4 mb-4">
 	<div>

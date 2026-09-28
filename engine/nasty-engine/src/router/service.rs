@@ -302,9 +302,12 @@ pub(super) async fn try_route(
                 .as_ref()
                 .and_then(|p| p.get("nqn_prefix"))
                 .and_then(|v| v.as_str())
-                && let Err(e) = tokio::fs::write("/var/lib/nasty/nvmeof-base-nqn", nqn.trim()).await
             {
-                tracing::warn!("persist nvmeof base NQN failed: {e}");
+                if let Err(error) =
+                    nasty_sharing::nvmeof::NvmeofService::update_base_nqn_prefix(nqn).await
+                {
+                    return Some(err(req, error));
+                }
             }
             ok(req, "ok")
         }

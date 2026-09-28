@@ -1306,11 +1306,16 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
             }
             match parse_params::<nasty_sharing::nvmeof::CreateSubsystemRequest>(req) {
                 Ok(mut p) => {
+                    if session_is_scoped(session) && p.device_path.is_none() {
+                        return Some(err(req, "access denied"));
+                    }
+                    let nqn = match nasty_sharing::nvmeof::NvmeofService::nqn_for_subsystem(&p.name)
+                        .await
+                    {
+                        Ok(nqn) => nqn,
+                        Err(error) => return Some(err(req, error)),
+                    };
                     if session_is_scoped(session) {
-                        if p.device_path.is_none() {
-                            return Some(err(req, "access denied"));
-                        }
-                        let nqn = format!("nqn.2137-04.storage.nasty:{}", p.name);
                         if state.nvmeof.list().await.is_ok_and(|subsystems| {
                             subsystems.iter().any(|subsystem| subsystem.nqn == nqn)
                         }) {
@@ -1339,6 +1344,7 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                     {
                         return Some(err(req, conflict));
                     }
+                    p.resolved_nqn = Some(nqn);
                     match state.nvmeof.create(p).await {
                         Ok(v) => {
                             // If Tailscale is connected, add a port for its IP too
