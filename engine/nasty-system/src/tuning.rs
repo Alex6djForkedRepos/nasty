@@ -144,6 +144,18 @@ impl TuningService {
 
     pub async fn update(&self, update: TuningUpdate) -> Result<TuningConfig, String> {
         let mut config = self.state.write().await;
+        let nfs_running = if update.nfs_threads.is_some()
+            || update.nfs_lease_time.is_some()
+            || update.nfs_grace_time.is_some()
+        {
+            tokio::process::Command::new("systemctl")
+                .args(["is-active", "--quiet", "nfs-server.service"])
+                .status()
+                .await
+                .is_ok_and(|status| status.success())
+        } else {
+            false
+        };
 
         // ── NFS ──
         if let Some(v) = update.nfs_threads {
@@ -151,7 +163,9 @@ impl TuningService {
                 return Err("nfs_threads must be > 0".into());
             }
             if v != config.nfs_threads {
-                apply_nfs_threads(v).await?;
+                if nfs_running {
+                    apply_nfs_threads(v).await?;
+                }
                 config.nfs_threads = v;
             }
         }
@@ -162,7 +176,9 @@ impl TuningService {
             if v != config.nfs_lease_time {
                 // nfsv4leasetime returns EBUSY when clients hold active leases.
                 // This is expected — the new value takes effect after existing leases expire.
-                if let Err(e) = apply_proc_value("/proc/fs/nfsd/nfsv4leasetime", v).await {
+                if nfs_running
+                    && let Err(e) = apply_proc_value("/proc/fs/nfsd/nfsv4leasetime", v).await
+                {
                     warn!("Cannot set NFS lease time while leases are active: {e}");
                     return Err("NFS lease time cannot be changed while clients hold active leases. Disconnect all NFS clients first.".into());
                 }
@@ -174,7 +190,9 @@ impl TuningService {
                 return Err("nfs_grace_time must be > 0".into());
             }
             if v != config.nfs_grace_time {
-                if let Err(e) = apply_proc_value("/proc/fs/nfsd/nfsv4gracetime", v).await {
+                if nfs_running
+                    && let Err(e) = apply_proc_value("/proc/fs/nfsd/nfsv4gracetime", v).await
+                {
                     warn!("Cannot set NFS grace time: {e}");
                     return Err(
                         "NFS grace time cannot be changed while the server is active.".into(),
