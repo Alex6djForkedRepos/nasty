@@ -297,6 +297,7 @@ fn is_read_only(method: &str) -> bool {
                 | "system.settings.get"
                 | "system.tuning.get"
                 | "system.nut.config.get"
+                | "system.nut.apply_status"
                 | "system.nut.status"
                 | "system.watchdog.config.get"
                 | "system.tailscale.get"

@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 const STATE_PATH: &str = "/var/lib/nasty/nut.json";
@@ -224,6 +224,23 @@ pub struct UpsStatus {
 
 pub struct NutService {
     state: Arc<RwLock<NutConfig>>,
+    apply_status: Arc<RwLock<NutApplyStatus>>,
+    apply_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NutApplyState {
+    Idle,
+    Applying,
+    Applied,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct NutApplyStatus {
+    pub state: NutApplyState,
+    pub error: Option<String>,
 }
 
 impl NutService {
@@ -231,11 +248,20 @@ impl NutService {
         let config = load().await;
         Self {
             state: Arc::new(RwLock::new(config)),
+            apply_status: Arc::new(RwLock::new(NutApplyStatus {
+                state: NutApplyState::Idle,
+                error: None,
+            })),
+            apply_lock: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn get_config(&self) -> NutConfig {
         self.state.read().await.clone()
+    }
+
+    pub async fn apply_status(&self) -> NutApplyStatus {
+        self.apply_status.read().await.clone()
     }
 
     /// Eagerly seal a plaintext `remote_password` left on disk from
@@ -257,7 +283,12 @@ impl NutService {
     }
 
     pub async fn update_config(&self, update: NutConfigUpdate) -> Result<NutConfig, String> {
-        let mut config = self.state.write().await;
+        let apply_guard =
+            self.apply_lock.clone().try_lock_owned().map_err(|_| {
+                "UPS configuration is still being applied; retry shortly".to_string()
+            })?;
+        let mut state = self.state.write().await;
+        let mut config = state.clone();
 
         if let Some(v) = update.mode {
             config.mode = v;
@@ -318,23 +349,47 @@ impl NutService {
         encrypt_remote_password_in_place(&mut config).await;
 
         save(&config).await.map_err(|e| e.to_string())?;
+        *state = config.clone();
 
-        // Regenerate config files so next restart picks them up.
-        // If NUT is currently running, restart it.
+        // Persistence and runtime application are distinct: report when the
+        // configuration was saved but could not be applied to running NUT.
         if let Err(e) = write_config_files(&config).await {
-            warn!("Failed to write NUT config files: {e}");
+            *self.apply_status.write().await = NutApplyStatus {
+                state: NutApplyState::Failed,
+                error: Some(format!("Could not write NUT files: {e}")),
+            };
+            return Err(format!(
+                "UPS configuration saved, but could not write NUT files: {e}"
+            ));
         }
         if is_nut_enabled().await {
-            // Spawn restart in background — some drivers (nutdrv_qx) take 20-30s
-            // to probe USB and we don't want the API call to block/timeout.
-            // restart_nut_services() logs per-service errors itself; the spawn
-            // wrapper just guards against a task-panic vanishing into nothing.
-            let h = tokio::spawn(async move { reconcile_nut_services(new_mode).await });
+            *self.apply_status.write().await = NutApplyStatus {
+                state: NutApplyState::Applying,
+                error: None,
+            };
+            let status = self.apply_status.clone();
             tokio::spawn(async move {
-                if let Err(e) = h.await {
-                    warn!("NUT restart task panicked / cancelled: {e}");
-                }
+                let _guard = apply_guard;
+                let result = reconcile_nut_services(new_mode).await;
+                *status.write().await = match result {
+                    Ok(()) => NutApplyStatus {
+                        state: NutApplyState::Applied,
+                        error: None,
+                    },
+                    Err(error) => {
+                        warn!("NUT configuration apply failed: {error}");
+                        NutApplyStatus {
+                            state: NutApplyState::Failed,
+                            error: Some(error),
+                        }
+                    }
+                };
             });
+        } else {
+            *self.apply_status.write().await = NutApplyStatus {
+                state: NutApplyState::Applied,
+                error: None,
+            };
         }
 
         Ok(config.clone())
@@ -590,8 +645,9 @@ async fn is_nut_enabled() -> bool {
     false
 }
 
-async fn reconcile_nut_services(mode: NutMode) {
+async fn reconcile_nut_services(mode: NutMode) -> Result<(), String> {
     let want: std::collections::HashSet<&str> = services_for_mode(mode).iter().copied().collect();
+    let mut failures = Vec::new();
     info!("Reconciling NUT services for mode={mode:?}: want {want:?}");
 
     // Stop any service that should NOT be running in this mode.
@@ -605,12 +661,12 @@ async fn reconcile_nut_services(mode: NutMode) {
             .await
         {
             Ok(o) if o.status.success() => {}
-            Ok(o) => warn!(
+            Ok(o) => failures.push(format!(
                 "systemctl stop {svc} exited {}: {}",
                 o.status,
                 String::from_utf8_lossy(&o.stderr).trim()
-            ),
-            Err(e) => warn!("systemctl stop {svc} failed to spawn: {e}"),
+            )),
+            Err(e) => failures.push(format!("systemctl stop {svc} failed to spawn: {e}")),
         }
     }
 
@@ -622,13 +678,18 @@ async fn reconcile_nut_services(mode: NutMode) {
             .await
         {
             Ok(o) if o.status.success() => {}
-            Ok(o) => warn!(
+            Ok(o) => failures.push(format!(
                 "systemctl restart {svc} exited {}: {}",
                 o.status,
                 String::from_utf8_lossy(&o.stderr).trim()
-            ),
-            Err(e) => warn!("systemctl restart {svc} failed to spawn: {e}"),
+            )),
+            Err(e) => failures.push(format!("systemctl restart {svc} failed to spawn: {e}")),
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 

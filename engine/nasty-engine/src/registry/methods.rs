@@ -63,7 +63,7 @@ use nasty_system::hardware::{HardwareSummary, IommuGroup};
 use nasty_system::network::nm::dbus::{NmApplyOutcome, NmDiff};
 use nasty_system::network::{ConfirmRequest, NetworkConfig, NetworkPendingTxn};
 use nasty_system::notifications::{ChannelType, NotificationConfig};
-use nasty_system::nut::{NutConfig, NutConfigUpdate, UpsStatus};
+use nasty_system::nut::{NutApplyStatus, NutConfig, NutConfigUpdate, UpsStatus};
 use nasty_system::passthrough::{PassthroughConfig, PassthroughUpdate};
 use nasty_system::protocol::ProtocolStatus;
 use nasty_system::rdma::{RdmaSetRequest, RdmaStatus};
@@ -1619,6 +1619,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<NutConfigUpdate>(generator)),
                     result: Some(gen_schema::<NutConfig>(generator)),
+                },
+                Method {
+                    name: "system.nut.apply_status",
+                    desc: "Return the outcome of the most recent NUT configuration apply.",
+                    role: MethodRole::Any,
+                    params: MethodParams::None,
+                    result: Some(gen_schema::<NutApplyStatus>(generator)),
                 },
                 Method {
                     name: "system.nut.status",
