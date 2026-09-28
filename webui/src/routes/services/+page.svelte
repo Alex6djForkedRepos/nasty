@@ -605,7 +605,7 @@
 								<div class="max-w-xl">
 									<label for="s-base-nqn" class="mb-1 block text-xs text-muted-foreground">Base NQN</label>
 									<input id="s-base-nqn" type="text" bind:value={baseNqn} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
-									<p class="mt-0.5 text-[0.6rem] text-muted-foreground">Prefix for all NVMe-oF subsystem NQNs (e.g. nqn.2137-04.storage.nasty).</p>
+										<p class="mt-0.5 text-[0.6rem] text-muted-foreground">Prefix for new NVMe-oF subsystems (e.g. nqn.2137-04.storage.nasty). Existing NQNs stay unchanged.</p>
 								</div>
 								<Button size="sm" class="mt-3" onclick={saveBaseNqn}>Save</Button>
 							{:else if proto.name === 'nut'}

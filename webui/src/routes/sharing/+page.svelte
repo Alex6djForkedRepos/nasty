@@ -48,6 +48,7 @@
 		nvme,
 		nvmeRefresh,
 		nvmeLoadProtocol,
+		nvmeLoadBaseNqn,
 	} from '$lib/sharing/nvmeof.svelte';
 	import { domainRefresh } from '$lib/domain.svelte';
 
@@ -138,6 +139,7 @@
 
 	function openShareWizard() {
 		if (activeTab === 'iscsi') iscsiLoadBaseIqn();
+		if (activeTab === 'nvmeof') nvmeLoadBaseNqn();
 		shareWizardStep = 1;
 		// The wizard is protocol-only (its button is hidden on the guest tab);
 		// guard keeps the types honest and is a no-op on 'guest'.
@@ -327,6 +329,7 @@
 			iscsiLoadProtocol(),
 			iscsiLoadBaseIqn(),
 			nvmeLoadProtocol(),
+			nvmeLoadBaseNqn(),
 			rdmaLoad(),
 		]);
 		// Load AD membership so SmbPanel's domain-user picker appears when the
@@ -477,6 +480,7 @@
 					bind:name={shareNvmeofName}
 					bind:addr={shareNvmeofAddr}
 					bind:port={shareNvmeofPort}
+					prefix={nvme.nqnPrefix}
 				/>
 			{/if}
 			<div class="flex gap-2">
@@ -512,6 +516,7 @@
 						fallbackName={sv?.name ?? ''}
 						addr={shareNvmeofAddr}
 						port={shareNvmeofPort}
+						prefix={nvme.nqnPrefix}
 					/>
 				{/if}
 			</div>
