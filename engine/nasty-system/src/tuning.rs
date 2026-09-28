@@ -204,6 +204,7 @@ impl TuningService {
 
         // ── SMB ──
         let mut smb_changed = false;
+        let mut smb_reload_error = None;
         if let Some(v) = update.smb_max_connections
             && v != config.smb_max_connections
         {
@@ -224,6 +225,7 @@ impl TuningService {
         }
         if smb_changed {
             apply_smb_tuning(&config).await?;
+            smb_reload_error = reload_smb_tuning_if_running().await.err();
         }
 
         // ── iSCSI ──
@@ -273,6 +275,9 @@ impl TuningService {
         }
 
         save(&config).await.map_err(|e| e.to_string())?;
+        if let Some(error) = smb_reload_error {
+            return Err(format!("SMB tuning saved, but live reload failed: {error}"));
+        }
         Ok(config.clone())
     }
 
@@ -301,6 +306,8 @@ impl TuningService {
         }
         if let Err(e) = apply_smb_tuning(&config).await {
             warn!("Failed to apply SMB tuning: {e}");
+        } else if let Err(e) = reload_smb_tuning_if_running().await {
+            warn!("Failed to reload SMB tuning: {e}");
         }
         if let Err(e) = apply_iscsi_cmdsn_depth(config.iscsi_default_cmdsn_depth).await {
             warn!("Failed to apply iscsi_default_cmdsn_depth: {e}");
@@ -390,12 +397,21 @@ async fn apply_smb_tuning(config: &TuningConfig) -> Result<(), String> {
         .await
         .map_err(|e| format!("failed to write {SMB_TUNING_CONF}: {e}"))?;
 
-    // Reload Samba config (non-fatal if smbd isn't running). `try_run`
-    // logs the "smbd not running" error at warn! so we still see it in
-    // the journal if reload was actually expected to take effect.
-    nasty_common::cmd::try_run("smbcontrol", &["smbd", "reload-config"]).await;
+    info!("SMB tuning config written");
+    Ok(())
+}
 
-    info!("SMB tuning config written and reload requested");
+async fn reload_smb_tuning_if_running() -> Result<(), String> {
+    // A stopped SMB service reads this config on its next start; avoid
+    // reporting an expected "smbd not running" as a reload failure.
+    let running = tokio::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "samba-smbd.service"])
+        .status()
+        .await
+        .is_ok_and(|status| status.success());
+    if running {
+        nasty_common::cmd::run_ok("smbcontrol", &["smbd", "reload-config"]).await?;
+    }
     Ok(())
 }
 
