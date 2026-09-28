@@ -1261,6 +1261,7 @@ export interface Settings {
 
 export interface TailscaleStatus {
 	enabled: boolean;
+	accept_routes: boolean;
 	daemon_running: boolean;
 	connected: boolean;
 	ip?: string;
