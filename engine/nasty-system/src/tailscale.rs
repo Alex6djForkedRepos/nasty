@@ -14,6 +14,9 @@ const TAILSCALE_SOCKET: &str = "/run/tailscale/tailscaled.sock";
 pub struct TailscaleConfig {
     /// Whether Tailscale should be enabled.
     pub enabled: bool,
+    /// Whether to install routes advertised by other tailnet nodes.
+    #[serde(default)]
+    pub accept_routes: bool,
     /// Tailscale auth key for `tailscale up --authkey`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_key: Option<String>,
@@ -23,6 +26,14 @@ pub struct TailscaleConfig {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TailscaleConnectRequest {
     pub auth_key: String,
+    /// Omitted by older clients: keep the persisted preference.
+    #[serde(default)]
+    pub accept_routes: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TailscaleRoutesRequest {
+    pub accept_routes: bool,
 }
 
 /// Live Tailscale status returned to the WebUI.
@@ -30,6 +41,7 @@ pub struct TailscaleConnectRequest {
 pub struct TailscaleStatus {
     /// Persisted configuration.
     pub enabled: bool,
+    pub accept_routes: bool,
     /// Whether the tailscaled daemon is running.
     pub daemon_running: bool,
     /// Whether Tailscale is connected to the network.
@@ -64,7 +76,8 @@ impl TailscaleService {
         let config = self.config.read().await.clone();
         if config.enabled {
             info!("Restoring Tailscale from persisted config");
-            if let Err(e) = start_tailscale(config.auth_key.as_deref()).await {
+            if let Err(e) = start_tailscale(config.auth_key.as_deref(), config.accept_routes).await
+            {
                 warn!("Failed to restore Tailscale: {e}");
             }
         }
@@ -83,6 +96,7 @@ impl TailscaleService {
 
         TailscaleStatus {
             enabled: config.enabled,
+            accept_routes: config.accept_routes,
             daemon_running,
             connected,
             ip,
@@ -108,9 +122,11 @@ impl TailscaleService {
         };
 
         info!("Connecting to Tailscale");
-        start_tailscale(Some(key.as_str())).await?;
+        let accept_routes = req.accept_routes.unwrap_or(config.accept_routes);
+        start_tailscale(Some(key.as_str()), accept_routes).await?;
         config.enabled = true;
         config.auth_key = Some(key);
+        config.accept_routes = accept_routes;
         save_config(&config)
             .await
             .map_err(|e| format!("Failed to save config: {e}"))?;
@@ -132,11 +148,54 @@ impl TailscaleService {
 
         Ok(self.get().await)
     }
+
+    /// Change route acceptance without disconnecting an active tailnet session.
+    pub async fn set_accept_routes(&self, accept_routes: bool) -> Result<TailscaleStatus, String> {
+        let mut config = self.config.write().await;
+        let active = config.enabled && is_daemon_running().await;
+        let socket_arg = format!("--socket={TAILSCALE_SOCKET}");
+        if active {
+            run_cmd(
+                "tailscale",
+                &[&socket_arg, "set", accept_routes_arg(accept_routes)],
+            )
+            .await?;
+        }
+        let mut next = config.clone();
+        next.accept_routes = accept_routes;
+        if let Err(error) = save_config(&next).await {
+            if active
+                && let Err(rollback) = run_cmd(
+                    "tailscale",
+                    &[&socket_arg, "set", accept_routes_arg(config.accept_routes)],
+                )
+                .await
+            {
+                return Err(format!(
+                    "Failed to save Tailscale route preference: {error}; failed to restore live preference: {rollback}"
+                ));
+            }
+            return Err(format!(
+                "Failed to save Tailscale route preference: {error}"
+            ));
+        }
+        *config = next;
+        drop(config);
+        Ok(self.get().await)
+    }
 }
 
 // ── Lifecycle commands ──────────────────────────────────────────
 
-async fn start_tailscale(auth_key: Option<&str>) -> Result<(), String> {
+fn accept_routes_arg(accept_routes: bool) -> &'static str {
+    if accept_routes {
+        "--accept-routes=true"
+    } else {
+        "--accept-routes=false"
+    }
+}
+
+async fn start_tailscale(auth_key: Option<&str>, accept_routes: bool) -> Result<(), String> {
     // Always restart to clear any stale auth state from previous attempts
     let _ = run_cmd("systemctl", &["stop", SYSTEMD_UNIT]).await;
     run_cmd("systemctl", &["start", SYSTEMD_UNIT]).await?;
@@ -151,27 +210,34 @@ async fn start_tailscale(auth_key: Option<&str>) -> Result<(), String> {
 
     // Authenticate and connect — requires an auth key.
     // Without a key, `tailscale up` blocks waiting for browser auth which hangs the engine.
+    let socket_arg = format!("--socket={TAILSCALE_SOCKET}");
     let Some(key) = auth_key else {
+        run_cmd(
+            "tailscale",
+            &[&socket_arg, "set", accept_routes_arg(accept_routes)],
+        )
+        .await?;
         info!("Tailscale daemon started but no auth key configured — skipping tailscale up");
         return Ok(());
     };
 
     if key.is_empty() {
+        run_cmd(
+            "tailscale",
+            &[&socket_arg, "set", accept_routes_arg(accept_routes)],
+        )
+        .await?;
         info!("Tailscale daemon started but auth key is empty — skipping tailscale up");
         return Ok(());
     }
 
     let authkey_arg = format!("--auth-key={key}");
-
-    let socket_arg = format!("--socket={TAILSCALE_SOCKET}");
+    let route_arg = accept_routes_arg(accept_routes);
 
     // Use a timeout to prevent hanging if auth key is invalid or network is unreachable
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        run_cmd(
-            "tailscale",
-            &[&socket_arg, "up", "--accept-routes", &authkey_arg],
-        ),
+        run_cmd("tailscale", &[&socket_arg, "up", route_arg, &authkey_arg]),
     )
     .await;
 
@@ -288,5 +354,29 @@ async fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("{program} failed: {stderr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_disables_advertised_routes_on_next_start() {
+        let config: TailscaleConfig =
+            serde_json::from_str(r#"{"enabled":true,"auth_key":"test"}"#).unwrap();
+        assert!(!config.accept_routes);
+        assert_eq!(
+            accept_routes_arg(config.accept_routes),
+            "--accept-routes=false"
+        );
+        assert_eq!(accept_routes_arg(true), "--accept-routes=true");
+    }
+
+    #[test]
+    fn legacy_connect_request_preserves_saved_preference() {
+        let request: TailscaleConnectRequest =
+            serde_json::from_str(r#"{"auth_key":"test"}"#).unwrap();
+        assert_eq!(request.accept_routes, None);
     }
 }

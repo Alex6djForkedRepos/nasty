@@ -9,13 +9,26 @@
 
 	let tsStatus: TailscaleStatus | null = $state(null);
 	let tsAuthKey = $state('');
+	let tsAcceptRoutes = $state(false);
 	let tsLoading = $state(false);
 
 	onMount(async () => {
 		try {
 			tsStatus = await client.call<TailscaleStatus>('system.tailscale.get');
+			tsAcceptRoutes = tsStatus.accept_routes;
 		} catch { /* tailscale module may not be enabled */ }
 	});
+
+	async function saveAcceptRoutes() {
+		tsLoading = true;
+		const result = await withToast(
+			() => client.call<TailscaleStatus>('system.tailscale.set_accept_routes', { accept_routes: tsAcceptRoutes }),
+			tsAcceptRoutes ? 'Tailnet routes enabled' : 'Tailnet routes disabled'
+		);
+		if (result) tsStatus = result;
+		tsAcceptRoutes = tsStatus?.accept_routes ?? false;
+		tsLoading = false;
+	}
 </script>
 
 <div>
@@ -31,6 +44,16 @@
 			Refresh <a href="/update#version" class="underline">Tailscale package source</a> under System → Update → Upstream instead.
 		</p>
 	</div>
+
+	{#if tsStatus}
+		<div class="rounded-lg border p-4 space-y-2">
+			<label class="flex items-center gap-2 text-sm">
+				<input type="checkbox" bind:checked={tsAcceptRoutes} onchange={saveAcceptRoutes} disabled={tsLoading} />
+				Accept routes advertised by other tailnet nodes
+			</label>
+			<p class="text-xs text-amber-500">Do not enable this if a subnet router advertises this host's own LAN. It can make the NAS unreachable from the LAN.</p>
+		</div>
+	{/if}
 
 	{#if !tsStatus}
 		<p class="text-muted-foreground">Loading...</p>
@@ -87,7 +110,7 @@
 					onclick={async () => {
 						tsLoading = true;
 						const result = await withToast(
-							() => client.call('system.tailscale.connect', { auth_key: '' }),
+							() => client.call('system.tailscale.connect', { auth_key: '', accept_routes: tsAcceptRoutes }),
 							'Tailscale connected'
 						);
 						if (result) tsStatus = result as TailscaleStatus;
@@ -117,7 +140,7 @@
 				onclick={async () => {
 					tsLoading = true;
 					const result = await withToast(
-						() => client.call('system.tailscale.connect', { auth_key: tsAuthKey }),
+						() => client.call('system.tailscale.connect', { auth_key: tsAuthKey, accept_routes: tsAcceptRoutes }),
 						'Tailscale connected'
 					);
 					if (result) {

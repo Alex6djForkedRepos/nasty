@@ -670,6 +670,15 @@ pub(super) async fn try_route(
             }
         }
         "system.tailscale.get" => ok(req, state.tailscale.get().await),
+        "system.tailscale.set_accept_routes" => {
+            match parse_params::<nasty_system::tailscale::TailscaleRoutesRequest>(req) {
+                Ok(p) => match state.tailscale.set_accept_routes(p.accept_routes).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                },
+                Err(e) => invalid(req, e),
+            }
+        }
         "system.tailscale.connect" => match parse_params(req) {
             Ok(p) => match state.tailscale.connect(p).await {
                 Ok(v) => {

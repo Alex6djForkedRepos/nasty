@@ -70,7 +70,7 @@ use nasty_system::rdma::{RdmaSetRequest, RdmaStatus};
 use nasty_system::secure_boot::ReadinessReport;
 use nasty_system::secure_boot_enrollment::{EnrollmentState, EnrollmentStatusResponse};
 use nasty_system::settings::{AcmeStatus, HostTlsStatus, OidcSettings, Settings, SettingsUpdate};
-use nasty_system::tailscale::{TailscaleConnectRequest, TailscaleStatus};
+use nasty_system::tailscale::{TailscaleConnectRequest, TailscaleRoutesRequest, TailscaleStatus};
 use nasty_system::tuning::{TuningConfig, TuningUpdate};
 use nasty_system::update::{
     Generation, ReleaseChannel, UpdateBuildDirConfig, UpdateInfo, UpdateStatus, VersionInfo,
@@ -1843,6 +1843,13 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     desc: "Start the Tailscale daemon and authenticate with the supplied auth key (falling back to the stored key when empty); also re-sync NVMe-oF ports for the new Tailscale IP.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<TailscaleConnectRequest>(generator)),
+                    result: Some(gen_schema::<TailscaleStatus>(generator)),
+                },
+                Method {
+                    name: "system.tailscale.set_accept_routes",
+                    desc: "Set whether the NAS accepts advertised tailnet routes. Defaults to false to preserve local LAN connectivity.",
+                    role: MethodRole::Admin,
+                    params: MethodParams::Schema(gen_schema::<TailscaleRoutesRequest>(generator)),
                     result: Some(gen_schema::<TailscaleStatus>(generator)),
                 },
                 Method {
