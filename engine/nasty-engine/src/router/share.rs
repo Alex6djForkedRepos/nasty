@@ -1315,12 +1315,12 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
                         Ok(nqn) => nqn,
                         Err(error) => return Some(err(req, error)),
                     };
-                    if session_is_scoped(session) {
-                        if state.nvmeof.list().await.is_ok_and(|subsystems| {
+                    if session_is_scoped(session)
+                        && state.nvmeof.list().await.is_ok_and(|subsystems| {
                             subsystems.iter().any(|subsystem| subsystem.nqn == nqn)
-                        }) {
-                            return Some(err(req, "access denied"));
-                        }
+                        })
+                    {
+                        return Some(err(req, "access denied"));
                     }
                     if let Some(ref device_path) = p.device_path {
                         match authorize_block_source(state, session, device_path).await {

@@ -302,12 +302,10 @@ pub(super) async fn try_route(
                 .as_ref()
                 .and_then(|p| p.get("nqn_prefix"))
                 .and_then(|v| v.as_str())
-            {
-                if let Err(error) =
+                && let Err(error) =
                     nasty_sharing::nvmeof::NvmeofService::update_base_nqn_prefix(nqn).await
-                {
-                    return Some(err(req, error));
-                }
+            {
+                return Some(err(req, error));
             }
             ok(req, "ok")
         }
