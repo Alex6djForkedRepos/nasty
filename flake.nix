@@ -161,7 +161,7 @@
       pname = "nasty-webui";
       version = nasty-version;
       src = ./webui;
-      npmDepsHash = "sha256-Y6VKTdV0bBiFaqIbvuyzSrfZp/+DXBNuF5UAaUVbL6k=";
+      npmDepsHash = "sha256-xoPkgk+1JzR4a1/PKoLc5Uts6NIlcZ4VgUH2lMfOJxg=";
       npmFlags = [ "--legacy-peer-deps" ];
       buildPhase = ''
         npm run prepare
