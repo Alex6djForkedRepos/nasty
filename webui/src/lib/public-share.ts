@@ -10,6 +10,7 @@ export interface PublicShareMeta {
 	password_required: boolean;
 	unlocked: boolean;
 	expires_at: number | null;
+	media_preview_enabled?: boolean;
 }
 
 export interface PublicDirectoryEntry {
@@ -75,4 +76,17 @@ export function shareDownloadUrl(token: string, root: number, path: string): str
 
 export function shareZipUrl(token: string): string {
 	return shareEndpoint(token, 'zip');
+}
+
+export function shareMediaUrl(token: string, root: number, path: string): string {
+	const params = new URLSearchParams({ root: String(root) });
+	if (path) params.set('path', path);
+	return `${shareEndpoint(token, 'media')}?${params}`;
+}
+
+export function mediaPreviewKind(name: string): 'audio' | 'video' | null {
+	const extension = name.split('.').at(-1)?.toLowerCase();
+	if (['mp4', 'm4v', 'mov', 'webm', 'mkv'].includes(extension ?? '')) return 'video';
+	if (['mp3', 'm4a', 'wav', 'ogg', 'oga', 'flac', 'aac'].includes(extension ?? '')) return 'audio';
+	return null;
 }

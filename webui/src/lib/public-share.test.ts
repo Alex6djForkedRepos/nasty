@@ -6,7 +6,9 @@ import {
 	shareBreadcrumbs,
 	shareBrowseUrl,
 	shareDownloadUrl,
-	shareZipUrl
+	shareZipUrl,
+	mediaPreviewKind,
+	shareMediaUrl
 } from './public-share';
 
 describe('public share navigation', () => {
@@ -41,5 +43,14 @@ describe('public share navigation', () => {
 			'/api/public/share/abc/download?root=0&path=reports%2FQ2+%26+Q3.pdf'
 		);
 		expect(shareZipUrl('abc')).toBe('/api/public/share/abc/zip');
+	});
+
+	test('preview links encode the same root and path boundary as downloads', () => {
+		expect(shareMediaUrl('abc', 2, 'Music/live & loud.mp3')).toBe('/api/public/share/abc/media?root=2&path=Music%2Flive+%26+loud.mp3');
+		expect(mediaPreviewKind('clip.MKV')).toBe('video');
+		expect(mediaPreviewKind('song.mp3')).toBe('audio');
+		for (const name of ['page.html', 'picture.svg', 'remote.m3u8', 'file.mp4.html']) {
+			expect(mediaPreviewKind(name)).toBeNull();
+		}
 	});
 });
