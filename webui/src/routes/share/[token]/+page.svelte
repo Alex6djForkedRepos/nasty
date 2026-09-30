@@ -10,12 +10,15 @@
 		shareBrowseUrl,
 		shareDownloadUrl,
 		shareZipUrl,
+		shareMediaUrl,
+		mediaPreviewKind,
 		type PublicDirectoryEntry,
 		type PublicDirectoryListing,
 		type PublicShareMeta,
 		type PublicShareRoot
 	} from '$lib/public-share';
 	import logoLight from '$lib/assets/nasty.svg';
+	import GuestMediaPreview from '$lib/components/GuestMediaPreview.svelte';
 	import logoDark from '$lib/assets/nasty-white.svg';
 	import { ArrowLeft, ChevronRight, Download, File, FolderOpen, Home, Lock } from '@lucide/svelte';
 
@@ -34,6 +37,7 @@
 	let downloadError = $state('');
 	let downloadPending = $state(false);
 	let breadcrumbNav = $state<HTMLElement | null>(null);
+	let preview = $state<{ url: string; name: string } | null>(null);
 
 	let unlocked = $state(false);
 	let password = $state('');
@@ -51,6 +55,7 @@
 	}
 
 	function resetShareState() {
+		preview = null;
 		browseRequest++;
 		meta = null;
 		notAvailable = false;
@@ -124,6 +129,7 @@
 	}
 
 	async function browse(root: PublicShareRoot, path: string) {
+		preview = null;
 		const request = ++browseRequest;
 		browseLoading = true;
 		browseError = '';
@@ -157,6 +163,7 @@
 	}
 
 	function showRoots() {
+		preview = null;
 		browseRequest++;
 		browseLoading = false;
 		browseError = '';
@@ -339,6 +346,11 @@
 					</p>
 				{/if}
 
+				{#if preview}
+					{#key preview.url}
+						<GuestMediaPreview url={preview.url} name={preview.name} onclose={() => preview = null} />
+					{/key}
+				{/if}
 				{#if browseLoading}
 					<p role="status" class="py-10 text-center text-sm text-muted-foreground">Loading folder...</p>
 				{:else if listing && selectedRoot}
@@ -365,6 +377,9 @@
 												<p class="text-xs text-muted-foreground">{formatBytes(entry.size)}</p>
 											</div>
 										</div>
+										{#if meta.media_preview_enabled && mediaPreviewKind(entry.name)}
+											<button type="button" onclick={() => preview = { url: shareMediaUrl(token, selectedRoot!.root, joinSharePath(listing!.path, entry.name)), name: entry.name }} class="rounded-md border px-2 py-1 text-sm">Preview</button>
+										{/if}
 										<a
 											href={shareDownloadUrl(token, selectedRoot.root, joinSharePath(listing.path, entry.name))}
 											download={entry.name}
@@ -400,6 +415,9 @@
 											<p class="text-xs text-muted-foreground">{formatBytes(entry.size)}</p>
 										</div>
 									</div>
+									{#if meta.media_preview_enabled && mediaPreviewKind(entry.name)}
+										<button type="button" onclick={() => preview = { url: shareMediaUrl(token, entry.root, ''), name: entry.name }} class="rounded-md border px-2 py-1 text-sm">Preview</button>
+									{/if}
 									<a
 										href={shareDownloadUrl(token, entry.root, '')}
 										download={entry.name}
@@ -413,6 +431,9 @@
 							</li>
 						{/each}
 					</ul>
+				{/if}
+				{#if !meta.media_preview_enabled}
+					<p class="mt-3 text-xs text-muted-foreground">Media previews are available only on shares without a download limit in this prototype.</p>
 				{/if}
 			{/if}
 		{/if}

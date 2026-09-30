@@ -236,6 +236,7 @@ pub struct PublicShareMeta {
     pub password_required: bool,
     pub unlocked: bool,
     pub expires_at: Option<i64>,
+    pub media_preview_enabled: bool,
 }
 
 /// Whether a share may still be served: not revoked, not past expiry, not
@@ -276,6 +277,14 @@ impl tokio::io::AsyncRead for GuestDownloadReader {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.file).poll_read(cx, buf)
+    }
+}
+
+impl GuestDownloadReader {
+    pub async fn seek_to(&mut self, offset: u64) -> std::io::Result<()> {
+        use tokio::io::AsyncSeekExt;
+        self.file.seek(std::io::SeekFrom::Start(offset)).await?;
+        Ok(())
     }
 }
 
@@ -901,6 +910,7 @@ impl GuestShareService {
                 password_required,
                 unlocked: false,
                 expires_at: share.expires_at,
+                media_preview_enabled: false,
             });
         }
         if share.paths.len() > MAX_SHARE_ROOTS {
@@ -910,6 +920,7 @@ impl GuestShareService {
         let files_root = self.fs_root.clone();
         let paths = share.paths.clone();
         let expires_at = share.expires_at;
+        let media_preview_enabled = share.max_downloads.is_none();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let entries = paths
@@ -955,6 +966,7 @@ impl GuestShareService {
                 password_required,
                 unlocked: true,
                 expires_at,
+                media_preview_enabled,
             }
         })
         .await
@@ -1065,6 +1077,20 @@ impl GuestShareService {
         .await
         .ok()
         .flatten()
+    }
+
+    /// Preview reads share the download descriptor budget but may only serve
+    /// uncapped shares. Media reads must never bypass a download allowance.
+    pub async fn open_media(
+        &self,
+        share: &GuestShare,
+        root: usize,
+        rel: &str,
+    ) -> Option<OpenedGuestFile> {
+        if share.max_downloads.is_some() {
+            return None;
+        }
+        self.open_download(share, Some(root), rel).await
     }
 
     /// Whether `share` is password-protected.
@@ -1942,6 +1968,36 @@ mod tests {
             ..bare("s")
         };
         assert!(svc.open_download(&file_share, None, "").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn media_preview_preserves_caps_boundaries_and_descriptor_seek() {
+        use tokio::io::AsyncReadExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let svc = GuestShareService::with_dirs(root.join("state"), root.clone());
+        let folder = root.join("media");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("video.mp4"), b"0123456789").unwrap();
+        let mut share = GuestShare {
+            paths: vec![folder.to_string_lossy().into_owned()],
+            ..bare("media")
+        };
+        assert!(svc.open_media(&share, 0, "../secret.mp4").await.is_none());
+        assert!(svc.open_media(&share, 1, "video.mp4").await.is_none());
+        let opened = svc.open_media(&share, 0, "video.mp4").await.unwrap();
+        let (mut reader, _, _) = opened.into_parts();
+        reader.seek_to(4).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.take(3).read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"456");
+        share.max_downloads = Some(1);
+        assert!(svc.open_media(&share, 0, "video.mp4").await.is_none());
+        assert!(!svc.meta(&share, true).await.unwrap().media_preview_enabled);
+        share.max_downloads = None;
+        assert!(svc.meta(&share, true).await.unwrap().media_preview_enabled);
+        share.password_hash = Some("not unlocked".into());
+        assert!(!svc.meta(&share, false).await.unwrap().media_preview_enabled);
     }
 
     #[tokio::test]

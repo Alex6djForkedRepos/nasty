@@ -23,6 +23,7 @@ mod boot_status;
 mod file_boundary;
 mod fs_dependents;
 mod fs_lock;
+mod guest_media;
 mod guestshare;
 mod ingress_conflict;
 mod log_stream;
@@ -1002,6 +1003,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/public/share/{token}/download",
             get(public_share_download_handler).head(public_share_download_head_handler),
+        )
+        .route(
+            "/api/public/share/{token}/media",
+            get(guest_media::media_handler),
         )
         .route(
             "/api/public/share/{token}/zip",
